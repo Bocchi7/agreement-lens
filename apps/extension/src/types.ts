@@ -18,5 +18,6 @@ export type ExtensionMessage =
   | { type: "HIGHLIGHT_EVIDENCE"; quote: string }
   | {
       type: "FETCH_AGREEMENT_SOURCES";
+      tabId?: number;
       sources: Array<{ id: string; url: string; kind: "url" | "pdf" }>;
     };

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { analysisResultSchema, type CreateAnalysisInput, type JobStatus } from "@agreement-lens/shared";
+import { analysisResultSchema, maxSourceDocuments, type CreateAnalysisInput, type JobStatus } from "@agreement-lens/shared";
 import type { AnalysisResult, VersionComparison } from "@agreement-lens/shared";
 import { refineChangeRoute, routeChangedContent, runWorkflow } from "@agreement-lens/agent-core";
 import type { MainAgentSession } from "@agreement-lens/agent-core";
@@ -42,8 +42,8 @@ export function enqueueAnalysis(jobId: string, analysisId: string, serviceId: st
   queue.push(async () => {
     try {
       setJob(jobId, { state: "fetching", progress: 10, message: "正在读取并整理协议来源" });
-      const selected = input.sources.filter((source) => source.selected).slice(0, 8);
-      const sources = await loadSourceGraph(selected, input.renderedHtml, 8, input.pageUrl);
+      const selected = input.sources.filter((source) => source.selected).slice(0, maxSourceDocuments);
+      const sources = await loadSourceGraph(selected, input.renderedHtml, maxSourceDocuments, input.pageUrl);
       assertUsableSources(sources);
       setJob(jobId, { state: "analyzing", progress: 30, message: "来源已就绪，开始多视角分析" });
       let mainAgentSession: MainAgentSession | undefined;
@@ -52,7 +52,7 @@ export function enqueueAnalysis(jobId: string, analysisId: string, serviceId: st
         sources, context: input.context, promptDir: path.join(repoRoot, "prompts"),
         onMainAgentSession: (session) => { mainAgentSession = session; }
       }, openKnowledge(), (progress) => setJob(jobId, {
-        state: progress.stage, progress: progress.progress, message: progress.message
+        state: progress.stage, progress: progress.progress, message: progress.message, agents: progress.agents
       }));
       saveResult(analysisResultSchema.parse(result));
       if (mainAgentSession) saveAgentSession(analysisId, mainAgentSession);
@@ -75,8 +75,8 @@ export function enqueueRecheck(
   queue.push(async () => {
     try {
       setJob(jobId, { state: "fetching", progress: 12, message: "正在重新抓取并计算内容指纹" });
-      const selected = input.sources.filter((source) => source.selected).slice(0, 8);
-      const sources = await loadSourceGraph(selected, input.renderedHtml, 8, input.pageUrl);
+      const selected = input.sources.filter((source) => source.selected).slice(0, maxSourceDocuments);
+      const sources = await loadSourceGraph(selected, input.renderedHtml, maxSourceDocuments, input.pageUrl);
       assertUsableSources(sources);
       let route = routeChangedContent(previousResult.sources, sources);
       const now = new Date().toISOString();
@@ -108,7 +108,29 @@ export function enqueueRecheck(
         return;
       }
       const knowledge = openKnowledge();
-      route = await refineChangeRoute(route, previousResult.sources, sources, knowledge, path.join(repoRoot, "prompts"));
+      route = await refineChangeRoute(
+        route,
+        previousResult.sources,
+        sources,
+        knowledge,
+        path.join(repoRoot, "prompts"),
+        (routerProgress) => {
+          const current = getJob(jobId);
+          if (!current) return;
+          setJob(jobId, {
+            state: "analyzing",
+            progress: 25,
+            message: routerProgress.message ?? "正在判断需要复核的视角",
+            agents: { ...(current.agents ?? {}), router: {
+              status: "running",
+              rounds: 0,
+              retries: 0,
+              ...current.agents?.router,
+              ...routerProgress
+            } }
+          });
+        }
+      );
       setJob(jobId, {
         state: "analyzing",
         progress: 32,
@@ -127,7 +149,13 @@ export function enqueueRecheck(
         saved: true,
         onMainAgentSession: (session) => { mainAgentSession = session; }
       }, knowledge, (progress) => setJob(jobId, {
-        state: progress.stage, progress: progress.progress, message: progress.message
+        state: progress.stage,
+        progress: progress.progress,
+        message: progress.message,
+        agents: {
+          ...(getJob(jobId)?.agents ?? {}),
+          ...(progress.agents ?? {})
+        }
       }));
       saveResult(analysisResultSchema.parse(result));
       if (mainAgentSession) saveAgentSession(analysisId, mainAgentSession);

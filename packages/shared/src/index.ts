@@ -1,9 +1,39 @@
 import { z } from "zod";
 
+const charsetAliases: Record<string, string> = {
+  "gb2312": "gb18030",
+  "gb_2312-80": "gb18030",
+  "x-gbk": "gbk",
+  "iso-8859-1": "windows-1252"
+};
+
+function declaredCharset(contentType: string, bytes: Uint8Array): string {
+  const headerCharset = contentType.match(/charset\s*=\s*["']?\s*([^;"'\s]+)/i)?.[1];
+  if (headerCharset) return headerCharset;
+
+  // The meta declaration is ASCII, so it can be inspected before decoding the
+  // rest of the document.
+  const head = new TextDecoder("windows-1252").decode(bytes.subarray(0, 8192));
+  return head.match(/<meta\b[^>]*charset\s*=\s*["']?\s*([^"'\s/>]+)/i)?.[1]
+    ?? head.match(/<meta\b[^>]*content\s*=\s*["'][^"']*charset\s*=\s*([^"'\s;>]+)/i)?.[1]
+    ?? "utf-8";
+}
+
+export function decodeHtmlBytes(bytes: Uint8Array, contentType = ""): string {
+  const declared = declaredCharset(contentType, bytes).toLocaleLowerCase();
+  const charset = charsetAliases[declared] ?? declared;
+  try {
+    return new TextDecoder(charset).decode(bytes);
+  } catch {
+    return new TextDecoder("utf-8").decode(bytes);
+  }
+}
+
 export const actionTypes = ["register", "pay", "upload", "authorize", "other"] as const;
 export const riskCategories = ["money", "data", "content", "account", "remedies"] as const;
 export const severities = ["low", "medium", "high", "critical"] as const;
 export const recommendations = ["continue", "adjust", "pause"] as const;
+export const maxSourceDocuments = 32;
 
 export const userContextSchema = z.object({
   action: z.enum(actionTypes).default("register"),
@@ -122,6 +152,15 @@ export const versionComparisonSchema = z.object({
 });
 export type VersionComparison = z.infer<typeof versionComparisonSchema>;
 
+export const agentProgressSchema = z.object({
+  status: z.enum(["idle", "running", "completed", "failed"]),
+  rounds: z.number().int().min(0),
+  retries: z.number().int().min(0),
+  message: z.string().optional(),
+  error: z.string().optional()
+});
+export type AgentProgress = z.infer<typeof agentProgressSchema>;
+
 export const jobStatusSchema = z.object({
   id: z.string(),
   analysisId: z.string(),
@@ -129,6 +168,7 @@ export const jobStatusSchema = z.object({
   progress: z.number().int().min(0).max(100),
   message: z.string(),
   error: z.string().optional(),
+  agents: z.record(agentProgressSchema).optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -137,7 +177,7 @@ export type JobStatus = z.infer<typeof jobStatusSchema>;
 export const createAnalysisSchema = z.object({
   serviceName: z.string().min(1).max(200),
   pageUrl: z.string().url(),
-  sources: z.array(discoveredSourceSchema).min(1).max(12),
+  sources: z.array(discoveredSourceSchema).min(1).max(maxSourceDocuments),
   context: userContextSchema,
   renderedHtml: z.string().max(2_000_000).optional()
 });

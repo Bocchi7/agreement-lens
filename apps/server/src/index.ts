@@ -4,6 +4,7 @@ import cors from "@fastify/cors";
 import {
   createAnalysisSchema,
   followUpSchema,
+  maxSourceDocuments,
   type CreateAnalysisInput,
   type PairResponse,
   userContextSchema
@@ -16,9 +17,10 @@ import {
 import { enqueueAnalysis, enqueueRecheck, newJob } from "./jobs.js";
 import { allowedExtensionId, serverPort } from "./config.js";
 import { repoRoot } from "./config.js";
+import { mergeSupplementalSources } from "./supplemental-sources.js";
 import path from "node:path";
 
-const app = Fastify({ logger: true, bodyLimit: 14_000_000 });
+const app = Fastify({ logger: true, bodyLimit: 80_000_000 });
 
 await app.register(cors, {
   origin(origin, callback) {
@@ -57,7 +59,7 @@ app.get("/v1/capabilities", async () => ({
   ocr: false,
   knowledgeSearch: true,
   knowledgeShell: true,
-  maxSourceDocuments: 8
+  maxSourceDocuments
 }));
 
 app.post("/v1/pair", async (request, reply) => {
@@ -148,13 +150,16 @@ app.post("/v1/analyses/:id/sources", async (request, reply) => {
   const id = (request.params as { id: string }).id;
   const previous = getAnalysisRequest(id);
   if (!previous) return reply.code(404).send({ error: "分析不存在" });
-  const body = (request.body ?? {}) as { sources?: unknown[]; context?: unknown };
-  const merged = createAnalysisSchema.safeParse({
-    ...(previous.request as CreateAnalysisInput),
-    sources: [...((previous.request as CreateAnalysisInput).sources ?? []), ...(body.sources ?? [])],
-    context: body.context ? userContextSchema.parse(body.context) : previous.context
-  });
-  if (!merged.success) return reply.code(400).send({ error: "补充来源格式不正确", details: merged.error.flatten() });
+  const merged = mergeSupplementalSources(previous.request, previous.context, request.body ?? {});
+  if (!merged.success) {
+    request.log.warn({
+      analysisId: id,
+      existingSourceCount: (previous.request as CreateAnalysisInput).sources?.length ?? 0,
+      error: merged.error,
+      details: merged.details
+    }, "supplemental source validation failed");
+    return reply.code(400).send({ error: merged.error, details: merged.details });
+  }
   const analysisId = randomUUID();
   const job = newJob(analysisId);
   createAnalysisRecord({

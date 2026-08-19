@@ -3,7 +3,8 @@ import type { DiscoveredSource } from "@agreement-lens/shared";
 const agreementLinkKeywords = [
   "协议", "条款", "隐私", "privacy", "cookie", "cookies", "terms", "conditions",
   "user agreement", "service agreement", "subscription", "auto-renew", "自动续费",
-  "社区规范", "community guidelines"
+  "社区规范", "community guidelines", "法律声明", "个人信息保护", "个人信息处理",
+  "数据保护", "数据须知", "收集使用信息", "账号注销"
 ];
 
 function matchesAgreementLink(value: string): boolean {
@@ -44,38 +45,86 @@ function classify(text: string, url: string): string {
 }
 
 function agreementLinkElements(root: Document | ShadowRoot): Element[] {
-  const elements = [...root.querySelectorAll("a[href],area[href],[role='link'][href],[data-href],[data-url]")];
+  const elements = [...root.querySelectorAll("a,area,[role='link'],[data-href],[data-url]")];
   for (const element of [...root.querySelectorAll("*")]) {
     if (element.shadowRoot) elements.push(...agreementLinkElements(element.shadowRoot));
   }
   return elements;
 }
 
+function linkLabel(link: Element): string {
+  return (
+    (link as HTMLElement).innerText
+    || link.getAttribute("aria-label")
+    || link.getAttribute("title")
+    || link.textContent
+    || ""
+  ).replace(/\s+/g, " ").trim();
+}
+
+function linkRawTarget(link: Element): string {
+  return [
+    link.getAttribute("href"),
+    link.getAttribute("data-href"),
+    link.getAttribute("data-url"),
+    link.getAttribute("data-link"),
+    link.getAttribute("data-target"),
+    link.getAttribute("onclick"),
+    link.getAttribute("aria-label"),
+    link.getAttribute("title")
+  ].filter(Boolean).join(" ");
+}
+
+function linkUrl(link: Element, pageUrl: string): URL | null {
+  const rawHref = link.getAttribute("href") || link.getAttribute("data-href") || link.getAttribute("data-url") || "";
+  if (!rawHref) {
+    const embeddedUrl = linkRawTarget(link).match(/https?:\/\/[^\s"'<>]+/i)?.[0];
+    try {
+      return embeddedUrl ? new URL(embeddedUrl, pageUrl) : null;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    return new URL(rawHref, pageUrl);
+  } catch {
+    const embeddedUrl = linkRawTarget(link).match(/https?:\/\/[^\s"'<>]+/i)?.[0];
+    try {
+      return embeddedUrl ? new URL(embeddedUrl, pageUrl) : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
+function canonicalAgreementUrl(url: URL): string {
+  const normalized = new URL(url.href);
+  if (normalized.hash && !/^#(?:!\/|\/)/.test(normalized.hash)) normalized.hash = "";
+  return normalized.href;
+}
+
 export function discoverAgreementSources(document: Document, pageUrl: string): DiscoveredSource[] {
   const seen = new Set<string>();
   const sources: DiscoveredSource[] = [];
   for (const link of agreementLinkElements(document)) {
-    const text = ((link as HTMLElement).innerText || link.getAttribute("aria-label") || link.getAttribute("title") || link.textContent || "").replace(/\s+/g, " ").trim();
-    const rawHref = link.getAttribute("href") || link.getAttribute("data-href") || link.getAttribute("data-url") || "";
-    let url: URL;
-    try {
-      url = new URL(rawHref, pageUrl);
-    } catch {
-      continue;
-    }
-    if (!["http:", "https:"].includes(url.protocol)
+    const text = linkLabel(link);
+    const rawTarget = linkRawTarget(link);
+    const url = linkUrl(link, pageUrl);
+    const matchValue = text || rawTarget || url?.pathname || "";
+    if (url && (!["http:", "https:"].includes(url.protocol)
       || isInteractiveAccountUrl(url)
       || isAccountDashboardLink(text, url)
       || isHistoricalVersionLink(text, url)
-      || !matchesAgreementLink(`${text} ${url.pathname}`)) continue;
-    url.hash = "";
-    if (seen.has(url.href)) continue;
-    seen.add(url.href);
+      || !matchesAgreementLink(matchValue))) continue;
+    if (!url || !matchesAgreementLink(matchValue)) continue;
+    const canonicalUrl = canonicalAgreementUrl(url);
+    if (seen.has(canonicalUrl)) continue;
+    seen.add(canonicalUrl);
     sources.push({
       id: crypto.randomUUID(),
-      kind: /\.pdf(?:$|\?)/i.test(url.href) ? "pdf" : "url",
-      title: text || classify("", url.href),
-      url: url.href,
+      kind: /\.pdf(?:$|\?)/i.test(canonicalUrl) ? "pdf" : "url",
+      title: text || classify("", canonicalUrl),
+      url: canonicalUrl,
       selected: true,
       relation: "primary"
     });

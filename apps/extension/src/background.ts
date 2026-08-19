@@ -1,4 +1,5 @@
 import type { PageSnapshot } from "./types";
+import { decodeHtmlBytes } from "@agreement-lens/shared";
 import { resolveDynamicAgreementLinks } from "./dynamic-discovery";
 import { needsRenderedFallback } from "./html-readiness";
 import { setTabBadge as updateTabBadge } from "./tab-badge";
@@ -7,6 +8,36 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => 
 
 const MAX_HTML_BYTES = 2_000_000;
 const MAX_PDF_BYTES = 8_000_000;
+const MAX_BROWSER_SOURCES = 8;
+
+interface BrowserSourceRequest {
+  id: string;
+  title: string;
+  url: string;
+  kind: "url" | "pdf";
+  relation?: "primary" | "direct" | "manual";
+}
+
+interface CapturedAgreementLink {
+  title: string;
+  url: string;
+}
+
+interface CapturedRenderedPage {
+  html: string;
+  title: string;
+  url: string;
+  textLength: number;
+  links: CapturedAgreementLink[];
+}
+
+interface BrowserFetchedSource extends BrowserSourceRequest {
+  renderedHtml?: string;
+  dataBase64?: string;
+  textLength?: number;
+  error?: string;
+  linkedSources: CapturedAgreementLink[];
+}
 
 function base64FromBytes(bytes: Uint8Array): string {
   let binary = "";
@@ -17,12 +48,22 @@ function base64FromBytes(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+function isSpaRouteUrl(value: string): boolean {
+  try {
+    return /^#(?:!\/|\/)/.test(new URL(value).hash);
+  } catch {
+    return false;
+  }
+}
+
 async function waitForTab(tabId: number): Promise<void> {
+  const current = await chrome.tabs.get(tabId);
+  if (current.status === "complete") return;
   await new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(listener);
       reject(new Error("来源页面加载超时"));
-    }, 15_000);
+    }, 30_000);
     const listener = (updatedTabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
       if (updatedTabId !== tabId || changeInfo.status !== "complete") return;
       clearTimeout(timeout);
@@ -30,11 +71,216 @@ async function waitForTab(tabId: number): Promise<void> {
       resolve();
     };
     chrome.tabs.onUpdated.addListener(listener);
+    void chrome.tabs.get(tabId).then((tab) => {
+      if (tab.status !== "complete") return;
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    }).catch(() => undefined);
   });
 }
 
-async function fetchRenderedSource(source: { id: string; url: string; kind: "url" | "pdf" }) {
+async function captureRenderedTab(tabId: number): Promise<CapturedRenderedPage> {
+  type CaptureTarget = { tabId: number; allFrames?: boolean; frameIds?: number[] };
+  type RenderedFrameResult = {
+    html: string;
+    textLength: number;
+    title: string;
+    url: string;
+    links: CapturedAgreementLink[];
+  };
+  const capture = async (target: CaptureTarget) => chrome.scripting.executeScript({
+    target,
+    func: async () => {
+      const visibleTextLength = () => {
+        const renderedText = document.body?.innerText?.replace(/\s+/g, " ").trim();
+        if (renderedText) return renderedText.length;
+        const clone = document.documentElement.cloneNode(true) as HTMLElement;
+        clone.querySelectorAll("script,style,noscript,template").forEach((node) => node.remove());
+        return (clone.textContent ?? "").replace(/\s+/g, " ").trim().length;
+      };
+      let previousLength = -1;
+      let stablePolls = 0;
+      const startedAt = Date.now();
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        const textLength = visibleTextLength();
+        if (textLength === previousLength) stablePolls += 1;
+        else stablePolls = 0;
+        previousLength = textLength;
+        const elapsed = Date.now() - startedAt;
+        if (textLength >= 300 && elapsed >= 2_000 && stablePolls >= 4) break;
+        if (textLength >= 80 && elapsed >= 12_000 && stablePolls >= 4) break;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      const clone = document.documentElement.cloneNode(true) as HTMLElement;
+      clone.querySelectorAll("script,style,noscript,iframe,input,textarea,select,button,template").forEach((node) => node.remove());
+      clone.querySelectorAll("*").forEach((node) => {
+        for (const attribute of [...node.attributes]) {
+          if (/^on/i.test(attribute.name) || ["value", "srcdoc"].includes(attribute.name)) node.removeAttribute(attribute.name);
+        }
+      });
+      const keywords = [
+        "协议", "条款", "隐私", "privacy", "cookie", "cookies", "terms", "conditions",
+        "user agreement", "service agreement", "subscription", "auto-renew", "自动续费",
+        "社区规范", "community guidelines", "法律声明", "个人信息保护", "个人信息处理",
+        "数据保护", "数据须知", "收集使用信息", "账号注销"
+      ];
+      const normalize = (value: string) => value
+        .replace(/\u00a0/g, " ")
+        .replace(/[\u2010-\u2015]/g, "-")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLocaleLowerCase();
+      const links = [...document.querySelectorAll<HTMLAnchorElement>("a[href],area[href]")]
+        .map((link) => {
+          const title = normalize(link.innerText || link.textContent || link.title || link.getAttribute("aria-label") || "");
+          try {
+            const target = new URL(link.href, location.href);
+            const matchValue = `${title} ${target.pathname} ${target.hash}`;
+            const historical = /历史版本|历史条款|旧版|上一版|previous|histor(?:y|ical)|archive|archived/i.test(matchValue)
+              || /(?:^|[/_-])old(?:[/_-]|$)/i.test(`${target.pathname}${target.search}`);
+            const interactive = /\/(?:oauth2?|authorize|signin|sign-in|login)(?:\/|$)/i.test(`${target.hostname}${target.pathname}`)
+              || ["client_id", "redirect_uri", "response_type"].some((name) => target.searchParams.has(name));
+            return ["http:", "https:"].includes(target.protocol)
+              && keywords.some((keyword) => matchValue.includes(keyword))
+              && !historical
+              && !interactive
+              ? { title: link.innerText?.replace(/\s+/g, " ").trim() || link.textContent?.replace(/\s+/g, " ").trim() || "关联规则", url: target.href }
+              : undefined;
+          } catch {
+            return undefined;
+          }
+        })
+        .filter((item): item is { title: string; url: string } => Boolean(item));
+      return {
+        html: clone.outerHTML.slice(0, 2_000_000),
+        textLength: visibleTextLength(),
+        title: document.title || location.hostname,
+        url: location.href,
+        links
+      };
+    }
+  });
+  let rendered: Array<{ result?: unknown }> = [];
+  try {
+    rendered = await capture({ tabId, allFrames: true });
+  } catch {
+    try {
+      const frames = await chrome.webNavigation.getAllFrames({ tabId });
+      const frameResults = await Promise.allSettled(
+        (frames ?? []).map((frame) => capture({ tabId, frameIds: [frame.frameId] }))
+      );
+      rendered = frameResults
+        .flatMap((item) => item.status === "fulfilled" ? item.value : []);
+    } catch {
+      rendered = await capture({ tabId });
+    }
+  }
+  let candidates = rendered
+    .map((entry) => entry.result)
+    .filter((entry): entry is RenderedFrameResult =>
+      Boolean(entry && typeof entry === "object"
+        && typeof (entry as { html?: unknown }).html === "string"
+        && typeof (entry as { textLength?: unknown }).textLength === "number"));
+  if ((candidates.sort((left, right) => right.textLength - left.textLength)[0]?.textLength ?? 0) < 80) {
+    try {
+      const frames = await chrome.webNavigation.getAllFrames({ tabId });
+      const frameResults = await Promise.allSettled(
+        (frames ?? []).map((frame) => capture({ tabId, frameIds: [frame.frameId] }))
+      );
+      candidates = frameResults
+        .flatMap((item) => item.status === "fulfilled" ? item.value : [])
+        .map((entry) => entry.result)
+        .filter((entry): entry is RenderedFrameResult =>
+          Boolean(entry && typeof entry === "object"
+            && typeof (entry as { html?: unknown }).html === "string"
+            && typeof (entry as { textLength?: unknown }).textLength === "number"));
+    } catch {
+      // Keep the first capture result; the caller will report a useful empty-body error.
+    }
+  }
+  const candidate = candidates.sort((left, right) => right.textLength - left.textLength)[0];
+  const html = candidate?.html ?? "";
+  if (!html) throw new Error("当前来源页面没有返回 HTML");
+  const textLength = candidate?.textLength ?? 0;
+  if (textLength < 80) {
+    throw new Error(`页面完成渲染后仍未取得正文（仅 ${textLength} 字）`);
+  }
+  const links = candidates
+    .flatMap((result) => result.links ?? [])
+    .filter((item, index, all) => all.findIndex((other) => other.url === item.url) === index)
+    .slice(0, MAX_BROWSER_SOURCES);
+  console.info("[agreement-lens] captured rendered frame", {
+    tabId,
+    frameCount: rendered.length,
+    textLength: candidate?.textLength ?? 0,
+    htmlLength: html.length
+  });
+  return {
+    html,
+    title: candidate?.title ?? "",
+    url: candidate?.url ?? "",
+    textLength,
+    links
+  };
+}
+
+async function currentTabId(preferredTabId?: number): Promise<number | undefined> {
+  if (preferredTabId !== undefined) {
+    try {
+      const tab = await chrome.tabs.get(preferredTabId);
+      if (tab.id && tab.url) return tab.id;
+    } catch {
+      // The page may have been closed while the side panel was open.
+    }
+  }
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab?.id;
+}
+
+async function fetchCurrentTabSource(
+  source: BrowserSourceRequest,
+  preferredTabId?: number
+): Promise<BrowserFetchedSource | undefined> {
+  if (source.kind === "pdf") return undefined;
+  const tabId = await currentTabId(preferredTabId);
+  if (!tabId) return undefined;
+  const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+  if (!tab?.url || !samePageUrl(tab.url, source.url)) return undefined;
+  try {
+    const captured = await captureRenderedTab(tabId);
+    if (captured.html.length > MAX_HTML_BYTES) throw new Error("当前页面超过 2 MB");
+    console.info("[agreement-lens] captured rendered current tab", {
+      sourceUrl: source.url,
+      tabId,
+      textLength: captured.textLength,
+      htmlLength: captured.html.length
+    });
+    return {
+      ...source,
+      renderedHtml: captured.html,
+      textLength: captured.textLength,
+      linkedSources: captured.links
+    };
+  } catch (error) {
+    console.warn("[agreement-lens] failed to capture rendered current tab", {
+      sourceUrl: source.url,
+      tabId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return undefined;
+  }
+}
+
+async function fetchRenderedSource(
+  source: BrowserSourceRequest,
+  preferredTabId?: number
+): Promise<BrowserFetchedSource> {
+  const currentTabSource = await fetchCurrentTabSource(source, preferredTabId);
+  if (currentTabSource) return currentTabSource;
+
   let lastError = "浏览器无法读取来源";
+  let staticHtmlFallback: string | undefined;
   try {
     const response = await fetch(source.url, {
       credentials: "include",
@@ -46,15 +292,20 @@ async function fetchRenderedSource(source: { id: string; url: string; kind: "url
       if (source.kind === "pdf" || contentType.includes("pdf") || /\.pdf(?:$|\?)/i.test(source.url)) {
         const bytes = new Uint8Array(await response.arrayBuffer());
         if (bytes.length <= MAX_PDF_BYTES) {
-          return { id: source.id, dataBase64: base64FromBytes(bytes) };
+          return { ...source, dataBase64: base64FromBytes(bytes), linkedSources: [] as CapturedAgreementLink[] };
         }
         lastError = "PDF 超过 8 MB";
       } else {
-        const html = await response.text();
-        if (html.length <= MAX_HTML_BYTES && !needsRenderedFallback(html)) {
-          return { id: source.id, renderedHtml: html };
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        const html = decodeHtmlBytes(bytes, contentType);
+        if (html.length <= MAX_HTML_BYTES && !isSpaRouteUrl(source.url) && !needsRenderedFallback(html)) {
+          staticHtmlFallback = html;
         }
-        lastError = html.length > MAX_HTML_BYTES ? "页面超过 2 MB" : "页面是动态渲染空壳";
+        lastError = html.length > MAX_HTML_BYTES
+          ? "页面超过 2 MB"
+          : staticHtmlFallback
+            ? "正在用浏览器确认完整正文"
+            : "页面需要在浏览器中完成动态渲染";
       }
     } else {
       lastError = `来源返回 HTTP ${response.status}`;
@@ -63,7 +314,7 @@ async function fetchRenderedSource(source: { id: string; url: string; kind: "url
     lastError = error instanceof Error ? error.message : lastError;
   }
 
-  if (source.kind === "pdf") return { id: source.id, error: lastError };
+  if (source.kind === "pdf") return { ...source, error: lastError, linkedSources: [] as CapturedAgreementLink[] };
 
   let tabId: number | undefined;
   try {
@@ -71,36 +322,69 @@ async function fetchRenderedSource(source: { id: string; url: string; kind: "url
     if (!tab.id) throw new Error("无法打开来源页面");
     tabId = tab.id;
     if (tab.status !== "complete") await waitForTab(tab.id);
-    const [rendered] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: async () => {
-        const textLength = () => {
-          const clone = document.documentElement.cloneNode(true) as HTMLElement;
-          clone.querySelectorAll("script,style,noscript,template").forEach((node) => node.remove());
-          return (clone.textContent ?? "").replace(/\s+/g, " ").trim().length;
-        };
-        for (let attempt = 0; attempt < 20 && textLength() < 300; attempt += 1) {
-          await new Promise((resolve) => setTimeout(resolve, 500));
-        }
-        const clone = document.documentElement.cloneNode(true) as HTMLElement;
-        clone.querySelectorAll("script,style,noscript,iframe,input,textarea,select,button,template").forEach((node) => node.remove());
-        clone.querySelectorAll("*").forEach((node) => {
-          for (const attribute of [...node.attributes]) {
-            if (/^on/i.test(attribute.name) || ["value", "srcdoc"].includes(attribute.name)) node.removeAttribute(attribute.name);
-          }
-        });
-        return clone.outerHTML.slice(0, 2_000_000);
-      }
+    const captured = await captureRenderedTab(tabId);
+    console.info("[agreement-lens] captured rendered source", {
+      sourceUrl: source.url,
+      capturedUrl: captured.url,
+      tabId,
+      textLength: captured.textLength,
+      htmlLength: captured.html.length
     });
-    const html = typeof rendered?.result === "string" ? rendered.result : "";
-    return html && html.length <= MAX_HTML_BYTES
-      ? { id: source.id, renderedHtml: html }
-      : { id: source.id, error: "页面正文为空或超过 2 MB" };
+    return captured.html && captured.html.length <= MAX_HTML_BYTES
+      ? { ...source, renderedHtml: captured.html, textLength: captured.textLength, linkedSources: captured.links }
+      : { ...source, error: "页面正文为空或超过 2 MB", linkedSources: [] as CapturedAgreementLink[] };
   } catch (error) {
-    return { id: source.id, error: error instanceof Error ? error.message : lastError };
+    if (staticHtmlFallback) {
+      return {
+        ...source,
+        renderedHtml: staticHtmlFallback,
+        linkedSources: [] as CapturedAgreementLink[]
+      };
+    }
+    return { ...source, error: error instanceof Error ? error.message : lastError, linkedSources: [] as CapturedAgreementLink[] };
   } finally {
     if (tabId !== undefined) await chrome.tabs.remove(tabId).catch(() => undefined);
   }
+}
+
+function canonicalSourceUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    if (url.hash && !/^#(?:!\/|\/)/.test(url.hash)) url.hash = "";
+    return url.href;
+  } catch {
+    return value;
+  }
+}
+
+async function fetchSourceGraphInBrowser(
+  roots: BrowserSourceRequest[],
+  preferredTabId?: number
+) {
+  const queued = roots.slice(0, MAX_BROWSER_SOURCES);
+  const seen = new Set(queued.map((source) => canonicalSourceUrl(source.url)));
+  const results: BrowserFetchedSource[] = [];
+  while (queued.length && results.length < MAX_BROWSER_SOURCES) {
+    const batch = queued.splice(0, Math.min(3, MAX_BROWSER_SOURCES - results.length));
+    const acquired = await Promise.all(batch.map((source) => fetchRenderedSource(source, preferredTabId)));
+    results.push(...acquired);
+    for (const source of acquired) {
+      if (!source.renderedHtml) continue;
+      for (const link of source.linkedSources ?? []) {
+        const url = canonicalSourceUrl(link.url);
+        if (seen.has(url) || queued.length + results.length >= MAX_BROWSER_SOURCES) continue;
+        seen.add(url);
+        queued.push({
+          id: crypto.randomUUID(),
+          title: link.title,
+          url,
+          kind: /\.pdf(?:$|\?)/i.test(url) ? "pdf" : "url",
+          relation: "direct"
+        });
+      }
+    }
+  }
+  return results;
 }
 
 async function maybeRecheck(payload: PageSnapshot) {
@@ -134,6 +418,19 @@ async function scanTab(tabId: number) {
   }
 }
 
+function samePageUrl(left: string | undefined, right: string | undefined): boolean {
+  if (!left || !right) return false;
+  try {
+    const leftUrl = new URL(left);
+    const rightUrl = new URL(right);
+    if (leftUrl.hash && !/^#(?:!\/|\/)/.test(leftUrl.hash)) leftUrl.hash = "";
+    if (rightUrl.hash && !/^#(?:!\/|\/)/.test(rightUrl.hash)) rightUrl.hash = "";
+    return leftUrl.href === rightUrl.href;
+  } catch {
+    return left === right;
+  }
+}
+
 chrome.action.onClicked.addListener((tab) => {
   if (tab.id) void scanTab(tab.id);
 });
@@ -156,13 +453,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       target: { tabId: sender.tab.id },
       world: "MAIN",
       func: resolveDynamicAgreementLinks
-    }).then(([result]) => sendResponse({ links: result?.result ?? [] }))
-      .catch(() => sendResponse({ links: [] }));
+    }).then(([result]) => {
+      console.info("[agreement-lens] dynamic discovery completed", {
+        tabId: sender.tab?.id,
+        links: result?.result ?? []
+      });
+      sendResponse({ links: result?.result ?? [] });
+    }).catch((error) => {
+      console.warn("[agreement-lens] dynamic discovery failed", {
+        tabId: sender.tab?.id,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      sendResponse({ links: [] });
+    });
     return true;
   }
   if (message.type === "PAGE_DISCOVERED") {
     const incoming = { ...message.payload, tabId: sender.tab?.id ?? message.payload.tabId } as PageSnapshot;
-    void maybeRecheck(incoming).then((payload) => {
+    void chrome.tabs.get(incoming.tabId).then((tab) => {
+      if (!samePageUrl(tab.url, incoming.pageUrl)) return null;
+      return maybeRecheck(incoming);
+    }).then((payload) => {
+      if (!payload) {
+        sendResponse({ ok: false, stale: true });
+        return;
+      }
       void chrome.storage.session.set({ [`page:${payload.tabId}`]: payload, latestPage: payload });
       void chrome.runtime.sendMessage({ type: "PAGE_STATE_UPDATED", payload }).catch(() => undefined);
       const count = payload.sources.length;
@@ -170,19 +485,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         void updateTabBadge(chrome, payload.tabId, count ? String(count) : "", count ? "#c7482d" : "#69726d");
       }
       sendResponse({ ok: true });
-    });
+    }).catch(() => sendResponse({ ok: false, stale: true }));
     return true;
   }
   if (message.type === "GET_PAGE_STATE") {
     chrome.tabs.query({ active: true, currentWindow: true }, async ([tab]) => {
       if (!tab?.id) return sendResponse(null);
       const stored = await chrome.storage.session.get(`page:${tab.id}`);
-      sendResponse(stored[`page:${tab.id}`] ?? null);
+      const snapshot = stored[`page:${tab.id}`] as PageSnapshot | undefined;
+      sendResponse(snapshot && samePageUrl(snapshot.pageUrl, tab.url) ? snapshot : null);
     });
     return true;
   }
   if (message.type === "FETCH_AGREEMENT_SOURCES") {
-    void Promise.all(message.sources.slice(0, 8).map(fetchRenderedSource))
+    const tabId = message.tabId;
+    void fetchSourceGraphInBrowser(message.sources.slice(0, MAX_BROWSER_SOURCES) as BrowserSourceRequest[], tabId)
       .then((sources) => sendResponse({ ok: true, sources }))
       .catch((error) => sendResponse({ ok: false, error: error instanceof Error ? error.message : "来源读取失败" }));
     return true;

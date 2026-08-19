@@ -38,6 +38,7 @@ db.exec(`
     progress INTEGER NOT NULL,
     message TEXT NOT NULL,
     error TEXT,
+    agents_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -64,6 +65,11 @@ db.exec(`
     created_at TEXT NOT NULL
   );
 `);
+try {
+  db.exec("ALTER TABLE jobs ADD COLUMN agents_json TEXT");
+} catch {
+  // Existing databases already have this column.
+}
 
 export function createAnalysisRecord(record: {
   id: string; serviceId: string; serviceName: string; pageUrl: string;
@@ -73,14 +79,31 @@ export function createAnalysisRecord(record: {
     (id, service_id, service_name, page_url, context_json, request_json, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(record.id, record.serviceId, record.serviceName, record.pageUrl, JSON.stringify(record.context), JSON.stringify(record.request), record.job.createdAt, record.job.updatedAt);
-  db.prepare(`INSERT INTO jobs (id, analysis_id, state, progress, message, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .run(record.job.id, record.id, record.job.state, record.job.progress, record.job.message, record.job.createdAt, record.job.updatedAt);
+  db.prepare(`INSERT INTO jobs (id, analysis_id, state, progress, message, agents_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      record.job.id,
+      record.id,
+      record.job.state,
+      record.job.progress,
+      record.job.message,
+      record.job.agents ? JSON.stringify(record.job.agents) : null,
+      record.job.createdAt,
+      record.job.updatedAt
+    );
 }
 
 export function updateJob(job: JobStatus) {
-  db.prepare("UPDATE jobs SET state=?, progress=?, message=?, error=?, updated_at=? WHERE id=?")
-    .run(job.state, job.progress, job.message, job.error ?? null, job.updatedAt, job.id);
+  db.prepare("UPDATE jobs SET state=?, progress=?, message=?, error=?, agents_json=?, updated_at=? WHERE id=?")
+    .run(
+      job.state,
+      job.progress,
+      job.message,
+      job.error ?? null,
+      job.agents ? JSON.stringify(job.agents) : null,
+      job.updatedAt,
+      job.id
+    );
 }
 
 export function getJob(id: string): JobStatus | undefined {
@@ -90,6 +113,7 @@ export function getJob(id: string): JobStatus | undefined {
     id: row.id as string, analysisId: row.analysis_id as string,
     state: row.state as JobStatus["state"], progress: row.progress as number,
     message: row.message as string, error: row.error as string | undefined,
+    agents: row.agents_json ? JSON.parse(row.agents_json as string) : undefined,
     createdAt: row.created_at as string, updatedAt: row.updated_at as string
   };
 }

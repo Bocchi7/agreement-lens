@@ -3,15 +3,17 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   AlertTriangle, ArrowLeft, BookOpen, Check, CheckCircle2, ChevronRight,
-  CircleDollarSign, Database, ExternalLink, FileText, History, LoaderCircle,
+  Circle, CircleDollarSign, Database, ExternalLink, FileText, History, LoaderCircle,
   LockKeyhole, MessageCircle, Plus, RefreshCw, Save, Search, Send, Shield,
   Sparkles, Upload, UserRoundX, X
 } from "lucide-react";
 import type {
   AnalysisResult, DiscoveredSource, Finding, JobStatus, UserContext, VersionComparison
 } from "@agreement-lens/shared";
+import { maxSourceDocuments } from "@agreement-lens/shared";
 import { api, ApiError } from "./api";
 import type { PageSnapshot } from "./types";
+import { evidenceSourceUrl, resultSourceLabel } from "./evidence-source";
 
 type View = "overview" | "risks" | "sources" | "chat" | "versions";
 type Phase = "loading" | "pair" | "permission" | "scanning" | "prepare" | "preparing" | "running" | "result" | "offline" | "error";
@@ -74,6 +76,7 @@ type PersistedAnalysisState = {
   job?: JobStatus;
   jobId?: string;
   analysisId?: string;
+  previousAnalysisId?: string;
   pageUrl?: string;
   sourceCount?: number;
 };
@@ -122,7 +125,7 @@ async function clearAnalysisState(tabId: number): Promise<void> {
   }
 }
 
-async function waitForTabComplete(tabId: number, timeoutMs = 15_000): Promise<void> {
+async function waitForTabComplete(tabId: number, timeoutMs = 30_000): Promise<void> {
   const current = await chrome.tabs.get(tabId);
   if (current.status === "complete") return;
   await new Promise<void>((resolve, reject) => {
@@ -142,14 +145,22 @@ async function waitForTabComplete(tabId: number, timeoutMs = 15_000): Promise<vo
 
 async function highlightInTab(tabId: number, quote: string): Promise<boolean> {
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ["content.js"] });
   } catch {
-    return false;
-  }
-  for (let attempt = 0; attempt < 6; attempt++) {
     try {
-      const response = await chrome.tabs.sendMessage(tabId, { type: "HIGHLIGHT_EVIDENCE", quote });
-      if (response?.found) return true;
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    } catch {
+      return false;
+    }
+  }
+  for (let attempt = 0; attempt < 12; attempt++) {
+    try {
+      const frames = await chrome.webNavigation.getAllFrames({ tabId }).catch(() => [{ frameId: 0 }]);
+      const frameIds = [...new Set((frames ?? []).map((frame) => frame.frameId))];
+      const responses = await Promise.all(frameIds.map((frameId) =>
+        chrome.tabs.sendMessage(tabId, { type: "HIGHLIGHT_EVIDENCE", quote }, { frameId }).catch(() => undefined)
+      ));
+      if (responses.some((response) => response?.found)) return true;
     } catch {
       // Dynamic agreement pages may not be ready immediately after the load event.
     }
@@ -197,6 +208,8 @@ export function App() {
   const [permissionTarget, setPermissionTarget] = useState<{ id: number; url: string } | null>(null);
   const [saving, setSaving] = useState(false);
   const [asking, setAsking] = useState(false);
+  const [supplementing, setSupplementing] = useState(false);
+  const [preserveResultWhileRunning, setPreserveResultWhileRunning] = useState(false);
 
   useEffect(() => {
     void (async () => {
@@ -261,12 +274,18 @@ export function App() {
       const persisted = await readAnalysisState(page.tabId);
       if (persisted) {
         try {
+          let previousAnalysis: AnalysisResult | undefined;
+          if (persisted.previousAnalysisId) {
+            previousAnalysis = await api.getAnalysis(persisted.previousAnalysisId).catch(() => undefined);
+            if (previousAnalysis) setResult(previousAnalysis);
+          }
           const restoredJob = persisted.jobId
             ? await api.getJob(persisted.jobId)
             : persisted.job;
           if (restoredJob?.state === "complete" && (persisted.analysisId ?? restoredJob.analysisId)) {
             const analysis = await api.getAnalysis(persisted.analysisId ?? restoredJob.analysisId);
             setResult(analysis);
+            setPreserveResultWhileRunning(false);
             setSources(page.sources);
             setJob(restoredJob);
             setPhase("result");
@@ -275,11 +294,13 @@ export function App() {
           if (restoredJob?.state === "failed") {
             setJob(restoredJob);
             setError(restoredJob.error ?? "分析失败");
-            setPhase("error");
+            setPreserveResultWhileRunning(false);
+            setPhase(previousAnalysis ? "result" : "error");
             return;
           }
           if (restoredJob) {
             setJob(restoredJob);
+            setPreserveResultWhileRunning(Boolean(previousAnalysis));
             setPhase("running");
             return;
           }
@@ -339,14 +360,16 @@ export function App() {
           await writeAnalysisState(snapshot.tabId, {
             job: next,
             jobId: next.id,
-            analysisId: next.analysisId,
-            pageUrl: snapshot.pageUrl,
-            sourceCount: sources.length
+              analysisId: next.analysisId,
+              previousAnalysisId: preserveResultWhileRunning ? result?.id : undefined,
+              pageUrl: snapshot.pageUrl,
+              sourceCount: sources.length
           });
         }
         if (next.state === "complete") {
           const analysis = await api.getAnalysis(next.analysisId);
           setResult(analysis);
+          setPreserveResultWhileRunning(false);
           if (snapshot?.tabId !== undefined) {
             await writeAnalysisState(snapshot.tabId, {
               job: next,
@@ -360,17 +383,19 @@ export function App() {
           window.clearInterval(timer);
         } else if (next.state === "failed") {
           setError(next.error ?? "分析失败");
-          setPhase("error");
+          setPreserveResultWhileRunning(false);
+          setPhase(preserveResultWhileRunning && result ? "result" : "error");
           window.clearInterval(timer);
         }
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : "无法读取任务状态");
-        setPhase("offline");
+        setPreserveResultWhileRunning(false);
+        setPhase(preserveResultWhileRunning && result ? "result" : "offline");
         window.clearInterval(timer);
       }
     }, 700);
     return () => window.clearInterval(timer);
-  }, [phase, job?.id]);
+  }, [phase, job?.id, preserveResultWhileRunning, result?.id]);
 
   async function pair() {
     try {
@@ -472,10 +497,9 @@ export function App() {
       setPhase("preparing");
       const selectedUrlSources = sources.filter((source) => source.selected && source.url && (source.kind === "url" || source.kind === "pdf"));
       if (chromeAvailable() && selectedUrlSources.length > 0) {
-        const origins = [...new Set(selectedUrlSources.map((source) => `${new URL(source.url!).origin}/*`))];
-        const granted = await chrome.permissions.request({ origins });
+        const granted = await chrome.permissions.request({ origins: ["http://*/*", "https://*/*"] });
         if (!granted) {
-          setError("需要允许访问协议链接，才能在浏览器中读取被拦截的页面");
+          setError("需要允许读取协议链接及其引用的补充条款，才能完成浏览器渲染和正文提取");
           setPhase("error");
           return;
         }
@@ -486,24 +510,60 @@ export function App() {
         const browserSources = await withTimeout(
           chrome.runtime.sendMessage({
             type: "FETCH_AGREEMENT_SOURCES",
-            sources: selectedUrlSources.map((source) => ({ id: source.id, url: source.url!, kind: source.kind as "url" | "pdf" }))
+            tabId: snapshot.tabId,
+            sources: selectedUrlSources.map((source) => ({
+              id: source.id,
+              title: source.title,
+              url: source.url!,
+              kind: source.kind as "url" | "pdf",
+              relation: source.relation
+            }))
           }),
-          35_000,
+          180_000,
           "读取协议页面超时，请检查网络或减少本次分析来源"
         );
-        const fetched = new Map<string, { renderedHtml?: string; dataBase64?: string; error?: string }>(
-          (browserSources?.sources ?? []).map((source: { id: string; renderedHtml?: string; dataBase64?: string; error?: string }) => [source.id, source])
+        type BrowserPreparedSource = {
+          id: string;
+          title?: string;
+          url?: string;
+          kind?: "url" | "pdf";
+          relation?: "primary" | "direct" | "manual";
+          renderedHtml?: string;
+          dataBase64?: string;
+          error?: string;
+        };
+        const acquiredSources = (browserSources?.sources ?? []) as BrowserPreparedSource[];
+        const fetched = new Map<string, BrowserPreparedSource>(
+          acquiredSources.map((source) => [source.id, source])
         );
-        preparedSources = sources.map((source) => {
+        const failedRoots = selectedUrlSources.flatMap((source) => {
           const acquired = fetched.get(source.id);
-          return acquired ? { ...source, renderedHtml: acquired.renderedHtml, dataBase64: acquired.dataBase64 } : source;
+          if (acquired?.renderedHtml || acquired?.dataBase64) return [];
+          return [`${source.title}：${acquired?.error ?? "浏览器未返回读取结果"}`];
         });
-        const failures = [...fetched.values()].filter((source) => source.error);
-        if (failures.length === selectedUrlSources.length && !sources.some((source) => source.selected && source.kind === "text" && source.text?.trim())) {
-          setError("浏览器也无法读取协议内容，请先打开协议页面或手动粘贴文本后再分析");
+        if (failedRoots.length > 0) {
+          setError(`以下协议未能取得正文，已停止本次分析：${failedRoots.join("；")}`);
           setPhase("error");
           return;
         }
+        const existingIds = new Set(sources.map((source) => source.id));
+        const enrichedRoots = sources.map((source) => {
+          const acquired = fetched.get(source.id);
+          return acquired ? { ...source, renderedHtml: acquired.renderedHtml, dataBase64: acquired.dataBase64 } : source;
+        });
+        const browserDiscovered = acquiredSources
+          .filter((source) => !existingIds.has(source.id) && source.url && source.title && (source.renderedHtml || source.dataBase64))
+          .map((source) => ({
+            id: source.id,
+            kind: source.kind ?? "url",
+            title: source.title!,
+            url: source.url!,
+            renderedHtml: source.renderedHtml,
+            dataBase64: source.dataBase64,
+            selected: true,
+            relation: source.relation ?? "direct"
+          } satisfies DiscoveredSource));
+        preparedSources = [...enrichedRoots, ...browserDiscovered].slice(0, 8);
       }
       const created = await api.createAnalysis({
         serviceName: snapshot.pageTitle, pageUrl: snapshot.pageUrl,
@@ -522,6 +582,7 @@ export function App() {
         sourceCount: preparedSources.filter((source) => source.selected).length
       });
       setJob(pendingJob);
+      setPreserveResultWhileRunning(false);
       setPhase("running");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法开始分析");
@@ -551,11 +612,13 @@ export function App() {
 
   async function openSourceEvidence(finding: Finding) {
     const evidence = finding.evidence.find((item) => item.verified) ?? finding.evidence[0];
-    if (!evidence?.url || !chromeAvailable()) return;
+    if (!evidence) return;
+    const sourceUrl = evidenceSourceUrl(result!, evidence);
+    if (!sourceUrl || !chromeAvailable()) return;
     setError("");
     const targetUrl = evidence.page
-      ? `${evidence.url.replace(/#.*$/, "")}#page=${evidence.page}`
-      : evidence.url;
+      ? `${sourceUrl.replace(/#.*$/, "")}#page=${evidence.page}`
+      : sourceUrl;
     const tab = await chrome.tabs.create({ url: targetUrl });
     if (!tab.id) return;
     try {
@@ -591,6 +654,7 @@ export function App() {
         });
       }
       setJob(pendingJob);
+      setPreserveResultWhileRunning(false);
       setPhase("running");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法开始版本复核");
@@ -599,16 +663,77 @@ export function App() {
   }
 
   async function addRelatedSources(related: Array<{ title: string; url: string }>) {
-    if (!result || !related.length) return;
+    if (!result || !related.length || supplementing || preserveResultWhileRunning) return;
+    setError("");
+    setSupplementing(true);
     try {
-      const created = await api.addSources(result.id, related.map((item) => ({
+      const remaining = Math.max(0, maxSourceDocuments - result.sources.length);
+      const requestedSources: DiscoveredSource[] = related.slice(0, Math.min(8, remaining)).map((item) => ({
         id: crypto.randomUUID(),
         kind: /\.pdf(?:$|\?)/i.test(item.url) ? "pdf" : "url",
         title: item.title,
         url: item.url,
         selected: true,
-        relation: "manual"
-      })));
+        relation: "direct"
+      } satisfies DiscoveredSource));
+      if (!requestedSources.length) throw new Error(`当前分析已达到 ${maxSourceDocuments} 份材料上限`);
+
+      let preparedSources = requestedSources;
+      if (chromeAvailable()) {
+        const granted = await chrome.permissions.request({ origins: ["http://*/*", "https://*/*"] });
+        if (!granted) throw new Error("需要允许读取补充协议及其引用页面");
+        const browserSources = await withTimeout(
+          chrome.runtime.sendMessage({
+            type: "FETCH_AGREEMENT_SOURCES",
+            tabId: snapshot?.tabId,
+            sources: requestedSources.map((source) => ({
+              id: source.id,
+              title: source.title,
+              url: source.url!,
+              kind: source.kind as "url" | "pdf",
+              relation: source.relation
+            }))
+          }),
+          180_000,
+          "读取补充协议页面超时"
+        );
+        type BrowserPreparedSource = {
+          id: string;
+          title?: string;
+          url?: string;
+          kind?: "url" | "pdf";
+          relation?: "primary" | "direct" | "manual";
+          renderedHtml?: string;
+          dataBase64?: string;
+          error?: string;
+        };
+        const acquired = (browserSources?.sources ?? []) as BrowserPreparedSource[];
+        const acquiredById = new Map(acquired.map((source) => [source.id, source]));
+        const failedRoots = requestedSources.flatMap((source) => {
+          const fetched = acquiredById.get(source.id);
+          if (fetched?.renderedHtml || fetched?.dataBase64) return [];
+          return [`${source.title}：${fetched?.error ?? "浏览器未返回读取结果"}`];
+        });
+        if (failedRoots.length) throw new Error(`以下补充材料未能取得正文：${failedRoots.join("；")}`);
+
+        const includedUrls = new Set(result.sources.map((source) => source.url).filter((url): url is string => Boolean(url)));
+        preparedSources = acquired
+          .filter((source) => source.url && source.title && (source.renderedHtml || source.dataBase64) && !includedUrls.has(source.url))
+          .map((source) => ({
+            id: source.id,
+            kind: source.kind ?? "url",
+            title: source.title!,
+            url: source.url!,
+            renderedHtml: source.renderedHtml,
+            dataBase64: source.dataBase64,
+            selected: true,
+            relation: source.relation ?? "direct"
+          } satisfies DiscoveredSource))
+          .slice(0, remaining);
+      }
+      if (!preparedSources.length) throw new Error("所选补充材料已包含在当前分析中");
+
+      const created = await api.addSources(result.id, preparedSources);
       const pendingJob = {
         id: created.jobId, analysisId: created.analysisId, state: "queued",
         progress: 0, message: "补充材料已进入队列",
@@ -619,15 +744,19 @@ export function App() {
           job: pendingJob,
           jobId: pendingJob.id,
           analysisId: pendingJob.analysisId,
+          previousAnalysisId: result.id,
           pageUrl: snapshot.pageUrl,
-          sourceCount: result.sources.length + related.length
+          sourceCount: result.sources.length + preparedSources.length
         });
       }
       setJob(pendingJob);
+      setPreserveResultWhileRunning(true);
       setPhase("running");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "无法补充关联材料");
-      setPhase("error");
+      setError(`补充材料失败：${cause instanceof Error ? cause.message : "未知错误"}`);
+      setPhase("result");
+    } finally {
+      setSupplementing(false);
     }
   }
 
@@ -677,12 +806,13 @@ export function App() {
   if (phase === "permission") return <Shell><PermissionScreen onGrant={grantAndScan} /></Shell>;
   if (phase === "scanning") return <Shell><Centered><LoaderCircle className="spin" /><p className="eyebrow">正在读取当前站点</p><h2>扫描协议入口</h2></Centered></Shell>;
   if (phase === "preparing") return <Shell><Centered><LoaderCircle className="spin" /><p className="eyebrow">正在准备分析</p><h2>读取协议原文</h2><p>正在获取所选页面并整理分析材料。</p></Centered></Shell>;
-  if (phase === "running" && job) return <Shell><RunningScreen job={job} sources={sources} /></Shell>;
+  if (phase === "running" && job && !(preserveResultWhileRunning && result)) return <Shell><RunningScreen job={job} sources={sources} /></Shell>;
   if (phase === "offline") return <Shell offline><OfflineScreen detail={error} /></Shell>;
   if (phase === "error") return <Shell><Centered><AlertTriangle size={30} /><h2>操作失败</h2><p>{error}</p><button className="primary" onClick={() => { setError(""); setPhase(snapshot ? "prepare" : "permission"); }}><RefreshCw size={16} />返回并重试</button></Centered></Shell>;
-  if (phase === "result" && result) {
+  if ((phase === "result" || (phase === "running" && preserveResultWhileRunning)) && result) {
     return <Shell>
       <ResultHeader result={result} saving={saving} onSave={() => void saveAnalysis()} onDelete={() => void removeAnalysis()} />
+      {(supplementing || (phase === "running" && job)) && <section className="supplement-progress"><LoaderCircle className="spin" size={16} /><div><strong>{supplementing ? "正在读取补充材料" : job?.message ?? "正在深入分析"}</strong><p>{supplementing ? "原分析结果会保留，读取完成后再启动分析。" : `当前进度 ${job?.progress ?? 0}%`}</p></div></section>}
       {error && <p className="inline-error result-error">{error}</p>}
       <nav className="tabs">
         {([
@@ -697,11 +827,11 @@ export function App() {
       <main className="result-body">
         {view === "overview" && <Overview result={result} topFindings={topFindings} openEvidence={openEvidence} setView={setView} />}
         {view === "risks" && <RiskList findings={result.findings} openEvidence={openEvidence} />}
-        {view === "sources" && <SourcesView result={result} onAddRelated={addRelatedSources} />}
+        {view === "sources" && <SourcesView result={result} supplementing={supplementing || (phase === "running" && preserveResultWhileRunning)} onAddRelated={addRelatedSources} />}
         {view === "chat" && <ChatView messages={messages} suggestions={result.followUpSuggestions ?? []} input={chatInput} setInput={setChatInput} ask={ask} asking={asking} />}
         {view === "versions" && <VersionsView versions={versions} onRecheck={recheck} />}
       </main>
-      {selectedFinding && <EvidenceDrawer finding={selectedFinding} onClose={() => setSelectedFinding(null)} onOpenSource={() => void openSourceEvidence(selectedFinding)} />}
+      {selectedFinding && <EvidenceDrawer result={result} finding={selectedFinding} onClose={() => setSelectedFinding(null)} onOpenSource={() => void openSourceEvidence(selectedFinding)} />}
     </Shell>;
   }
   return <Shell>
@@ -775,11 +905,22 @@ function PrepareScreen(props: {
 }
 
 function RunningScreen({ job, sources }: { job: JobStatus; sources: DiscoveredSource[] }) {
-  const agents = [
-    ["费用", job.progress > 40], ["数据", job.progress > 47], ["内容与账号", job.progress > 54], ["权利与变更", job.progress > 61],
-    ["证据核验", job.progress > 78], ["结论整合", job.progress > 94]
-  ];
-  return <main className="running"><div className="radar"><span /><Search size={28} /></div><p className="eyebrow">正在分析 {sources.length} 份材料</p><h1>{job.message}</h1><div className="progress-track"><i style={{ width: `${job.progress}%` }} /></div><span className="progress-number">{job.progress}%</span><div className="agent-grid">{agents.map(([name, done]) => <div className={done ? "done" : ""} key={String(name)}>{done ? <Check size={14} /> : <LoaderCircle size={14} className="spin" />}<span>{name}</span></div>)}</div><p className="muted small">关闭侧边栏不会中断任务</p></main>;
+  const agentDefinitions = [
+    ["fees", "费用"],
+    ["privacy", "隐私与数据"],
+    ["content", "内容与账号"],
+    ["rights", "权利与变更"],
+    ["verifier", "证据核验"],
+    ["main", "结论整合"],
+    ["router", "版本路由"]
+  ] as const;
+  return <main className="running"><div className="radar"><span /><Search size={28} /></div><p className="eyebrow">正在分析 {sources.length} 份材料</p><h1>{job.message}</h1><div className="progress-track"><i style={{ width: `${job.progress}%` }} /></div><span className="progress-number">{job.progress}%</span><div className="agent-grid">{agentDefinitions.map(([key, name]) => {
+    const progress = job.agents?.[key];
+    const status = progress?.status ?? "idle";
+    const Icon = status === "completed" ? Check : status === "failed" ? AlertTriangle : status === "running" ? LoaderCircle : Circle;
+    const details = progress ? `交互 ${progress.rounds} 轮 · 重试 ${progress.retries} 次` : "尚未开始";
+    return <div className={status === "completed" ? "done" : status === "failed" ? "failed" : status === "running" ? "active" : ""} key={key}><Icon size={14} className={status === "running" ? "spin" : undefined} /><span><strong>{name}</strong><small>{details}</small></span></div>;
+  })}</div><p className="muted small">关闭侧边栏不会中断任务</p></main>;
 }
 
 function ResultHeader({ result, saving, onSave, onDelete }: { result: AnalysisResult; saving: boolean; onSave: () => void; onDelete: () => void }) {
@@ -806,13 +947,14 @@ function RiskList({ findings, openEvidence }: { findings: Finding[]; openEvidenc
   return <section className="result-section no-top"><div className="view-heading"><h2>全部风险</h2><span>{findings.length} 项</span></div><div className="finding-list">{findings.map((finding, index) => <FindingRow key={finding.id} finding={finding} index={index + 1} onClick={() => openEvidence(finding)} />)}</div></section>;
 }
 
-function SourcesView({ result, onAddRelated }: { result: AnalysisResult; onAddRelated: (sources: Array<{ title: string; url: string }>) => void }) {
+function SourcesView({ result, supplementing, onAddRelated }: { result: AnalysisResult; supplementing: boolean; onAddRelated: (sources: Array<{ title: string; url: string }>) => void }) {
   const included = new Set(result.sources.map((source) => source.url).filter(Boolean));
+  const remaining = Math.max(0, maxSourceDocuments - result.sources.length);
   const related = result.sources.flatMap((source) => source.linkedSources ?? [])
     .filter((item) => !included.has(item.url))
     .filter((item, index, all) => all.findIndex((other) => other.url === item.url) === index)
-    .slice(0, 8);
-  return <section className="result-section no-top"><div className="view-heading"><h2>分析来源</h2><span>{result.sources.length} 份</span></div>{result.sources.map((source) => <div className="source-detail" key={source.id}><div className={`source-status ${source.status}`}><FileText size={17} /></div><div><strong>{source.title}</strong><p>{source.sections.length} 个章节 · {source.normalizedText.length.toLocaleString()} 字</p><small>{source.status === "ready" ? "已完整读取并生成内容指纹" : source.error}</small></div>{source.url && <button title="打开来源" onClick={() => chromeAvailable() && chrome.tabs.create({ url: source.url })}><ExternalLink size={15} /></button>}</div>)}{related.length > 0 && <div className="related-box"><div><strong>发现 {related.length} 份更深层关联材料</strong><p>{related.map((item) => item.title).join("、")}</p></div><button onClick={() => onAddRelated(related)}>确认并继续读取</button></div>}</section>;
+    .slice(0, Math.min(8, remaining));
+  return <section className="result-section no-top"><div className="view-heading"><h2>分析来源</h2><span>{result.sources.length} 份</span></div>{result.sources.map((source) => <div className="source-detail" key={source.id}><div className={`source-status ${source.status}`}><FileText size={17} /></div><div><strong>{source.title}</strong><p>{source.normalizedText.length > 0 ? `${source.sections.length} 个章节 · ${source.normalizedText.length.toLocaleString()} 字` : source.status === "failed" ? "读取失败" : "未取得有效正文"}</p><small>{source.status === "ready" ? "已完整读取并生成内容指纹" : source.error}</small></div>{source.url && <button title="打开来源" onClick={() => chromeAvailable() && chrome.tabs.create({ url: source.url })}><ExternalLink size={15} /></button>}</div>)}{related.length > 0 && <div className="related-box"><div><strong>发现 {related.length} 份更深层关联材料</strong><p>{related.map((item) => item.title).join("、")}</p></div><button disabled={supplementing} onClick={() => onAddRelated(related)}>{supplementing ? <><LoaderCircle className="spin" size={13} />正在处理</> : "确认并继续读取"}</button></div>}</section>;
 }
 
 function ChatView({ messages, suggestions, input, setInput, ask, asking }: { messages: Array<{ role: "user" | "assistant"; text: string }>; suggestions: string[]; input: string; setInput: (v: string) => void; ask: () => void; asking: boolean }) {
@@ -827,9 +969,9 @@ function VersionsView({ versions, onRecheck }: { versions: { analyses: Array<{ a
   return <section className="result-section no-top"><div className="view-heading"><h2>版本记录</h2><button className="recheck-button" onClick={onRecheck}><RefreshCw size={14} />立即复核</button></div>{versions.comparisons[0] && <div className={`version-impact ${versions.comparisons[0].changed ? "changed" : ""}`}><strong>{versions.comparisons[0].changed ? "上次变化对你的影响" : "上次检查没有变化"}</strong><p>{versions.comparisons[0].decisionImpact}</p><small>{versions.comparisons[0].summary}</small></div>}{versions.analyses.length < 2 && <div className="version-empty"><History size={25} /><strong>正在守候下一次变化</strong><p>再次复核时会先比较正文指纹，没有变化就不会调用模型。</p></div>}{versions.analyses.map((version, index) => <div className="version-row" key={version.analysisId}><span className={index === 0 ? "current" : ""} /><div><strong>{index === 0 ? "当前版本" : "历史版本"}</strong><p>{new Date(version.createdAt).toLocaleString("zh-CN")}</p></div><small>{recommendationMeta[version.recommendation as keyof typeof recommendationMeta]?.label}</small></div>)}</section>;
 }
 
-function EvidenceDrawer({ finding, onClose, onOpenSource }: { finding: Finding; onClose: () => void; onOpenSource: () => void }) {
+function EvidenceDrawer({ result, finding, onClose, onOpenSource }: { result: AnalysisResult; finding: Finding; onClose: () => void; onOpenSource: () => void }) {
   const evidence = finding.evidence.find((item) => item.verified) ?? finding.evidence[0];
-  return <div className="drawer-backdrop" onClick={onClose}><aside className="evidence-drawer" onClick={(e) => e.stopPropagation()}><header><button className="icon-button" title="返回" onClick={onClose}><ArrowLeft size={18} /></button><span>告警详情</span><button className="icon-button" title="关闭" onClick={onClose}><X size={18} /></button></header><div className="drawer-content"><span className={`severity-label ${finding.severity}`}>{finding.status !== "verified" ? "待核实" : finding.severity === "high" ? "高影响" : finding.severity === "medium" ? "中等影响" : "低影响"}</span><h2>{finding.title}</h2><dl><dt>什么时候触发</dt><dd>{finding.trigger}</dd><dt>平台可能做什么</dt><dd>{finding.platformAction}</dd><dt>对你的影响</dt><dd>{finding.userImpact}</dd></dl><div className="evidence-quote"><div><BookOpen size={16} /><strong>原文证据</strong>{evidence?.verified && <span><Check size={12} />已核验</span>}</div><blockquote>{focusedEvidenceQuote(finding, evidence?.quote) ?? "暂无可核验引用"}</blockquote><small>{resultSourceLabel(evidence)}</small>{evidence?.url && <button className="open-source" onClick={onOpenSource}><ExternalLink size={14} />打开并定位原文</button>}</div><div className="actions-box"><strong>你可以这样做</strong>{finding.actions.map((action) => <p key={action}><CheckCircle2 size={16} />{action}</p>)}</div>{finding.uncertainty && <p className="uncertainty">{finding.uncertainty}</p>}</div></aside></div>;
+  return <div className="drawer-backdrop" onClick={onClose}><aside className="evidence-drawer" onClick={(e) => e.stopPropagation()}><header><button className="icon-button" title="返回" onClick={onClose}><ArrowLeft size={18} /></button><span>告警详情</span><button className="icon-button" title="关闭" onClick={onClose}><X size={18} /></button></header><div className="drawer-content"><span className={`severity-label ${finding.severity}`}>{finding.status !== "verified" ? "待核实" : finding.severity === "high" ? "高影响" : finding.severity === "medium" ? "中等影响" : "低影响"}</span><h2>{finding.title}</h2><dl><dt>什么时候触发</dt><dd>{finding.trigger}</dd><dt>平台可能做什么</dt><dd>{finding.platformAction}</dd><dt>对你的影响</dt><dd>{finding.userImpact}</dd></dl><div className="evidence-quote"><div><BookOpen size={16} /><strong>原文证据</strong>{evidence?.verified && <span><Check size={12} />已核验</span>}</div><blockquote>{focusedEvidenceQuote(finding, evidence?.quote) ?? "暂无可核验引用"}</blockquote><small>{resultSourceLabel(result, evidence)}</small>{evidenceSourceUrl(result, evidence) && <button className="open-source" onClick={onOpenSource}><ExternalLink size={14} />打开并定位原文</button>}</div><div className="actions-box"><strong>你可以这样做</strong>{finding.actions.map((action) => <p key={action}><CheckCircle2 size={16} />{action}</p>)}</div>{finding.uncertainty && <p className="uncertainty">{finding.uncertainty}</p>}</div></aside></div>;
 }
 
 function focusedEvidenceQuote(finding: Finding, quote?: string): string | undefined {
@@ -854,11 +996,6 @@ function focusedEvidenceQuote(finding: Finding, quote?: string): string | undefi
   const focusTerm = terms.find((term) => selected.toLocaleLowerCase().includes(term));
   const focus = focusTerm ? selected.toLocaleLowerCase().indexOf(focusTerm) : 0;
   return selected.slice(Math.max(0, Math.min(selected.length - 260, focus - 80)), Math.max(0, Math.min(selected.length - 260, focus - 80)) + 260).trim();
-}
-
-function resultSourceLabel(evidence?: Finding["evidence"][number]) {
-  if (!evidence) return "";
-  return `${evidence.page ? `第 ${evidence.page} 页 · ` : ""}${evidence.url ? new URL(evidence.url).hostname : "手动提供的材料"}`;
 }
 
 function coverageGapSummary(gap?: AnalysisResult["coverageGaps"][number]): string {

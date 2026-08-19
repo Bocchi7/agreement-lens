@@ -3,25 +3,29 @@ import { highlightEvidence } from "./evidence-highlight";
 
 async function collectSources() {
   const sources = discoverAgreementSources(document, location.href);
-  try {
-    const response = await chrome.runtime.sendMessage({ type: "RESOLVE_DYNAMIC_AGREEMENT_LINKS" }) as {
-      links?: Array<{ title: string; url: string }>;
-    };
-    const seen = new Set(sources.map((source) => source.url));
-    for (const link of response.links ?? []) {
-      if (seen.has(link.url)) continue;
-      seen.add(link.url);
-      sources.push({
-        id: crypto.randomUUID(),
-        kind: /\.pdf(?:$|\?)/i.test(link.url) ? "pdf" : "url",
-        title: link.title,
-        url: link.url,
-        selected: true,
-        relation: "primary"
-      });
+  for (const delay of [0, 300, 900]) {
+    if (delay) await new Promise((resolve) => window.setTimeout(resolve, delay));
+    try {
+      const response = await chrome.runtime.sendMessage({ type: "RESOLVE_DYNAMIC_AGREEMENT_LINKS" }) as {
+        links?: Array<{ title: string; url: string }>;
+      };
+      const seen = new Set(sources.map((source) => source.url));
+      for (const link of response.links ?? []) {
+        if (seen.has(link.url)) continue;
+        seen.add(link.url);
+        sources.push({
+          id: crypto.randomUUID(),
+          kind: /\.pdf(?:$|\?)/i.test(link.url) ? "pdf" : "url",
+          title: link.title,
+          url: link.url,
+          selected: true,
+          relation: "primary"
+        });
+      }
+      if (response.links?.length) break;
+    } catch (error) {
+      console.warn("[agreement-lens] dynamic discovery request failed", error);
     }
-  } catch {
-    // Ordinary links remain available if main-world component inspection is unavailable.
   }
   return sources.slice(0, 12);
 }
@@ -46,9 +50,12 @@ async function sendDiscovery() {
   return sources.length;
 }
 
-const runtimeWindow = window as Window & { __agreementLensLoaded?: boolean };
+const runtimeWindow = window as Window & {
+  __agreementLensContentVersion?: string;
+};
+const contentVersion = "2026-08-19-evidence-frames-v4";
 
-if (!runtimeWindow.__agreementLensLoaded) chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+if (runtimeWindow.__agreementLensContentVersion !== contentVersion) chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === "SCAN_PAGE") {
     void sendDiscovery().then((count) => sendResponse({ count }));
     return true;
@@ -62,8 +69,8 @@ if (!runtimeWindow.__agreementLensLoaded) chrome.runtime.onMessage.addListener((
   }
 });
 
-if (!runtimeWindow.__agreementLensLoaded) {
-  runtimeWindow.__agreementLensLoaded = true;
+if (runtimeWindow.__agreementLensContentVersion !== contentVersion) {
+  runtimeWindow.__agreementLensContentVersion = contentVersion;
   let lastSignature = "";
   let timer: number | undefined;
   const scanIfChanged = async () => {

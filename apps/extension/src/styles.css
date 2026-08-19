@@ -96,8 +96,13 @@ button { color: inherit; }
 .progress-track i { display: block; height: 100%; background: #c44d31; transition: width .4s; }
 .progress-number { display: block; margin: 7px 0 24px; color: #65706a; font: 11px ui-monospace, monospace; }
 .agent-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; text-align: left; }
-.agent-grid div { height: 36px; border: 1px solid #d8dfdb; background: #fff; border-radius: 5px; padding: 0 10px; display: flex; align-items: center; gap: 7px; color: #84908a; font-size: 11px; }
+.agent-grid div { min-height: 48px; height: auto; border: 1px solid #d8dfdb; background: #fff; border-radius: 5px; padding: 7px 10px; display: flex; align-items: flex-start; gap: 7px; color: #84908a; font-size: 11px; }
+.agent-grid div span { min-width: 0; }
+.agent-grid div strong { display: block; font-weight: 600; }
+.agent-grid div small { display: block; margin-top: 3px; color: #7b8580; font-size: 9px; line-height: 1.3; }
 .agent-grid .done { color: #24634e; border-color: #bfd6ca; background: #eaf3ee; }
+.agent-grid .active { color: #174d3f; border-color: #b8d0c4; background: #f3f8f5; }
+.agent-grid .failed { color: #983623; border-color: #e3b8ad; background: #fff0ec; }
 .small { font-size: 11px !important; margin: 25px auto; }
 .spin { animation: rotate 1.2s linear infinite; }
 @keyframes rotate { to { transform: rotate(360deg); } }
@@ -138,6 +143,9 @@ button { color: inherit; }
 .finding-main p { margin: 0; color: #66706b; font-size: 10px; line-height: 1.45; }
 .coverage { margin: 0 16px 20px; padding: 13px; border: 1px solid #e1c992; background: #fbf5e7; border-radius: 6px; display: flex; align-items: flex-start; gap: 9px; color: #70571f; }
 .coverage strong { font-size: 11px; }.coverage p { margin: 4px 0 0; font-size: 10px; line-height: 1.4; }
+.supplement-progress { margin: 12px 16px 0; padding: 11px 13px; border: 1px solid #bcd1c7; background: #edf5f1; border-radius: 6px; display: flex; align-items: center; gap: 9px; color: #285c49; }
+.supplement-progress strong { display: block; font-size: 11px; }
+.supplement-progress p { margin: 3px 0 0; color: #60736a; font-size: 9px; }
 .result-error { margin: 10px 16px 0; }
 .empty-inline { color: #537064; padding: 22px; display: flex; align-items: center; gap: 9px; font-size: 11px; }
 .source-detail { min-height: 72px; border-bottom: 1px solid #dce2de; display: grid; grid-template-columns: 32px 1fr 28px; gap: 10px; align-items: center; }
@@ -149,7 +157,8 @@ button { color: inherit; }
 .source-detail button { border: 0; background: transparent; cursor: pointer; }
 .related-box { margin-top: 15px; padding: 13px; border: 1px solid #cdd8d2; border-radius: 6px; background: #edf3ef; }
 .related-box strong { font-size: 11px; }.related-box p { margin: 5px 0 10px; color: #68736d; font-size: 9px; line-height: 1.45; }
-.related-box button { border: 0; border-radius: 5px; background: #275f4d; color: white; padding: 7px 9px; font-size: 10px; font-weight: 700; cursor: pointer; }
+.related-box button { border: 0; border-radius: 5px; background: #275f4d; color: white; padding: 7px 9px; font-size: 10px; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; }
+.related-box button:disabled { opacity: .6; cursor: default; }
 .chat-view { height: calc(100vh - 230px); display: flex; flex-direction: column; }
 .chat-stream { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 12px; }
 .chat-empty { margin: auto; text-align: center; color: #607069; }

@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
-import type { DiscoveredSource, SourceDocument, SourceSection } from "@agreement-lens/shared";
+import { decodeHtmlBytes, maxSourceDocuments, type DiscoveredSource, type SourceDocument, type SourceSection } from "@agreement-lens/shared";
 import { contentFingerprint } from "@agreement-lens/agent-core";
 import { sanitizeRenderedHtml, validateRemoteUrl } from "./security.js";
 import { snapshotDir } from "./config.js";
@@ -41,6 +41,12 @@ function normalize(text: string): string {
   return text.replace(/\r/g, "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+function canonicalAgreementUrl(url: URL): string {
+  const normalized = new URL(url.href);
+  if (normalized.hash && !/^#(?:!\/|\/)/.test(normalized.hash)) normalized.hash = "";
+  return normalized.href;
+}
+
 function sourceErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : "来源读取失败";
   if (/fetch failed|ETIMEDOUT|ECONNRESET|ENETUNREACH/i.test(message)) {
@@ -51,7 +57,8 @@ function sourceErrorMessage(error: unknown): string {
 }
 
 function sectionsFromDocument(document: Document): SourceSection[] {
-  const nodes = [...document.querySelectorAll("h1,h2,h3,h4,p,li,tr")];
+  const nodes = [...document.querySelectorAll("h1,h2,h3,h4,p,li,tr")]
+    .filter((node) => /^H[1-4]$/.test(node.tagName) || !node.querySelector("p,li,tr"));
   const sections: SourceSection[] = [];
   let heading = "正文";
   let buffer: string[] = [];
@@ -75,6 +82,13 @@ function sectionsFromDocument(document: Document): SourceSection[] {
   return sections;
 }
 
+function sectionsRepresentText(sections: SourceSection[], normalizedText: string): boolean {
+  if (!normalizedText) return false;
+  const sectionLength = sections.reduce((total, section) => total + section.content.length, 0);
+  return sectionLength >= normalizedText.length * 0.75
+    && sectionLength <= normalizedText.length * 1.5;
+}
+
 function parseHtml(id: string, title: string, html: string, url?: string): SourceDocument {
   const clean = sanitizeRenderedHtml(html);
   const dom = new JSDOM(clean, { url: url ?? "https://local.invalid/" });
@@ -85,13 +99,12 @@ function parseHtml(id: string, title: string, html: string, url?: string): Sourc
       const label = normalize(link.textContent ?? link.title ?? "");
       try {
         const target = new URL(link.href, url ?? "https://local.invalid/");
-        target.hash = "";
-        return matchesAgreementLink(`${label} ${target.pathname}`)
+        return matchesAgreementLink(label || target.pathname)
           && ["http:", "https:"].includes(target.protocol)
           && !isInteractiveAccountUrl(target)
           && !isAccountDashboardLink(label, target)
           && !isHistoricalVersionLink(label, target)
-          ? { title: label || target.pathname.split("/").pop() || "关联规则", url: target.href }
+          ? { title: label || target.pathname.split("/").pop() || "关联规则", url: canonicalAgreementUrl(target) }
           : undefined;
       } catch {
         return undefined;
@@ -102,7 +115,15 @@ function parseHtml(id: string, title: string, html: string, url?: string): Sourc
     .slice(0, 12);
   const fallbackText = fallbackSections.map((section) => `${section.heading}\n${section.content}`).join("\n\n");
   const normalizedText = normalize(reader?.textContent && reader.textContent.length > 300 ? reader.textContent : fallbackText || dom.window.document.body?.textContent || "");
-  const sections = fallbackSections.length ? fallbackSections : [{ id: randomUUID(), heading: reader?.title || title, content: normalizedText }];
+  let sections = fallbackSections;
+  if (reader?.content && !sectionsRepresentText(sections, normalizedText)) {
+    const readerDom = new JSDOM(reader.content, { url: url ?? "https://local.invalid/" });
+    const readerSections = sectionsFromDocument(readerDom.window.document);
+    if (sectionsRepresentText(readerSections, normalizedText)) sections = readerSections;
+  }
+  if (!sectionsRepresentText(sections, normalizedText)) {
+    sections = [{ id: randomUUID(), heading: reader?.title || title, content: normalizedText }];
+  }
   return {
     id, title: reader?.title || title, url, mediaType: "html", normalizedText,
     fingerprint: contentFingerprint(normalizedText), sections,
@@ -110,6 +131,34 @@ function parseHtml(id: string, title: string, html: string, url?: string): Sourc
     fetchedAt: new Date().toISOString(), status: normalizedText.length > 80 ? "ready" : "partial",
     error: normalizedText.length > 80 ? undefined : "页面正文过短，可能依赖动态渲染"
   };
+}
+
+async function fetchJdPrivacyApiHtml(url: URL): Promise<string | undefined> {
+  if (url.hostname.toLowerCase() !== "about.jd.com" || !/^\/privacy\/?$/i.test(url.pathname)) {
+    return undefined;
+  }
+  const response = await fetch("https://services.jd.com/neos/data/?id=about_privacy", {
+    signal: AbortSignal.timeout(15_000),
+    headers: {
+      accept: "application/json",
+      "x-source-id": "0",
+      "x-source": "2"
+    }
+  });
+  if (!response.ok) throw new Error(`京东隐私政策接口返回 HTTP ${response.status}`);
+  const payload = await response.json() as {
+    code?: number;
+    data?: { title?: string; subTitle?: string; date?: string; dateEff?: string; tips?: string; content?: string };
+  };
+  if (payload.code !== 0 || !payload.data?.content) throw new Error("京东隐私政策接口未返回正文");
+  const data = payload.data;
+  return `<main>
+    <h1>${data.title ?? "京东基本功能隐私政策"}</h1>
+    <p>版本更新日期：${data.date ?? "未提供"}</p>
+    <p>版本生效日期：${data.dateEff ?? "未提供"}</p>
+    <section>${data.tips ?? ""}</section>
+    <section>${data.content}</section>
+  </main>`;
 }
 
 async function persistSnapshot(
@@ -211,8 +260,22 @@ export async function loadSource(source: DiscoveredSource, renderedHtml?: string
         headers: Object.fromEntries(response.headers.entries())
       });
     }
-    const html = await response.text();
-    return persistSnapshot(parseHtml(source.id, source.title, html, url.href), html, {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const html = decodeHtmlBytes(bytes, contentType);
+    const parsed = parseHtml(source.id, source.title, html, url.href);
+    if (parsed.normalizedText.length < 1000) {
+      const dynamicHtml = await fetchJdPrivacyApiHtml(url);
+      if (dynamicHtml) {
+        return persistSnapshot(parseHtml(source.id, source.title, dynamicHtml, url.href), dynamicHtml, {
+          status: response.status,
+          headers: {
+            ...Object.fromEntries(response.headers.entries()),
+            "x-agreement-lens-source": "jd-privacy-api"
+          }
+        });
+      }
+    }
+    return persistSnapshot(parsed, html, {
       status: response.status,
       headers: Object.fromEntries(response.headers.entries())
     });
@@ -232,7 +295,7 @@ export async function loadSource(source: DiscoveredSource, renderedHtml?: string
 export async function loadSourceGraph(
   selected: DiscoveredSource[],
   renderedHtml?: string,
-  maxDocuments = 8,
+  maxDocuments = maxSourceDocuments,
   currentPageUrl?: string
 ): Promise<SourceDocument[]> {
   const currentFamilies = new Set(selected.flatMap((source) => {
@@ -250,12 +313,10 @@ export async function loadSourceGraph(
     return !family || !currentFamilies.has(family);
   }).slice(0, maxDocuments);
   const normalizedPageUrl = currentPageUrl ? new URL(currentPageUrl) : undefined;
-  if (normalizedPageUrl) normalizedPageUrl.hash = "";
   const rootDocuments = await Promise.all(roots.map((source) => {
     let useRenderedHtml: string | undefined;
     if (renderedHtml && source.url && normalizedPageUrl) {
       const sourceUrl = new URL(source.url);
-      sourceUrl.hash = "";
       if (sourceUrl.href === normalizedPageUrl.href) useRenderedHtml = renderedHtml;
     }
     return loadSource(source, useRenderedHtml);
@@ -265,11 +326,24 @@ export async function loadSourceGraph(
     ...roots.map((source) => source.url),
     ...rootDocuments.map((source) => source.url)
   ].filter((url): url is string => Boolean(url)));
+  const normalizeTitle = (title: string) => normalize(title)
+    .replace(/[《》"'“”‘’（）()[\]]/g, "")
+    .toLocaleLowerCase();
+  const seenTitles = new Set([
+    ...roots.map((source) => normalizeTitle(source.title)),
+    ...rootDocuments.map((source) => normalizeTitle(source.title))
+  ]);
   const direct: DiscoveredSource[] = [];
-  for (const document of rootDocuments) {
+  for (const [index, document] of rootDocuments.entries()) {
+    // The extension has already rendered and recursively acquired links from
+    // rendered roots. Fetching those links again here would downgrade SPA or
+    // iframe agreements back to their empty static app shells.
+    if (roots[index]?.renderedHtml) continue;
     for (const link of document.linkedSources ?? []) {
-      if (seen.has(link.url) || direct.length + rootDocuments.length >= maxDocuments) continue;
+      const normalizedTitle = normalizeTitle(link.title);
+      if (seen.has(link.url) || seenTitles.has(normalizedTitle) || direct.length + rootDocuments.length >= maxDocuments) continue;
       seen.add(link.url);
+      seenTitles.add(normalizedTitle);
       direct.push({
         id: randomUUID(),
         kind: link.url.toLowerCase().includes(".pdf") ? "pdf" : "url",
@@ -286,7 +360,8 @@ export async function loadSourceGraph(
 const agreementLinkKeywords = [
   "协议", "条款", "隐私", "privacy", "cookie", "cookies", "terms", "conditions",
   "user agreement", "service agreement", "subscription", "auto-renew", "自动续费",
-  "社区规范", "community guidelines"
+  "社区规范", "community guidelines", "法律声明", "个人信息保护", "个人信息处理",
+  "数据保护", "数据须知", "收集使用信息", "账号注销"
 ];
 
 function matchesAgreementLink(value: string): boolean {

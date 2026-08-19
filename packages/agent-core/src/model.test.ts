@@ -17,7 +17,9 @@ describe("OpenAI-compatible model adapter", () => {
       expect(modelConfigFromEnv()?.apiKey).toBe("resolved-secret");
       expect(modelConfigFromEnv()?.reasoningEffort).toBe("low");
       expect(modelConfigFromEnv()?.timeoutMs).toBe(180_000);
-      expect(modelConfigFromEnv()?.maxToolRounds).toBe(4);
+      expect(modelConfigFromEnv()?.maxToolRounds).toBe(100);
+      expect(modelConfigFromEnv()?.maxRetries).toBe(100);
+      expect(modelConfigFromEnv()?.maxCompletionTokens).toBeUndefined();
     } finally {
       if (previousKey === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = previousKey;
@@ -28,6 +30,7 @@ describe("OpenAI-compatible model adapter", () => {
 
   it("executes native tool calls and validates the final specialist schema", async () => {
     let calls = 0;
+    const progress: Array<{ rounds?: number; retries?: number; message?: string }> = [];
     const requestBodies: Array<Record<string, unknown>> = [];
     const server = http.createServer(async (request, response) => {
       const chunks: Buffer[] = [];
@@ -104,7 +107,9 @@ describe("OpenAI-compatible model adapter", () => {
         model: "test-model",
         reasoningEffort: "low",
         timeoutMs: 45_000,
-        maxToolRounds: 2
+        maxToolRounds: 2,
+        agentName: "fees",
+        onProgress: ({ progress: update }) => progress.push(update)
       }
     });
 
@@ -116,6 +121,130 @@ describe("OpenAI-compatible model adapter", () => {
     expect(systemPrompt).toContain("Never use qualitative confidence labels");
     expect(findings).toHaveLength(1);
     expect(findings[0]?.evidence[0]?.quote).toContain("自动续费");
+    expect(progress.some((update) => update.rounds === 1)).toBe(true);
+    expect(progress.some((update) => update.rounds === 2)).toBe(true);
+  });
+
+  it("forces a final answer after the configured tool rounds instead of failing", async () => {
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      requestBodies.push(body);
+      response.setHeader("content-type", "application/json");
+      if (requestBodies.length === 1) {
+        response.end(JSON.stringify({
+          choices: [{
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [{
+                id: "tool-1",
+                type: "function",
+                function: { name: "search_sources", arguments: "{\"query\":\"自动续费\"}" }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      response.end(JSON.stringify({
+        choices: [{ message: { role: "assistant", content: JSON.stringify({ findings: [] }) } }]
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    const findings = await runModelSpecialist({
+      role: "fees",
+      sources: [{
+        id: "source-1", title: "会员协议", mediaType: "text", normalizedText: "服务将自动续费。",
+        fingerprint: "fixture", sections: [{ id: "section-1", heading: "续费", content: "服务将自动续费。" }],
+        fetchedAt: new Date().toISOString(), status: "ready"
+      }],
+      context: { action: "pay", concerns: ["money"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test", baseUrl: `http://127.0.0.1:${address.port}/v1`, model: "test-model",
+        reasoningEffort: "low", timeoutMs: 45_000, maxToolRounds: 1
+      }
+    });
+
+    expect(findings).toEqual([]);
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[0]?.tools).toBeDefined();
+    expect(requestBodies[1]?.tools).toBeUndefined();
+    const finalMessages = requestBodies[1]?.messages as Array<{ role: string; content?: string }>;
+    expect(finalMessages.at(-1)?.content).toContain("工具调用阶段已经结束");
+  });
+
+  it("returns complete large source sections to the model without a 30k truncation", async () => {
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      response.setHeader("content-type", "application/json");
+      if (requestBodies.length === 1) {
+        response.end(JSON.stringify({
+          choices: [{
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [{
+                id: "tool-full-section",
+                type: "function",
+                function: {
+                  name: "read_source_section",
+                  arguments: JSON.stringify({ sourceId: "source-1", sectionId: "section-1" })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      response.end(JSON.stringify({
+        choices: [{ message: { role: "assistant", content: JSON.stringify({ findings: [] }) } }]
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    const largeText = `${"个人信息处理规则。".repeat(5_000)}末尾核验标记。`;
+    await runModelSpecialist({
+      role: "privacy",
+      sources: [{
+        id: "source-1",
+        title: "隐私政策",
+        mediaType: "text",
+        normalizedText: largeText,
+        fingerprint: "fixture",
+        sections: [{ id: "section-1", heading: "正文", content: largeText }],
+        fetchedAt: new Date().toISOString(),
+        status: "ready"
+      }],
+      context: { action: "authorize", concerns: ["data"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        model: "test-model",
+        reasoningEffort: "low",
+        timeoutMs: 45_000,
+        maxToolRounds: 2
+      }
+    });
+
+    const messages = requestBodies[1]?.messages as Array<{ role: string; content?: string }>;
+    const toolMessage = messages.find((message) => message.role === "tool");
+    expect(toolMessage?.content?.length).toBeGreaterThan(30_000);
+    expect(toolMessage?.content).toContain("末尾核验标记");
   });
 
   it("normalizes common specialist type drift before schema validation", async () => {
@@ -231,6 +360,55 @@ describe("OpenAI-compatible model adapter", () => {
     expect(requestBodies[0]?.stream).toBe(true);
     expect((requestBodies[1]?.messages as Array<{ role: string }>).some((message) => message.role === "assistant")).toBe(true);
     expect((requestBodies[1]?.messages as Array<{ role: string; content?: string }>).at(-1)?.content).toContain("校验错误");
+  });
+
+  it("retries transient empty streamed responses with a fresh final-answer instruction", async () => {
+    let calls = 0;
+    const progress: Array<{ retries?: number }> = [];
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      calls++;
+      response.setHeader("content-type", "text/event-stream");
+      if (calls < 3) {
+        response.end(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+        return;
+      }
+      const content = JSON.stringify({ findings: [] });
+      response.end(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    const findings = await runModelSpecialist({
+      role: "privacy",
+      sources: [],
+      context: { action: "authorize", concerns: ["data"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        model: "test-model",
+        reasoningEffort: "low",
+        timeoutMs: 45_000,
+        maxToolRounds: 2,
+        maxRetries: 2,
+        agentName: "privacy",
+        onProgress: ({ progress: update }) => progress.push(update)
+      }
+    });
+
+    expect(findings).toEqual([]);
+    expect(calls).toBe(3);
+    const retryMessages = requestBodies[1]?.messages as Array<{ role: string; content?: string }>;
+    expect(retryMessages.at(-1)?.content).toContain("没有返回任何可见内容");
+    expect(retryMessages.some((message) => message.role === "assistant" && !message.content)).toBe(false);
+    expect(progress.some((update) => update.retries === 1)).toBe(true);
+    expect(progress.some((update) => update.retries === 2)).toBe(true);
   });
 
   it("turns an accidental integrator JSON response into a natural follow-up answer", async () => {

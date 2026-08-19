@@ -48,4 +48,27 @@ describe("dynamic agreement discovery", () => {
 
     expect(resolveDynamicAgreementLinks()).toEqual([]);
   });
+
+  it("captures URLs opened by legacy React click handlers on non-anchor controls", () => {
+    const dom = new JSDOM(`
+      <div role="link" aria-label="服务条款">服务条款</div>
+      <div role="link" aria-label="隐私政策">隐私政策</div>
+    `, { url: "https://mail.qq.com/" });
+    const links = [...dom.window.document.querySelectorAll("[role='link']")] as Array<Element & Record<string, unknown>>;
+    links[0]!.__reactEventHandlers$test = {
+      onClick: () => dom.window.open("https://wx.mail.qq.com/list/readtemplate?name=app_intro.html#/agreement/mailService")
+    };
+    links[1]!.__reactEventHandlers$test = {
+      onClick: () => dom.window.open("https://wx.mail.qq.com/list/readtemplate?name=app_intro.html#/agreement/appPolicy")
+    };
+    vi.stubGlobal("document", dom.window.document);
+    vi.stubGlobal("location", dom.window.location);
+    vi.stubGlobal("window", dom.window);
+
+    const injectedResolver = new Function(`return (${resolveDynamicAgreementLinks.toString()})`)() as typeof resolveDynamicAgreementLinks;
+    expect(injectedResolver()).toEqual([
+      { title: "服务条款", url: "https://wx.mail.qq.com/list/readtemplate?name=app_intro.html#/agreement/mailService" },
+      { title: "隐私政策", url: "https://wx.mail.qq.com/list/readtemplate?name=app_intro.html#/agreement/appPolicy" }
+    ]);
+  });
 });

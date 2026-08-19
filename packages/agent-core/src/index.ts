@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   type AnalysisResult,
+  type AgentProgress,
   type Finding,
   type SourceDocument,
   type UserContext,
@@ -49,6 +50,7 @@ export interface WorkflowProgress {
   stage: "analyzing" | "verifying" | "integrating";
   progress: number;
   message: string;
+  agents?: Record<string, AgentProgress>;
 }
 
 export type Domain = "fees" | "privacy" | "content" | "rights";
@@ -295,24 +297,74 @@ export async function runWorkflow(
   knowledge: KnowledgeTool,
   onProgress?: (progress: WorkflowProgress) => void
 ): Promise<AnalysisResult> {
-  onProgress?.({ stage: "analyzing", progress: 35, message: "四个专业视角正在并行分析" });
+  const agentProgress: Record<string, AgentProgress> = {};
+  const emit = (
+    stage: WorkflowProgress["stage"],
+    progress: number,
+    message: string
+  ) => onProgress?.({
+    stage,
+    progress,
+    message,
+    agents: { ...agentProgress }
+  });
+  const updateAgent = (agent: string, patch: Partial<AgentProgress>) => {
+    agentProgress[agent] = {
+      status: "running",
+      rounds: 0,
+      retries: 0,
+      ...agentProgress[agent],
+      ...patch
+    };
+    emit(
+      agent === "verifier" ? "verifying" : agent === "main" ? "integrating" : "analyzing",
+      agent === "verifier" ? 72 : agent === "main" ? 90 : 35,
+      agentProgress[agent].message ?? "正在分析"
+    );
+  };
   const modelConfig = modelConfigFromEnv();
   const modelFailures: string[] = [];
   const selectedDomains = input.domains?.length ? input.domains : Object.keys(patterns) as Domain[];
+  for (const domain of selectedDomains) {
+    updateAgent(domain, { status: "idle", message: "等待开始" });
+  }
+  if (modelConfig && selectedDomains.length < 4) {
+    for (const domain of (Object.keys(patterns) as Domain[]).filter((item) => !selectedDomains.includes(item))) {
+      agentProgress[domain] = { status: "idle", rounds: 0, retries: 0, message: "本次复核未涉及" };
+    }
+  }
+  emit("analyzing", 35, "四个专业视角正在并行分析");
   const groups = await Promise.all(selectedDomains.map(async (domain) => {
-    if (!modelConfig) return runSpecialist(domain, input.sources, knowledge);
+    updateAgent(domain, { status: "running", message: "正在调用模型" });
+    if (!modelConfig) {
+      const result = runSpecialist(domain, input.sources, knowledge);
+      updateAgent(domain, { status: "completed", message: "分析完成" });
+      return result;
+    }
     try {
       const roleModel = process.env[`MODEL_${domain.toUpperCase()}`];
-      return await runModelSpecialist({
+      const result = await runModelSpecialist({
         role: domain,
         sources: input.sources,
         context: input.context,
         knowledge,
         promptDir: input.promptDir,
-        config: { ...modelConfig, model: roleModel ?? modelConfig.model }
+        config: {
+          ...modelConfig,
+          model: roleModel ?? modelConfig.model,
+          agentName: domain,
+          onProgress: ({ progress }) => updateAgent(domain, progress)
+        }
       });
+      updateAgent(domain, { status: "completed", message: "分析完成" });
+      return result;
     } catch (error) {
       console.warn(`[agent-core] ${domain} specialist failed`, error);
+      updateAgent(domain, {
+        status: "failed",
+        error: summarizeModelFailure(error),
+        message: "分析失败"
+      });
       modelFailures.push(`${domain}: ${summarizeModelFailure(error)}`);
       return [];
     }
@@ -320,7 +372,7 @@ export async function runWorkflow(
   if (modelConfig && modelFailures.length) {
     throw new Error(`模型分析失败：${[...new Set(modelFailures)].join("；")}`);
   }
-  onProgress?.({ stage: "verifying", progress: 72, message: "正在逐条核对原文证据" });
+  emit("verifying", 72, "正在逐条核对原文证据");
   const preserved = input.previousResult
     ? input.previousResult.findings
       .filter((finding) => !selectedDomains.includes(domainForCategory(finding.category)))
@@ -330,14 +382,21 @@ export async function runWorkflow(
   let findings = verify(dedupe([...preserved, ...groups.flat()]), input.sources);
   const verifierEnabled = process.env.MODEL_VERIFIER_ENABLED === "true";
   if (modelConfig && findings.length && verifierEnabled) {
+    updateAgent("verifier", { status: "running", message: "正在核验证据" });
     try {
       const decisions = await runModelVerifier({
         findings,
         sources: input.sources,
         knowledge,
         promptDir: input.promptDir,
-        config: { ...modelConfig, model: process.env.MODEL_VERIFIER ?? modelConfig.model }
+        config: {
+          ...modelConfig,
+          model: process.env.MODEL_VERIFIER ?? modelConfig.model,
+          agentName: "verifier",
+          onProgress: ({ progress }) => updateAgent("verifier", progress)
+        }
       });
+      updateAgent("verifier", { status: "completed", message: "证据核验完成" });
       const decisionMap = new Map(decisions.map((decision) => [decision.findingId, decision]));
       findings = findings.map((finding) => {
         const decision = decisionMap.get(finding.id);
@@ -351,8 +410,18 @@ export async function runWorkflow(
       });
     } catch (error) {
       console.warn("[agent-core] verifier failed", error);
+      updateAgent("verifier", {
+        status: "failed",
+        error: summarizeModelFailure(error),
+        message: "证据核验失败"
+      });
       throw new Error(`模型复核失败：${summarizeModelFailure(error)}`);
     }
+  } else {
+    updateAgent("verifier", {
+      status: "completed",
+      message: modelConfig ? "无待核验结果，已跳过" : "本地证据核验完成"
+    });
   }
   findings = findings
     .filter((finding) => finding.status !== "rejected")
@@ -363,7 +432,7 @@ export async function runWorkflow(
     detail: source.error ?? "该来源只能部分读取，相关结论可能不完整。",
     impact: "high" as const
   }));
-  onProgress?.({ stage: "integrating", progress: 90, message: "主分析器正在整合结论与行动建议" });
+  updateAgent("main", { status: "running", message: "主分析器正在整合结论与行动建议" });
   const policyDecision = recommendationFor(findings, input.context, gaps);
   let decision = {
     recommendation: policyDecision.recommendation,
@@ -380,8 +449,14 @@ export async function runWorkflow(
         sources: input.sources,
         knowledge,
         promptDir: input.promptDir,
-        config: { ...modelConfig, model: process.env.MODEL_MAIN ?? modelConfig.model }
+        config: {
+          ...modelConfig,
+          model: process.env.MODEL_MAIN ?? modelConfig.model,
+          agentName: "main",
+          onProgress: ({ progress }) => updateAgent("main", progress)
+        }
       });
+      updateAgent("main", { status: "completed", message: "结论整合完成" });
       input.onMainAgentSession?.(proposal.session);
       const rank = { continue: 0, adjust: 1, pause: 2 };
       const recommendation = rank[policyDecision.recommendation] > rank[proposal.recommendation]
@@ -396,8 +471,15 @@ export async function runWorkflow(
       };
     } catch (error) {
       console.warn("[agent-core] integrator failed", error);
+      updateAgent("main", {
+        status: "failed",
+        error: summarizeModelFailure(error),
+        message: "结论整合失败"
+      });
       throw new Error(`主模型整合失败：${summarizeModelFailure(error)}`);
     }
+  } else {
+    updateAgent("main", { status: "completed", message: "本地规则已完成整合" });
   }
   const now = new Date().toISOString();
   return {
@@ -502,19 +584,27 @@ export async function refineChangeRoute(
   previous: SourceDocument[],
   current: SourceDocument[],
   knowledge: KnowledgeTool,
-  promptDir?: string
+  promptDir?: string,
+  onProgress?: (progress: Partial<AgentProgress>) => void
 ): Promise<ChangeRoute> {
   const modelConfig = modelConfigFromEnv();
   if (!route.changed || !modelConfig) return route;
   try {
+    onProgress?.({ status: "running", rounds: 0, retries: 0, message: "正在判断需要复核的视角" });
     const proposal = await runModelChangeRouter({
       deterministicRoute: route,
       previousSources: previous,
       currentSources: current,
       knowledge,
       promptDir,
-      config: { ...modelConfig, model: process.env.MODEL_ROUTER ?? modelConfig.model }
+      config: {
+        ...modelConfig,
+        model: process.env.MODEL_ROUTER ?? modelConfig.model,
+        agentName: "router",
+        onProgress: ({ progress }) => onProgress?.(progress)
+      }
     });
+    onProgress?.({ status: "completed", message: "复核范围判断完成" });
     const allDomains: Domain[] = ["fees", "privacy", "content", "rights"];
     const structural = route.structural || proposal.structural || proposal.confidence < 0.6;
     return {
@@ -523,7 +613,12 @@ export async function refineChangeRoute(
       confidence: Math.min(route.confidence, proposal.confidence),
       domains: structural ? allDomains : [...new Set([...route.domains, ...proposal.domains])]
     };
-  } catch {
+  } catch (error) {
+    onProgress?.({
+      status: "failed",
+      message: "复核范围判断失败",
+      error: summarizeModelFailure(error)
+    });
     return route;
   }
 }
