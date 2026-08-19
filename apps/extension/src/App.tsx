@@ -1,0 +1,868 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import {
+  AlertTriangle, ArrowLeft, BookOpen, Check, CheckCircle2, ChevronRight,
+  CircleDollarSign, Database, ExternalLink, FileText, History, LoaderCircle,
+  LockKeyhole, MessageCircle, Plus, RefreshCw, Save, Search, Send, Shield,
+  Sparkles, Upload, UserRoundX, X
+} from "lucide-react";
+import type {
+  AnalysisResult, DiscoveredSource, Finding, JobStatus, UserContext, VersionComparison
+} from "@agreement-lens/shared";
+import { api, ApiError } from "./api";
+import type { PageSnapshot } from "./types";
+
+type View = "overview" | "risks" | "sources" | "chat" | "versions";
+type Phase = "loading" | "pair" | "permission" | "scanning" | "prepare" | "preparing" | "running" | "result" | "offline" | "error";
+
+const actionOptions: Array<{ value: UserContext["action"]; label: string }> = [
+  { value: "register", label: "注册 / 重新同意" },
+  { value: "pay", label: "付费 / 试用" },
+  { value: "upload", label: "上传内容" },
+  { value: "authorize", label: "授权数据" }
+];
+const concernOptions: Array<{ value: UserContext["concerns"][number]; label: string }> = [
+  { value: "money", label: "费用" }, { value: "data", label: "数据" },
+  { value: "content", label: "内容" }, { value: "account", label: "账号" },
+  { value: "remedies", label: "维权" }
+];
+const redlineOptions = ["不能自动续费", "不能共享给第三方", "内容不能长期授权", "账号停用前必须通知"];
+const categoryMeta = {
+  money: { label: "费用", icon: CircleDollarSign },
+  data: { label: "数据", icon: Database },
+  content: { label: "内容", icon: FileText },
+  account: { label: "账号", icon: UserRoundX },
+  remedies: { label: "维权", icon: Shield }
+};
+const recommendationMeta = {
+  continue: { label: "可以继续", tone: "positive" },
+  adjust: { label: "先调整", tone: "warning" },
+  pause: { label: "暂缓核实", tone: "danger" }
+};
+
+function demoSnapshot(): PageSnapshot {
+  return {
+    tabId: 1, pageUrl: "https://demo.example/membership", pageTitle: "云笺会员中心",
+    origin: "https://demo.example", scannedAt: new Date().toISOString(),
+    sources: [
+      {
+        id: crypto.randomUUID(), kind: "text", title: "云笺会员服务协议", selected: true, relation: "primary",
+        text: "会员服务协议\n一、自动续费\n用户开通连续包月后，服务将在每个计费周期到期前自动续费并从原支付账户扣款。用户可在到期前二十四小时关闭。\n二、退款\n数字会员权益一经开通，不支持退款，法律另有规定的除外。\n三、协议更新\n平台有权根据服务变化修改本协议，重大变化将通过站内信通知。"
+      },
+      {
+        id: crypto.randomUUID(), kind: "text", title: "云笺隐私政策", selected: true, relation: "primary",
+        text: "隐私政策\n为提供个性化服务，我们可能收集设备信息和使用记录，并与提供分析服务的第三方共享部分数据。用户可在设置中关闭个性化推荐。"
+      }
+    ]
+  };
+}
+
+function inferAction(page: PageSnapshot | null): UserContext["action"] {
+  const text = `${page?.pageTitle ?? ""} ${(page?.sources ?? []).map((source) => source.title).join(" ")}`;
+  if (/会员|付费|续费|试用|subscription|payment/i.test(text)) return "pay";
+  if (/上传|创作|发布|投稿|upload|creator/i.test(text)) return "upload";
+  if (/授权|隐私|数据|privacy|permission/i.test(text)) return "authorize";
+  return "register";
+}
+
+function chromeAvailable() {
+  return typeof chrome !== "undefined" && Boolean(chrome.runtime?.id);
+}
+
+type PersistedAnalysisState = {
+  job?: JobStatus;
+  jobId?: string;
+  analysisId?: string;
+  pageUrl?: string;
+  sourceCount?: number;
+};
+
+function analysisStateKey(tabId: number) {
+  return `analysis-state:${tabId}`;
+}
+
+async function readAnalysisState(tabId: number): Promise<PersistedAnalysisState | null> {
+  try {
+    const key = analysisStateKey(tabId);
+    if (chromeAvailable()) {
+      const stored = await chrome.storage.session.get(key);
+      return (stored[key] as PersistedAnalysisState | undefined) ?? null;
+    }
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) as PersistedAnalysisState : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeAnalysisState(tabId: number, state: PersistedAnalysisState): Promise<void> {
+  try {
+    const key = analysisStateKey(tabId);
+    if (chromeAvailable()) {
+      await chrome.storage.session.set({ [key]: state });
+    } else {
+      localStorage.setItem(key, JSON.stringify(state));
+    }
+  } catch {
+    // The server remains the source of truth if session storage is unavailable.
+  }
+}
+
+async function clearAnalysisState(tabId: number): Promise<void> {
+  try {
+    const key = analysisStateKey(tabId);
+    if (chromeAvailable()) {
+      await chrome.storage.session.remove(key);
+    } else {
+      localStorage.removeItem(key);
+    }
+  } catch {
+    // Storage cleanup must not block the UI.
+  }
+}
+
+async function waitForTabComplete(tabId: number, timeoutMs = 15_000): Promise<void> {
+  const current = await chrome.tabs.get(tabId);
+  if (current.status === "complete") return;
+  await new Promise<void>((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error("原文页面加载超时"));
+    }, timeoutMs);
+    const listener = (updatedTabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
+      if (updatedTabId !== tabId || changeInfo.status !== "complete") return;
+      window.clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
+async function highlightInTab(tabId: number, quote: string): Promise<boolean> {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+  } catch {
+    return false;
+  }
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      const response = await chrome.tabs.sendMessage(tabId, { type: "HIGHLIGHT_EVIDENCE", quote });
+      if (response?.found) return true;
+    } catch {
+      // Dynamic agreement pages may not be ready immediately after the load event.
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+  }
+  return false;
+}
+
+async function currentSnapshot(): Promise<PageSnapshot | null> {
+  if (!chromeAvailable()) return demoSnapshot();
+  return chrome.runtime.sendMessage({ type: "GET_PAGE_STATE" });
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeout: number | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeout = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeout !== undefined) window.clearTimeout(timeout);
+  }
+}
+
+export function App() {
+  const [phase, setPhase] = useState<Phase>("loading");
+  const [snapshot, setSnapshot] = useState<PageSnapshot | null>(null);
+  const [sources, setSources] = useState<DiscoveredSource[]>([]);
+  const [context, setContext] = useState<UserContext>({ action: "register", concerns: ["money", "data"], redlines: [], notes: "" });
+  const [pairCode, setPairCode] = useState("246810");
+  const [error, setError] = useState("");
+  const [job, setJob] = useState<JobStatus | null>(null);
+  const [result, setResult] = useState<AnalysisResult | null>(null);
+  const [view, setView] = useState<View>("overview");
+  const [selectedFinding, setSelectedFinding] = useState<Finding | null>(null);
+  const [manualText, setManualText] = useState("");
+  const [manualUrl, setManualUrl] = useState("");
+  const [manualOpen, setManualOpen] = useState(false);
+  const [chatInput, setChatInput] = useState("");
+  const [messages, setMessages] = useState<Array<{ role: "user" | "assistant"; text: string }>>([]);
+  const [versions, setVersions] = useState<{ analyses: Array<{ analysisId: string; createdAt: string; recommendation: string; fingerprints: string[] }>; comparisons: VersionComparison[] }>({ analyses: [], comparisons: [] });
+  const [permissionTarget, setPermissionTarget] = useState<{ id: number; url: string } | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [asking, setAsking] = useState(false);
+
+  useEffect(() => {
+    void (async () => {
+      const page = await currentSnapshot();
+      setSnapshot(page);
+      setSources(page?.sources ?? []);
+      setContext((current) => ({ ...current, action: inferAction(page) }));
+      try {
+        await api.health();
+      } catch {
+        setPhase("offline");
+        return;
+      }
+      if (page?.pendingRecheck) {
+        const pendingJob = {
+          id: page.pendingRecheck.jobId,
+          analysisId: page.pendingRecheck.analysisId,
+          state: "queued",
+          progress: 0,
+          message: "检测到已保存服务，正在自动复核版本",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        } satisfies JobStatus;
+        await writeAnalysisState(page.tabId, {
+          job: pendingJob,
+          jobId: pendingJob.id,
+          analysisId: pendingJob.analysisId,
+          pageUrl: page.pageUrl,
+          sourceCount: page.sources.length
+        });
+        setJob(pendingJob);
+        setPhase("running");
+        return;
+      }
+      if (!chromeAvailable()) {
+        const existing = localStorage.getItem("pairToken");
+        if (existing) {
+          try {
+            await api.capabilities();
+            setPhase("prepare");
+          } catch {
+            localStorage.removeItem("pairToken");
+            setPhase("pair");
+          }
+        } else {
+          setPhase("pair");
+        }
+        return;
+      }
+      const stored = await chrome.storage.local.get("pairToken");
+      if (!stored.pairToken) return setPhase("pair");
+      try {
+        await api.capabilities();
+      } catch (cause) {
+        if (cause instanceof ApiError && cause.status === 401) {
+          await chrome.storage.local.remove("pairToken");
+          return setPhase("pair");
+        }
+        return setPhase("offline");
+      }
+      if (!page) return setPhase("permission");
+      const persisted = await readAnalysisState(page.tabId);
+      if (persisted) {
+        try {
+          const restoredJob = persisted.jobId
+            ? await api.getJob(persisted.jobId)
+            : persisted.job;
+          if (restoredJob?.state === "complete" && (persisted.analysisId ?? restoredJob.analysisId)) {
+            const analysis = await api.getAnalysis(persisted.analysisId ?? restoredJob.analysisId);
+            setResult(analysis);
+            setSources(page.sources);
+            setJob(restoredJob);
+            setPhase("result");
+            return;
+          }
+          if (restoredJob?.state === "failed") {
+            setJob(restoredJob);
+            setError(restoredJob.error ?? "分析失败");
+            setPhase("error");
+            return;
+          }
+          if (restoredJob) {
+            setJob(restoredJob);
+            setPhase("running");
+            return;
+          }
+        } catch (cause) {
+          if (cause instanceof ApiError && cause.status === 404) {
+            await clearAnalysisState(page.tabId);
+          } else {
+            setError(cause instanceof Error ? cause.message : "无法恢复分析任务");
+            setPhase("offline");
+            return;
+          }
+        }
+      }
+      setPhase("prepare");
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!chromeAvailable()) return;
+    const listener = (message: { type?: string; payload?: PageSnapshot }) => {
+      if (message.type !== "PAGE_STATE_UPDATED" || !message.payload) return;
+      setSnapshot(message.payload);
+      setSources(message.payload.sources);
+      setContext((current) => ({ ...current, action: inferAction(message.payload ?? null) }));
+      if (message.payload.sources.length && (phase === "permission" || phase === "prepare")) setPhase("prepare");
+    };
+    chrome.runtime.onMessage.addListener(listener);
+    return () => chrome.runtime.onMessage.removeListener(listener);
+  }, [phase]);
+
+  useEffect(() => {
+    if (!chromeAvailable()) return;
+    const refreshTarget = async () => {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      setPermissionTarget(tab?.id && tab.url?.startsWith("http") ? { id: tab.id, url: tab.url } : null);
+    };
+    const onActivated = () => void refreshTarget();
+    const onUpdated = (_tabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
+      if (changeInfo.url || changeInfo.status === "complete") void refreshTarget();
+    };
+    void refreshTarget();
+    chrome.tabs.onActivated.addListener(onActivated);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    return () => {
+      chrome.tabs.onActivated.removeListener(onActivated);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (phase !== "running" || !job) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const next = await api.getJob(job.id);
+        setJob(next);
+        if (snapshot?.tabId !== undefined) {
+          await writeAnalysisState(snapshot.tabId, {
+            job: next,
+            jobId: next.id,
+            analysisId: next.analysisId,
+            pageUrl: snapshot.pageUrl,
+            sourceCount: sources.length
+          });
+        }
+        if (next.state === "complete") {
+          const analysis = await api.getAnalysis(next.analysisId);
+          setResult(analysis);
+          if (snapshot?.tabId !== undefined) {
+            await writeAnalysisState(snapshot.tabId, {
+              job: next,
+              jobId: next.id,
+              analysisId: next.analysisId,
+              pageUrl: snapshot.pageUrl,
+              sourceCount: analysis.sources.length
+            });
+          }
+          setPhase("result");
+          window.clearInterval(timer);
+        } else if (next.state === "failed") {
+          setError(next.error ?? "分析失败");
+          setPhase("error");
+          window.clearInterval(timer);
+        }
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "无法读取任务状态");
+        setPhase("offline");
+        window.clearInterval(timer);
+      }
+    }, 700);
+    return () => window.clearInterval(timer);
+  }, [phase, job?.id]);
+
+  async function pair() {
+    try {
+      setError("");
+      await api.pair(pairCode);
+      const page = await currentSnapshot();
+      setSnapshot(page);
+      setSources(page?.sources ?? []);
+      setContext((current) => ({ ...current, action: inferAction(page) }));
+      setPhase(page ? "prepare" : "permission");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "配对失败");
+    }
+  }
+
+  async function grantAndScan() {
+    if (!chromeAvailable()) return;
+    setError("");
+    setPhase("scanning");
+    try {
+      if (!permissionTarget) throw new Error("当前标签页不支持扫描，请切换到需要分析的网站后重试");
+      const tab = permissionTarget;
+      const origin = new URL(tab.url).origin + "/*";
+      const granted = await chrome.permissions.request({ origins: [origin] });
+      if (!granted) throw new Error("未获得当前站点的读取权限");
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+      await chrome.tabs.sendMessage(tab.id, { type: "SCAN_PAGE" });
+
+      let page: PageSnapshot | null = null;
+      for (let attempt = 0; attempt < 10; attempt++) {
+        await new Promise((resolve) => window.setTimeout(resolve, 200));
+        page = await currentSnapshot();
+        if (page?.tabId === tab.id) break;
+      }
+      if (!page || page.tabId !== tab.id) throw new Error("扫描已执行，但没有收到当前页面的识别结果");
+      setSnapshot(page);
+      setSources(page.sources);
+      setContext((current) => ({ ...current, action: inferAction(page) }));
+      setPhase("prepare");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "无法扫描当前站点");
+      setPhase("error");
+    }
+  }
+
+  function addManualText() {
+    const text = manualText.trim();
+    const url = manualUrl.trim();
+    if (!text && !url) return;
+    setSources((current) => [...current,
+      ...(url ? [{
+        id: crypto.randomUUID(), kind: /\.pdf(?:$|\?)/i.test(url) ? "pdf" as const : "url" as const,
+        title: "手动补充链接", url, selected: true, relation: "manual" as const
+      }] : []),
+      ...(text ? [{
+        id: crypto.randomUUID(), kind: "text" as const, title: "手动补充文本",
+        text, selected: true, relation: "manual" as const
+      }] : [])
+    ]);
+    setManualText("");
+    setManualUrl("");
+    setManualOpen(false);
+  }
+
+  async function addPdfFiles(files: FileList | null) {
+    if (!files) return;
+    for (const file of [...files]) {
+      if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) continue;
+      if (file.size > 8_000_000) {
+        setError(`${file.name} 超过 8 MB，暂不支持上传`);
+        continue;
+      }
+      const dataBase64 = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(reader.error);
+        reader.onload = () => resolve(String(reader.result).split(",")[1] ?? "");
+        reader.readAsDataURL(file);
+      });
+      setSources((current) => [...current, {
+        id: crypto.randomUUID(), kind: "pdf", title: file.name,
+        dataBase64, selected: true, relation: "manual"
+      }]);
+    }
+  }
+
+  async function startAnalysis() {
+    if (!snapshot) {
+      setError("当前页面信息尚未准备好，请重新扫描后再试");
+      setPhase("error");
+      return;
+    }
+    if (!sources.some((source) => source.selected)) {
+      setError("请至少选择一份分析材料");
+      setPhase("error");
+      return;
+    }
+    try {
+      setError("");
+      setPhase("preparing");
+      const selectedUrlSources = sources.filter((source) => source.selected && source.url && (source.kind === "url" || source.kind === "pdf"));
+      if (chromeAvailable() && selectedUrlSources.length > 0) {
+        const origins = [...new Set(selectedUrlSources.map((source) => `${new URL(source.url!).origin}/*`))];
+        const granted = await chrome.permissions.request({ origins });
+        if (!granted) {
+          setError("需要允许访问协议链接，才能在浏览器中读取被拦截的页面");
+          setPhase("error");
+          return;
+        }
+      }
+      await api.health();
+      let preparedSources = sources;
+      if (chromeAvailable()) {
+        const browserSources = await withTimeout(
+          chrome.runtime.sendMessage({
+            type: "FETCH_AGREEMENT_SOURCES",
+            sources: selectedUrlSources.map((source) => ({ id: source.id, url: source.url!, kind: source.kind as "url" | "pdf" }))
+          }),
+          35_000,
+          "读取协议页面超时，请检查网络或减少本次分析来源"
+        );
+        const fetched = new Map<string, { renderedHtml?: string; dataBase64?: string; error?: string }>(
+          (browserSources?.sources ?? []).map((source: { id: string; renderedHtml?: string; dataBase64?: string; error?: string }) => [source.id, source])
+        );
+        preparedSources = sources.map((source) => {
+          const acquired = fetched.get(source.id);
+          return acquired ? { ...source, renderedHtml: acquired.renderedHtml, dataBase64: acquired.dataBase64 } : source;
+        });
+        const failures = [...fetched.values()].filter((source) => source.error);
+        if (failures.length === selectedUrlSources.length && !sources.some((source) => source.selected && source.kind === "text" && source.text?.trim())) {
+          setError("浏览器也无法读取协议内容，请先打开协议页面或手动粘贴文本后再分析");
+          setPhase("error");
+          return;
+        }
+      }
+      const created = await api.createAnalysis({
+        serviceName: snapshot.pageTitle, pageUrl: snapshot.pageUrl,
+        sources: preparedSources, context
+      });
+      const pendingJob = {
+        id: created.jobId, analysisId: created.analysisId, state: "queued",
+        progress: 0, message: "任务已进入队列",
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+      } satisfies JobStatus;
+      await writeAnalysisState(snapshot.tabId, {
+        job: pendingJob,
+        jobId: pendingJob.id,
+        analysisId: pendingJob.analysisId,
+        pageUrl: snapshot.pageUrl,
+        sourceCount: preparedSources.filter((source) => source.selected).length
+      });
+      setJob(pendingJob);
+      setPhase("running");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "无法开始分析");
+      setPhase(cause instanceof ApiError && cause.status === undefined ? "offline" : "error");
+    }
+  }
+
+  async function ask() {
+    if (!result || !chatInput.trim() || asking) return;
+    const message = chatInput.trim();
+    setChatInput("");
+    setMessages((current) => [...current, { role: "user", text: message }]);
+    setAsking(true);
+    try {
+      const response = await api.followUp(result.id, message, messages);
+      setMessages((current) => [...current, { role: "assistant", text: response.answer }]);
+    } catch (cause) {
+      setMessages((current) => [...current, { role: "assistant", text: cause instanceof Error ? cause.message : "追问失败" }]);
+    } finally {
+      setAsking(false);
+    }
+  }
+
+  function openEvidence(finding: Finding) {
+    setSelectedFinding(finding);
+  }
+
+  async function openSourceEvidence(finding: Finding) {
+    const evidence = finding.evidence.find((item) => item.verified) ?? finding.evidence[0];
+    if (!evidence?.url || !chromeAvailable()) return;
+    setError("");
+    const targetUrl = evidence.page
+      ? `${evidence.url.replace(/#.*$/, "")}#page=${evidence.page}`
+      : evidence.url;
+    const tab = await chrome.tabs.create({ url: targetUrl });
+    if (!tab.id) return;
+    try {
+      await waitForTabComplete(tab.id);
+      const found = await highlightInTab(tab.id, evidence.quote);
+      if (!found && !evidence.page) setError("原文已打开，但页面内容与分析时的快照不完全一致，未能自动定位");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "原文已打开，但自动定位失败");
+    }
+  }
+
+  async function loadVersions() {
+    if (!result) return;
+    try { setVersions(await api.versions(result.serviceId)); } catch { setVersions({ analyses: [], comparisons: [] }); }
+  }
+
+  async function recheck() {
+    if (!result) return;
+    try {
+      const created = await api.recheck(result.serviceId);
+      const pendingJob = {
+        id: created.jobId, analysisId: created.analysisId, state: "queued",
+        progress: 0, message: "版本复核已进入队列",
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+      } satisfies JobStatus;
+      if (snapshot?.tabId !== undefined) {
+        await writeAnalysisState(snapshot.tabId, {
+          job: pendingJob,
+          jobId: pendingJob.id,
+          analysisId: pendingJob.analysisId,
+          pageUrl: snapshot.pageUrl,
+          sourceCount: result.sources.length
+        });
+      }
+      setJob(pendingJob);
+      setPhase("running");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "无法开始版本复核");
+      setPhase("error");
+    }
+  }
+
+  async function addRelatedSources(related: Array<{ title: string; url: string }>) {
+    if (!result || !related.length) return;
+    try {
+      const created = await api.addSources(result.id, related.map((item) => ({
+        id: crypto.randomUUID(),
+        kind: /\.pdf(?:$|\?)/i.test(item.url) ? "pdf" : "url",
+        title: item.title,
+        url: item.url,
+        selected: true,
+        relation: "manual"
+      })));
+      const pendingJob = {
+        id: created.jobId, analysisId: created.analysisId, state: "queued",
+        progress: 0, message: "补充材料已进入队列",
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+      } satisfies JobStatus;
+      if (snapshot?.tabId !== undefined) {
+        await writeAnalysisState(snapshot.tabId, {
+          job: pendingJob,
+          jobId: pendingJob.id,
+          analysisId: pendingJob.analysisId,
+          pageUrl: snapshot.pageUrl,
+          sourceCount: result.sources.length + related.length
+        });
+      }
+      setJob(pendingJob);
+      setPhase("running");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "无法补充关联材料");
+      setPhase("error");
+    }
+  }
+
+  async function saveAnalysis() {
+    if (!result) return;
+    setSaving(true);
+    setError("");
+    try {
+      await api.save(result.id);
+      const host = new URL(snapshot?.pageUrl ?? `https://${result.serviceId}`).hostname.replace(/^www\./, "");
+      if (chromeAvailable()) {
+        const stored = await chrome.storage.local.get("savedServices");
+        await chrome.storage.local.set({
+          savedServices: { ...(stored.savedServices ?? {}), [host]: result.serviceId }
+        });
+      }
+      setResult({ ...result, saved: true });
+    } catch (cause) {
+      setError(`保存失败：${cause instanceof Error ? cause.message : "未知错误"}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function removeAnalysis() {
+    if (!result) return;
+    await api.delete(result.id);
+    if (chromeAvailable()) {
+      const stored = await chrome.storage.local.get("savedServices");
+      const savedServices = { ...(stored.savedServices ?? {}) } as Record<string, string>;
+      for (const [host, serviceId] of Object.entries(savedServices)) {
+        if (serviceId === result.serviceId) delete savedServices[host];
+      }
+      await chrome.storage.local.set({ savedServices });
+    }
+    if (snapshot?.tabId !== undefined) await clearAnalysisState(snapshot.tabId);
+    setResult(null);
+    setMessages([]);
+    setView("overview");
+    setPhase("prepare");
+  }
+
+  const topFindings = useMemo(() => result?.topFindingIds.map((id) => result.findings.find((item) => item.id === id)).filter(Boolean) as Finding[] ?? [], [result]);
+
+  if (phase === "loading") return <Shell><Centered><LoaderCircle className="spin" /><p>正在连接当前页面</p></Centered></Shell>;
+  if (phase === "pair") return <Shell><PairScreen code={pairCode} setCode={setPairCode} onPair={pair} error={error} /></Shell>;
+  if (phase === "permission") return <Shell><PermissionScreen onGrant={grantAndScan} /></Shell>;
+  if (phase === "scanning") return <Shell><Centered><LoaderCircle className="spin" /><p className="eyebrow">正在读取当前站点</p><h2>扫描协议入口</h2></Centered></Shell>;
+  if (phase === "preparing") return <Shell><Centered><LoaderCircle className="spin" /><p className="eyebrow">正在准备分析</p><h2>读取协议原文</h2><p>正在获取所选页面并整理分析材料。</p></Centered></Shell>;
+  if (phase === "running" && job) return <Shell><RunningScreen job={job} sources={sources} /></Shell>;
+  if (phase === "offline") return <Shell offline><OfflineScreen detail={error} /></Shell>;
+  if (phase === "error") return <Shell><Centered><AlertTriangle size={30} /><h2>操作失败</h2><p>{error}</p><button className="primary" onClick={() => { setError(""); setPhase(snapshot ? "prepare" : "permission"); }}><RefreshCw size={16} />返回并重试</button></Centered></Shell>;
+  if (phase === "result" && result) {
+    return <Shell>
+      <ResultHeader result={result} saving={saving} onSave={() => void saveAnalysis()} onDelete={() => void removeAnalysis()} />
+      {error && <p className="inline-error result-error">{error}</p>}
+      <nav className="tabs">
+        {([
+          ["overview", Sparkles, "总览"], ["risks", AlertTriangle, "风险"],
+          ["sources", BookOpen, "来源"], ["chat", MessageCircle, "对话"], ["versions", History, "版本"]
+        ] as const).map(([key, Icon, label]) =>
+          <button key={key} className={view === key ? "active" : ""} onClick={() => { setView(key); if (key === "versions") void loadVersions(); }}>
+            <Icon size={17} /><span>{label}</span>
+          </button>
+        )}
+      </nav>
+      <main className="result-body">
+        {view === "overview" && <Overview result={result} topFindings={topFindings} openEvidence={openEvidence} setView={setView} />}
+        {view === "risks" && <RiskList findings={result.findings} openEvidence={openEvidence} />}
+        {view === "sources" && <SourcesView result={result} onAddRelated={addRelatedSources} />}
+        {view === "chat" && <ChatView messages={messages} suggestions={result.followUpSuggestions ?? []} input={chatInput} setInput={setChatInput} ask={ask} asking={asking} />}
+        {view === "versions" && <VersionsView versions={versions} onRecheck={recheck} />}
+      </main>
+      {selectedFinding && <EvidenceDrawer finding={selectedFinding} onClose={() => setSelectedFinding(null)} onOpenSource={() => void openSourceEvidence(selectedFinding)} />}
+    </Shell>;
+  }
+  return <Shell>
+    <PrepareScreen
+      snapshot={snapshot} sources={sources} setSources={setSources}
+      context={context} setContext={setContext} start={startAnalysis}
+      manualOpen={manualOpen} setManualOpen={setManualOpen}
+      manualText={manualText} setManualText={setManualText}
+      manualUrl={manualUrl} setManualUrl={setManualUrl}
+      addManualText={addManualText} addPdfFiles={addPdfFiles}
+    />
+  </Shell>;
+}
+
+function Shell({ children, offline = false }: { children: React.ReactNode; offline?: boolean }) {
+  return <div className="app"><header className="brand"><div className="brand-mark"><Search size={18} /></div><div><strong>协议明镜</strong><span>Agreement Lens</span></div><i className={`status-dot ${offline ? "offline" : ""}`} title={offline ? "本地分析服务未连接" : "本地分析服务已连接"} /></header>{children}</div>;
+}
+
+function Centered({ children }: { children: React.ReactNode }) { return <main className="centered">{children}</main>; }
+
+function PairScreen({ code, setCode, onPair, error }: { code: string; setCode: (value: string) => void; onPair: () => void; error: string }) {
+  return <main className="pair-screen">
+    <div className="pair-symbol"><LockKeyhole size={27} /></div>
+    <p className="eyebrow">首次使用</p><h1>连接本地分析服务</h1>
+    <p className="muted">协议正文只发送到你电脑上运行的服务。输入终端中显示的六位配对码。</p>
+    <label className="field"><span>配对码</span><input autoFocus value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))} onKeyDown={(e) => e.key === "Enter" && onPair()} /></label>
+    {error && <p className="inline-error">{error}</p>}
+    <button className="primary wide" onClick={onPair} disabled={code.length !== 6}>连接 <ChevronRight size={17} /></button>
+  </main>;
+}
+
+function PermissionScreen({ onGrant }: { onGrant: () => void }) {
+  return <Centered><div className="pair-symbol"><Shield size={28} /></div><h2>允许读取当前站点</h2><p>授权后自动发现用户协议和隐私政策链接。权限仅针对当前站点。</p><button className="primary" onClick={onGrant}>允许并扫描 <ChevronRight size={17} /></button></Centered>;
+}
+
+function OfflineScreen({ detail }: { detail?: string }) {
+  return <Centered><div className="pair-symbol offline-symbol"><AlertTriangle size={28} /></div><p className="eyebrow">后端未连接</p><h2>先启动本地分析服务</h2><p>{detail || "扩展目前无法访问 127.0.0.1:4317。启动后保持终端运行，再重新检测。"}</p><code className="command-box">pnpm server:start</code><button className="primary" onClick={() => location.reload()}><RefreshCw size={16} />重新检测</button></Centered>;
+}
+
+function PrepareScreen(props: {
+  snapshot: PageSnapshot | null; sources: DiscoveredSource[]; setSources: React.Dispatch<React.SetStateAction<DiscoveredSource[]>>;
+  context: UserContext; setContext: React.Dispatch<React.SetStateAction<UserContext>>; start: () => void;
+  manualOpen: boolean; setManualOpen: (v: boolean) => void; manualText: string; setManualText: (v: string) => void; addManualText: () => void;
+  manualUrl: string; setManualUrl: (v: string) => void; addPdfFiles: (files: FileList | null) => void;
+}) {
+  const { snapshot, sources, setSources, context, setContext } = props;
+  return <main className="prepare">
+    <section className="page-intro"><p className="eyebrow">当前页面</p><h1>{snapshot?.pageTitle ?? "未识别页面"}</h1><p className="page-url">{snapshot?.pageUrl}</p><div className="scan-summary"><CheckCircle2 size={17} /><span>发现 {sources.length} 份可能相关的规则</span></div></section>
+    <section className="section"><div className="section-heading"><div><span className="step">1</span><h2>确认分析材料</h2></div><button className="icon-button" title="重新扫描" onClick={() => location.reload()}><RefreshCw size={16} /></button></div>
+      <div className="source-list">{sources.map((source) =>
+        <label className="source-row" key={source.id}><input type="checkbox" checked={source.selected} onChange={(e) => setSources((items) => items.map((item) => item.id === source.id ? { ...item, selected: e.target.checked } : item))} /><span className="checkbox-ui"><Check size={13} /></span><FileText size={17} /><span><strong>{source.title}</strong><small>{source.kind === "text" ? "已提供文本" : new URL(source.url!).hostname}</small></span></label>
+      )}</div>
+      <div className="source-actions">
+        <button className="text-button" onClick={() => props.setManualOpen(true)}><Plus size={16} />补充链接或文本</button>
+        <label className="text-button upload-button"><Upload size={16} />上传 PDF<input type="file" accept="application/pdf,.pdf" multiple onChange={(event) => void props.addPdfFiles(event.target.files)} /></label>
+      </div>
+      {props.manualOpen &&
+        <div className="manual-box"><input type="url" placeholder="https://example.com/terms" value={props.manualUrl} onChange={(e) => props.setManualUrl(e.target.value)} /><textarea placeholder="或粘贴协议、补充规则和相关说明" value={props.manualText} onChange={(e) => props.setManualText(e.target.value)} /><div><button className="ghost" onClick={() => props.setManualOpen(false)}>取消</button><button className="small-primary" onClick={props.addManualText}>加入材料</button></div></div>}
+    </section>
+    <section className="section"><div className="section-heading"><div><span className="step">2</span><h2>这次你准备做什么</h2></div></div>
+      <div className="segmented">{actionOptions.map((option) => <button key={option.value} className={context.action === option.value ? "active" : ""} onClick={() => setContext({ ...context, action: option.value })}>{option.label}</button>)}</div>
+    </section>
+    <section className="section"><div className="section-heading"><div><span className="step">3</span><h2>你更在意哪些问题</h2></div></div>
+      <div className="chips">{concernOptions.map((option) => <button key={option.value} className={context.concerns.includes(option.value) ? "selected" : ""} onClick={() => setContext({ ...context, concerns: context.concerns.includes(option.value) ? context.concerns.filter((item) => item !== option.value) : [...context.concerns, option.value] })}>{option.label}</button>)}</div>
+      <p className="sub-label">个人底线（可多选）</p>
+      <div className="redline-list">{redlineOptions.map((redline) => <label key={redline}><input type="checkbox" checked={context.redlines.includes(redline)} onChange={(event) => setContext({ ...context, redlines: event.target.checked ? [...context.redlines, redline] : context.redlines.filter((item) => item !== redline) })} /><span className="checkbox-ui"><Check size={13} /></span>{redline}</label>)}</div>
+      <label className="field compact"><span>个人底线或补充情况（可选）</span><textarea placeholder="例如：内容不能用于训练模型" value={context.notes} onChange={(e) => setContext({ ...context, notes: e.target.value, redlines: [...context.redlines.filter((item) => redlineOptions.includes(item)), ...(e.target.value ? [e.target.value] : [])] })} /></label>
+    </section>
+    <div className="sticky-action"><div><strong>{sources.filter((source) => source.selected).length}</strong><span>份材料</span></div><button className="primary" disabled={!sources.some((source) => source.selected)} onClick={props.start}><Sparkles size={17} />开始分析</button></div>
+  </main>;
+}
+
+function RunningScreen({ job, sources }: { job: JobStatus; sources: DiscoveredSource[] }) {
+  const agents = [
+    ["费用", job.progress > 40], ["数据", job.progress > 47], ["内容与账号", job.progress > 54], ["权利与变更", job.progress > 61],
+    ["证据核验", job.progress > 78], ["结论整合", job.progress > 94]
+  ];
+  return <main className="running"><div className="radar"><span /><Search size={28} /></div><p className="eyebrow">正在分析 {sources.length} 份材料</p><h1>{job.message}</h1><div className="progress-track"><i style={{ width: `${job.progress}%` }} /></div><span className="progress-number">{job.progress}%</span><div className="agent-grid">{agents.map(([name, done]) => <div className={done ? "done" : ""} key={String(name)}>{done ? <Check size={14} /> : <LoaderCircle size={14} className="spin" />}<span>{name}</span></div>)}</div><p className="muted small">关闭侧边栏不会中断任务</p></main>;
+}
+
+function ResultHeader({ result, saving, onSave, onDelete }: { result: AnalysisResult; saving: boolean; onSave: () => void; onDelete: () => void }) {
+  const meta = recommendationMeta[result.recommendation];
+  return <header className="result-header"><div><p>{result.serviceName}</p><h1 className={meta.tone}>{meta.label}</h1></div><div className="header-actions"><button className="icon-button light" disabled={saving || result.saved} title={result.saved ? "已保存" : saving ? "正在保存" : "保存本次分析"} onClick={onSave}>{saving ? <LoaderCircle size={17} className="spin" /> : result.saved ? <Check size={17} /> : <Save size={17} />}</button><button className="icon-button light delete-action" title="删除本次分析" onClick={onDelete}><X size={17} /></button></div></header>;
+}
+
+function Overview({ result, topFindings, openEvidence, setView }: { result: AnalysisResult; topFindings: Finding[]; openEvidence: (finding: Finding) => void; setView: (view: View) => void }) {
+  return <><section className="decision"><p>{result.recommendationReason}</p>{result.actionChecklist.length > 0 && <div className="checklist"><strong>确认前建议</strong>{result.actionChecklist.slice(0, 3).map((item) => <span key={item}><CheckCircle2 size={16} />{item}</span>)}</div>}</section>
+    <section className="result-section"><div className="result-title"><div><AlertTriangle size={18} /><h2>重点告警</h2></div><button onClick={() => setView("risks")}>查看全部 {result.findings.length}</button></div>
+      <div className="finding-list">{topFindings.map((finding, index) => <FindingRow key={finding.id} finding={finding} index={index + 1} onClick={() => openEvidence(finding)} />)}</div>
+      {!topFindings.length && <div className="empty-inline"><CheckCircle2 size={22} /><span>已读材料中暂未发现可核验的重点告警</span></div>}
+    </section>
+    {result.coverageGaps.length > 0 && <section className="coverage"><AlertTriangle size={17} /><div><strong>仍有 {result.coverageGaps.length} 项待核实</strong><p>{coverageGapSummary(result.coverageGaps[0])}</p></div></section>}
+  </>;
+}
+
+function FindingRow({ finding, index, onClick }: { finding: Finding; index: number; onClick: () => void }) {
+  const meta = categoryMeta[finding.category]; const Icon = meta.icon;
+  return <button className={`finding-row ${finding.status !== "verified" ? "pending" : ""}`} onClick={onClick}><span className={`risk-index ${finding.severity}`}>{finding.status === "verified" ? index : "?"}</span><span className="finding-main"><span className="finding-meta"><Icon size={14} />{meta.label} · {finding.status !== "verified" ? "待核实" : finding.severity === "high" || finding.severity === "critical" ? "高影响" : finding.severity === "medium" ? "中等影响" : "低影响"}</span><strong>{finding.title}</strong><p>{finding.userImpact}</p></span><ChevronRight size={17} /></button>;
+}
+
+function RiskList({ findings, openEvidence }: { findings: Finding[]; openEvidence: (finding: Finding) => void }) {
+  return <section className="result-section no-top"><div className="view-heading"><h2>全部风险</h2><span>{findings.length} 项</span></div><div className="finding-list">{findings.map((finding, index) => <FindingRow key={finding.id} finding={finding} index={index + 1} onClick={() => openEvidence(finding)} />)}</div></section>;
+}
+
+function SourcesView({ result, onAddRelated }: { result: AnalysisResult; onAddRelated: (sources: Array<{ title: string; url: string }>) => void }) {
+  const included = new Set(result.sources.map((source) => source.url).filter(Boolean));
+  const related = result.sources.flatMap((source) => source.linkedSources ?? [])
+    .filter((item) => !included.has(item.url))
+    .filter((item, index, all) => all.findIndex((other) => other.url === item.url) === index)
+    .slice(0, 8);
+  return <section className="result-section no-top"><div className="view-heading"><h2>分析来源</h2><span>{result.sources.length} 份</span></div>{result.sources.map((source) => <div className="source-detail" key={source.id}><div className={`source-status ${source.status}`}><FileText size={17} /></div><div><strong>{source.title}</strong><p>{source.sections.length} 个章节 · {source.normalizedText.length.toLocaleString()} 字</p><small>{source.status === "ready" ? "已完整读取并生成内容指纹" : source.error}</small></div>{source.url && <button title="打开来源" onClick={() => chromeAvailable() && chrome.tabs.create({ url: source.url })}><ExternalLink size={15} /></button>}</div>)}{related.length > 0 && <div className="related-box"><div><strong>发现 {related.length} 份更深层关联材料</strong><p>{related.map((item) => item.title).join("、")}</p></div><button onClick={() => onAddRelated(related)}>确认并继续读取</button></div>}</section>;
+}
+
+function ChatView({ messages, suggestions, input, setInput, ask, asking }: { messages: Array<{ role: "user" | "assistant"; text: string }>; suggestions: string[]; input: string; setInput: (v: string) => void; ask: () => void; asking: boolean }) {
+  const endRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages, asking]);
+  return <section className="chat-view"><div className="chat-stream">{messages.length === 0 && <div className="chat-empty"><MessageCircle size={25} /><strong>继续追问这份协议</strong><p>可以问某项条款对你的具体影响，回答会附上当前来源中的依据。</p>{suggestions.length > 0 && <div className="suggestions">{suggestions.map((text) => <button key={text} onClick={() => setInput(text)}>{text}</button>)}</div>}</div>}{messages.map((message, index) => <div className={`message ${message.role}`} key={index}>{message.role === "assistant" ? <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a> }}>{message.text}</ReactMarkdown> : message.text}</div>)}{asking && <div className="message assistant thinking" aria-label="Agent 正在回答"><span /><span /><span /></div>}<div ref={endRef} /></div><div className="chat-composer"><textarea rows={1} value={input} disabled={asking} placeholder={asking ? "Agent 正在回答" : "追问条款或补充你的情况"} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); } }} /><button title={asking ? "正在回答" : "发送"} disabled={asking || !input.trim()} onClick={ask}>{asking ? <LoaderCircle size={17} className="spin" /> : <Send size={17} />}</button></div></section>;
+}
+
+function VersionsView({ versions, onRecheck }: { versions: { analyses: Array<{ analysisId: string; createdAt: string; recommendation: string; fingerprints: string[] }>; comparisons: VersionComparison[] }; onRecheck: () => void }) {
+  return <section className="result-section no-top"><div className="view-heading"><h2>版本记录</h2><button className="recheck-button" onClick={onRecheck}><RefreshCw size={14} />立即复核</button></div>{versions.comparisons[0] && <div className={`version-impact ${versions.comparisons[0].changed ? "changed" : ""}`}><strong>{versions.comparisons[0].changed ? "上次变化对你的影响" : "上次检查没有变化"}</strong><p>{versions.comparisons[0].decisionImpact}</p><small>{versions.comparisons[0].summary}</small></div>}{versions.analyses.length < 2 && <div className="version-empty"><History size={25} /><strong>正在守候下一次变化</strong><p>再次复核时会先比较正文指纹，没有变化就不会调用模型。</p></div>}{versions.analyses.map((version, index) => <div className="version-row" key={version.analysisId}><span className={index === 0 ? "current" : ""} /><div><strong>{index === 0 ? "当前版本" : "历史版本"}</strong><p>{new Date(version.createdAt).toLocaleString("zh-CN")}</p></div><small>{recommendationMeta[version.recommendation as keyof typeof recommendationMeta]?.label}</small></div>)}</section>;
+}
+
+function EvidenceDrawer({ finding, onClose, onOpenSource }: { finding: Finding; onClose: () => void; onOpenSource: () => void }) {
+  const evidence = finding.evidence.find((item) => item.verified) ?? finding.evidence[0];
+  return <div className="drawer-backdrop" onClick={onClose}><aside className="evidence-drawer" onClick={(e) => e.stopPropagation()}><header><button className="icon-button" title="返回" onClick={onClose}><ArrowLeft size={18} /></button><span>告警详情</span><button className="icon-button" title="关闭" onClick={onClose}><X size={18} /></button></header><div className="drawer-content"><span className={`severity-label ${finding.severity}`}>{finding.status !== "verified" ? "待核实" : finding.severity === "high" ? "高影响" : finding.severity === "medium" ? "中等影响" : "低影响"}</span><h2>{finding.title}</h2><dl><dt>什么时候触发</dt><dd>{finding.trigger}</dd><dt>平台可能做什么</dt><dd>{finding.platformAction}</dd><dt>对你的影响</dt><dd>{finding.userImpact}</dd></dl><div className="evidence-quote"><div><BookOpen size={16} /><strong>原文证据</strong>{evidence?.verified && <span><Check size={12} />已核验</span>}</div><blockquote>{focusedEvidenceQuote(finding, evidence?.quote) ?? "暂无可核验引用"}</blockquote><small>{resultSourceLabel(evidence)}</small>{evidence?.url && <button className="open-source" onClick={onOpenSource}><ExternalLink size={14} />打开并定位原文</button>}</div><div className="actions-box"><strong>你可以这样做</strong>{finding.actions.map((action) => <p key={action}><CheckCircle2 size={16} />{action}</p>)}</div>{finding.uncertainty && <p className="uncertainty">{finding.uncertainty}</p>}</div></aside></div>;
+}
+
+function focusedEvidenceQuote(finding: Finding, quote?: string): string | undefined {
+  if (!quote) return;
+  const normalized = quote.replace(/\s+/g, " ").trim();
+  if (normalized.length <= 260) return normalized;
+  const relevance = `${finding.title} ${finding.platformAction}`.toLocaleLowerCase();
+  const englishTerms = relevance.match(/[a-z][a-z-]{2,}/g) ?? [];
+  const chineseRuns = relevance.match(/[\u4e00-\u9fff]{2,}/g) ?? [];
+  const chineseTerms = chineseRuns.flatMap((run) =>
+    [...run].slice(0, -1).map((character, index) => `${character}${run[index + 1]}`)
+  );
+  const terms = [...new Set([...englishTerms, ...chineseTerms])];
+  const sentences = normalized.match(/[^。！？!?；;]+[。！？!?；;]?/g)?.map((sentence) => sentence.trim()).filter(Boolean) ?? [normalized];
+  const selected = sentences
+    .map((sentence) => ({
+      sentence,
+      score: terms.reduce((score, term) => score + (sentence.toLocaleLowerCase().includes(term) ? term.length : 0), 0)
+    }))
+    .sort((left, right) => right.score - left.score || left.sentence.length - right.sentence.length)[0]?.sentence ?? normalized;
+  if (selected.length <= 260) return selected;
+  const focusTerm = terms.find((term) => selected.toLocaleLowerCase().includes(term));
+  const focus = focusTerm ? selected.toLocaleLowerCase().indexOf(focusTerm) : 0;
+  return selected.slice(Math.max(0, Math.min(selected.length - 260, focus - 80)), Math.max(0, Math.min(selected.length - 260, focus - 80)) + 260).trim();
+}
+
+function resultSourceLabel(evidence?: Finding["evidence"][number]) {
+  if (!evidence) return "";
+  return `${evidence.page ? `第 ${evidence.page} 页 · ` : ""}${evidence.url ? new URL(evidence.url).hostname : "手动提供的材料"}`;
+}
+
+function coverageGapSummary(gap?: AnalysisResult["coverageGaps"][number]): string {
+  if (!gap) return "";
+  if (/模型|分析器/.test(gap.title)) return "部分模型视角未完成，本次已使用本地分析器补充结果。";
+  return gap.detail.replace(/\s+/g, " ").slice(0, 180);
+}

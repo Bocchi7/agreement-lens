@@ -1,0 +1,170 @@
+import { z } from "zod";
+
+export const actionTypes = ["register", "pay", "upload", "authorize", "other"] as const;
+export const riskCategories = ["money", "data", "content", "account", "remedies"] as const;
+export const severities = ["low", "medium", "high", "critical"] as const;
+export const recommendations = ["continue", "adjust", "pause"] as const;
+
+export const userContextSchema = z.object({
+  action: z.enum(actionTypes).default("register"),
+  concerns: z.array(z.enum(riskCategories)).default([]),
+  redlines: z.array(z.string().max(300)).default([]),
+  notes: z.string().max(2000).default("")
+});
+export type UserContext = z.infer<typeof userContextSchema>;
+
+export const discoveredSourceSchema = z.object({
+  id: z.string(),
+  kind: z.enum(["url", "text", "pdf"]),
+  title: z.string(),
+  url: z.string().url().optional(),
+  text: z.string().optional(),
+  dataBase64: z.string().max(12_000_000).optional(),
+  renderedHtml: z.string().max(2_000_000).optional(),
+  selected: z.boolean().default(true),
+  relation: z.enum(["primary", "direct", "manual"]).default("primary")
+});
+export type DiscoveredSource = z.infer<typeof discoveredSourceSchema>;
+
+export const sourceSectionSchema = z.object({
+  id: z.string(),
+  heading: z.string(),
+  content: z.string(),
+  page: z.number().int().positive().optional(),
+  anchor: z.string().optional()
+});
+export type SourceSection = z.infer<typeof sourceSectionSchema>;
+
+export const sourceDocumentSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  url: z.string().optional(),
+  mediaType: z.enum(["html", "pdf", "text"]),
+  normalizedText: z.string(),
+  fingerprint: z.string(),
+  sections: z.array(sourceSectionSchema),
+  linkedSources: z.array(z.object({ title: z.string(), url: z.string().url() })).optional(),
+  snapshotPath: z.string().optional(),
+  fetchedAt: z.string(),
+  status: z.enum(["ready", "partial", "failed"]),
+  error: z.string().optional()
+});
+export type SourceDocument = z.infer<typeof sourceDocumentSchema>;
+
+export const evidenceReferenceSchema = z.object({
+  sourceId: z.string(),
+  sectionId: z.string(),
+  quote: z.string(),
+  page: z.number().int().positive().optional(),
+  url: z.string().optional(),
+  verified: z.boolean().default(false)
+});
+export type EvidenceReference = z.infer<typeof evidenceReferenceSchema>;
+
+export const findingSchema = z.object({
+  id: z.string(),
+  category: z.enum(riskCategories),
+  title: z.string(),
+  trigger: z.string(),
+  platformAction: z.string(),
+  userImpact: z.string(),
+  severity: z.enum(severities),
+  confidence: z.number().min(0).max(1),
+  actions: z.array(z.string()),
+  evidence: z.array(evidenceReferenceSchema),
+  knowledgeRefs: z.array(z.string()).default([]),
+  uncertainty: z.string().default(""),
+  status: z.enum(["verified", "needs_verification", "rejected"]).default("needs_verification")
+});
+export type Finding = z.infer<typeof findingSchema>;
+
+export const coverageGapSchema = z.object({
+  sourceId: z.string().optional(),
+  title: z.string(),
+  detail: z.string(),
+  impact: z.enum(["low", "medium", "high"])
+});
+export type CoverageGap = z.infer<typeof coverageGapSchema>;
+
+export const analysisResultSchema = z.object({
+  id: z.string(),
+  serviceId: z.string(),
+  serviceName: z.string(),
+  recommendation: z.enum(recommendations),
+  recommendationReason: z.string(),
+  findings: z.array(findingSchema),
+  topFindingIds: z.array(z.string()).max(3),
+  followUpSuggestions: z.array(z.string().max(200)).max(5).default([]),
+  sources: z.array(sourceDocumentSchema),
+  coverageGaps: z.array(coverageGapSchema),
+  actionChecklist: z.array(z.string()),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  saved: z.boolean(),
+  versions: z.object({
+    knowledge: z.string(),
+    prompts: z.string(),
+    model: z.string()
+  })
+});
+export type AnalysisResult = z.infer<typeof analysisResultSchema>;
+
+export const versionComparisonSchema = z.object({
+  id: z.string(),
+  serviceId: z.string(),
+  previousAnalysisId: z.string(),
+  currentAnalysisId: z.string(),
+  changed: z.boolean(),
+  summary: z.string(),
+  decisionImpact: z.string(),
+  changedSections: z.array(z.string()),
+  createdAt: z.string()
+});
+export type VersionComparison = z.infer<typeof versionComparisonSchema>;
+
+export const jobStatusSchema = z.object({
+  id: z.string(),
+  analysisId: z.string(),
+  state: z.enum(["queued", "fetching", "analyzing", "verifying", "integrating", "complete", "failed"]),
+  progress: z.number().int().min(0).max(100),
+  message: z.string(),
+  error: z.string().optional(),
+  createdAt: z.string(),
+  updatedAt: z.string()
+});
+export type JobStatus = z.infer<typeof jobStatusSchema>;
+
+export const createAnalysisSchema = z.object({
+  serviceName: z.string().min(1).max(200),
+  pageUrl: z.string().url(),
+  sources: z.array(discoveredSourceSchema).min(1).max(12),
+  context: userContextSchema,
+  renderedHtml: z.string().max(2_000_000).optional()
+});
+export type CreateAnalysisInput = z.infer<typeof createAnalysisSchema>;
+
+export const followUpSchema = z.object({
+  message: z.string().min(1).max(4000),
+  history: z.array(z.object({
+    role: z.enum(["user", "assistant"]),
+    text: z.string().min(1).max(8000)
+  })).max(12).default([]),
+  contextPatch: userContextSchema.partial().optional()
+});
+
+export interface FollowUpResponse {
+  answer: string;
+  analysis?: AnalysisResult;
+}
+
+export interface PairResponse {
+  token: string;
+  expiresAt: string;
+}
+
+export const severityWeight: Record<(typeof severities)[number], number> = {
+  low: 1,
+  medium: 2,
+  high: 3,
+  critical: 4
+};

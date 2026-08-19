@@ -1,0 +1,292 @@
+import http from "node:http";
+import { afterEach, describe, expect, it } from "vitest";
+import { modelConfigFromEnv, runModelFollowUp, runModelSpecialist } from "./model.js";
+
+const servers: http.Server[] = [];
+afterEach(async () => {
+  await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+});
+
+describe("OpenAI-compatible model adapter", () => {
+  it("resolves an API key referenced from another environment variable", () => {
+    const previousKey = process.env.OPENAI_API_KEY;
+    const previousReferencedKey = process.env.TEST_MODEL_API_KEY;
+    try {
+      process.env.OPENAI_API_KEY = "$TEST_MODEL_API_KEY";
+      process.env.TEST_MODEL_API_KEY = "resolved-secret";
+      expect(modelConfigFromEnv()?.apiKey).toBe("resolved-secret");
+      expect(modelConfigFromEnv()?.reasoningEffort).toBe("low");
+      expect(modelConfigFromEnv()?.timeoutMs).toBe(180_000);
+      expect(modelConfigFromEnv()?.maxToolRounds).toBe(4);
+    } finally {
+      if (previousKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousKey;
+      if (previousReferencedKey === undefined) delete process.env.TEST_MODEL_API_KEY;
+      else process.env.TEST_MODEL_API_KEY = previousReferencedKey;
+    }
+  });
+
+  it("executes native tool calls and validates the final specialist schema", async () => {
+    let calls = 0;
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      calls++;
+      response.setHeader("content-type", "application/json");
+      if (calls === 1) {
+        response.end(JSON.stringify({
+          choices: [{
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [{
+                id: "tool-1",
+                type: "function",
+                function: { name: "search_sources", arguments: "{\"query\":\"自动续费\",\"limit\":3}" }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      response.end(JSON.stringify({
+        choices: [{
+          message: {
+            role: "assistant",
+            content: JSON.stringify({
+              findings: [{
+                category: "费用与自动续费",
+                title: "自动续费",
+                trigger: "开通连续包月时",
+                platformAction: "到期后自动扣款",
+                userImpact: "可能产生非预期费用",
+                severity: "high",
+                confidence: 0.9,
+                actions: ["提前关闭续费"],
+                evidence: [{
+                  sourceId: "source-1",
+                  sectionId: "section-1",
+                  quote: "服务将在到期后自动续费并扣款。"
+                }],
+                knowledgeRefs: [],
+                uncertainty: ""
+              }]
+            })
+          }
+        }]
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    const text = "服务将在到期后自动续费并扣款。";
+    const findings = await runModelSpecialist({
+      role: "fees",
+      sources: [{
+        id: "source-1",
+        title: "会员协议",
+        mediaType: "text",
+        normalizedText: text,
+        fingerprint: "fixture",
+        sections: [{ id: "section-1", heading: "续费", content: text }],
+        fetchedAt: new Date().toISOString(),
+        status: "ready"
+      }],
+      context: { action: "pay", concerns: ["money"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        model: "test-model",
+        reasoningEffort: "low",
+        timeoutMs: 45_000,
+        maxToolRounds: 2
+      }
+    });
+
+    expect(calls).toBe(2);
+    expect(requestBodies[0]?.reasoning_effort).toBe("low");
+    const firstMessages = requestBodies[0]?.messages as Array<{ role: string; content?: string }>;
+    const systemPrompt = firstMessages.find((message) => message.role === "system")?.content ?? "";
+    expect(systemPrompt).toContain("confidence is a JSON number from 0 to 1");
+    expect(systemPrompt).toContain("Never use qualitative confidence labels");
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.evidence[0]?.quote).toContain("自动续费");
+  });
+
+  it("normalizes common specialist type drift before schema validation", async () => {
+    const server = http.createServer(async (_request, response) => {
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({
+        choices: [{
+          message: {
+            role: "assistant",
+            content: JSON.stringify({
+              findings: [{
+                category: "money",
+                title: "自动续费",
+                trigger: "开通时",
+                platformAction: "到期扣款",
+                userImpact: "可能产生非预期费用",
+                severity: "high",
+                confidence: "high",
+                actions: "提前关闭续费",
+                evidence: {
+                  sourceId: "source-1",
+                  sectionId: "section-1",
+                  quote: "服务将在到期后自动续费。"
+                },
+                knowledgeRefs: "kb-1",
+                uncertainty: ""
+              }]
+            })
+          }
+        }]
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    const findings = await runModelSpecialist({
+      role: "fees",
+      sources: [{
+        id: "source-1",
+        title: "会员协议",
+        mediaType: "text",
+        normalizedText: "服务将在到期后自动续费。",
+        fingerprint: "fixture",
+        sections: [{ id: "section-1", heading: "续费", content: "服务将在到期后自动续费。" }],
+        fetchedAt: new Date().toISOString(),
+        status: "ready"
+      }],
+      context: { action: "pay", concerns: ["money"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        model: "test-model",
+        reasoningEffort: "low",
+        timeoutMs: 45_000,
+        maxToolRounds: 1
+      }
+    });
+
+    expect(findings[0]?.confidence).toBe(0.85);
+    expect(findings[0]?.actions).toEqual(["提前关闭续费"]);
+    expect(findings[0]?.evidence).toHaveLength(1);
+    expect(findings[0]?.knowledgeRefs).toEqual(["kb-1"]);
+  });
+
+  it("reads streamed output and repairs invalid JSON in the same conversation", async () => {
+    let calls = 0;
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      calls++;
+      response.statusCode = 200;
+      response.setHeader("content-type", "text/event-stream");
+      const content = calls === 1
+        ? JSON.stringify({ findings: [{ category: "money" }] })
+        : JSON.stringify({
+          findings: [{
+            category: "money", title: "自动续费", trigger: "开通时",
+            platformAction: "到期扣款", userImpact: "可能产生费用", severity: "high",
+            confidence: 0.8, actions: ["提前关闭"], evidence: [{
+              sourceId: "source-1", sectionId: "section-1", quote: "服务将自动续费。"
+            }], knowledgeRefs: [], uncertainty: ""
+          }]
+        });
+      response.write(`data: ${JSON.stringify({ choices: [{ delta: { content: content.slice(0, 20) } }] })}\n\n`);
+      response.write(`data: ${JSON.stringify({ choices: [{ delta: { content: content.slice(20) } }] })}\n\n`);
+      response.end("data: [DONE]\n\n");
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    const findings = await runModelSpecialist({
+      role: "fees",
+      sources: [{
+        id: "source-1", title: "会员协议", mediaType: "text", normalizedText: "服务将自动续费。",
+        fingerprint: "fixture", sections: [{ id: "section-1", heading: "续费", content: "服务将自动续费。" }],
+        fetchedAt: new Date().toISOString(), status: "ready"
+      }],
+      context: { action: "pay", concerns: ["money"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test", baseUrl: `http://127.0.0.1:${address.port}/v1`, model: "test-model",
+        reasoningEffort: "low", timeoutMs: 45_000, maxToolRounds: 2
+      }
+    });
+    expect(findings[0]?.title).toBe("自动续费");
+    expect(requestBodies[0]?.stream).toBe(true);
+    expect((requestBodies[1]?.messages as Array<{ role: string }>).some((message) => message.role === "assistant")).toBe(true);
+    expect((requestBodies[1]?.messages as Array<{ role: string; content?: string }>).at(-1)?.content).toContain("校验错误");
+  });
+
+  it("turns an accidental integrator JSON response into a natural follow-up answer", async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBody = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({
+        choices: [{
+          message: {
+            role: "assistant",
+            content: JSON.stringify({
+              recommendation: "adjust first",
+              recommendationReason: "条款没有说明取消通知会导致既有材料下架，处理范围仍不明确。",
+              topFindingIds: ["finding-1"],
+              actionChecklist: ["核对取消通知的生效时间和既有材料处理规则。"],
+              followUpSuggestions: ["平台是否必须删除已发布的改编内容？"]
+            })
+          }
+        }]
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    const response = await runModelFollowUp({
+      result: { recommendation: "pause", recommendationReason: "需要核验", findings: [] },
+      message: "请核对取消服务后既有材料是否需要下架？",
+      session: {
+        model: "test-model",
+        messages: [
+          { role: "system", content: "初次整合时只返回 JSON。" },
+          { role: "user", content: "Return JSON." },
+          { role: "assistant", content: "{\"recommendation\":\"pause\"}" }
+        ]
+      },
+      sources: [],
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        model: "test-model",
+        reasoningEffort: "low",
+        timeoutMs: 45_000,
+        maxToolRounds: 1
+      }
+    });
+
+    expect(response.answer).toContain("结论：先调整后再决定");
+    expect(response.answer).toContain("既有材料下架");
+    expect(response.answer).not.toContain("\"recommendation\"");
+    const messages = requestBody?.messages as Array<{ role: string; content?: string }>;
+    expect(messages.some((message) => message.role === "system" && message.content?.includes("FOLLOW_UP_CONVERSATION_MODE"))).toBe(true);
+  });
+});

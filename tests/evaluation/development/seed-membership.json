@@ -1,0 +1,29 @@
+{
+  "id": "seed-membership",
+  "serviceName": "种子会员服务",
+  "pageUrl": "https://evaluation.example/membership",
+  "context": {
+    "action": "pay",
+    "concerns": ["money", "data"],
+    "redlines": [],
+    "notes": ""
+  },
+  "sources": [
+    {
+      "title": "会员协议",
+      "text": "用户开通连续包月后，服务将在到期前自动续费并扣款。数字会员权益一经开通，不支持退款。"
+    },
+    {
+      "title": "隐私政策",
+      "text": "为提供个性化服务，我们可能与第三方共享个人信息。用户可以在设置中关闭个性化推荐。"
+    }
+  ],
+  "expected": {
+    "recommendation": "adjust",
+    "highImpact": [
+      { "category": "money", "quoteContains": "自动续费" },
+      { "category": "money", "quoteContains": "不支持退款" },
+      { "category": "data", "quoteContains": "第三方共享个人信息" }
+    ]
+  }
+}
