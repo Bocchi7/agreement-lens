@@ -49,7 +49,7 @@ pnpm test
 pnpm build
 ```
 
-知识库材料放在 `knowledge/*.md`，使用 frontmatter 描述 `id`、`title`、`source` 和适用范围。每次更新材料后重新运行 `pnpm knowledge:import`。
+知识库材料放在 `knowledge/*.md`，使用 frontmatter 描述 `id`、`title`、`source` 和适用范围。每次更新材料后重新运行 `pnpm knowledge:import`。完整的文件格式、更新流程和维护边界见 [知识库维护说明](docs/knowledge-maintenance.md)。
 
 ## 数据位置
 
