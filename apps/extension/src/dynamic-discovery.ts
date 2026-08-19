@@ -8,9 +8,8 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
   // without module-level closures, so every runtime helper must be local.
   const agreementLabel = (value: string): string | undefined => {
     const normalized = value.replace(/\s+/g, " ").trim();
-    if (/隐私/.test(normalized)) return "隐私政策";
-    if (/服务条款|用户协议|服务协议|条款|协议/.test(normalized)) return "服务条款";
-    return undefined;
+    if (!normalized) return undefined;
+    return normalized.replace(/^[《「『【[(\s]+|[》」』】)\]\s]+$/g, "").trim();
   };
   const isHistoricalVersionLink = (label: string, url: URL): boolean => {
     const path = `${url.pathname}${url.search}`.toLocaleLowerCase();
@@ -102,44 +101,51 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
     return undefined;
   };
 
-  const urlsFromReactClick = (element: Element): string[] => {
+  const urlsFromClick = (element: Element): string[] => {
     if (typeof window === "undefined") return [];
+    const directTarget = element.getAttribute("href")
+      || element.getAttribute("data-href")
+      || element.getAttribute("data-url");
+    if (directTarget || !element.matches("a,area,[role='link']")) return [];
     const captured: string[] = [];
     const originalOpen = window.open;
+    const preventNavigation = (event: Event) => event.preventDefault();
     const capture = (value: unknown) => {
-      if (typeof value !== "string") return;
+      if (typeof value !== "string" && !(value instanceof URL)) return;
       try {
-        const url = new URL(value, location.href);
+        const url = new URL(String(value), location.href);
         if (["http:", "https:"].includes(url.protocol)) captured.push(url.href);
       } catch {
         // Ignore non-URL navigation values.
       }
     };
-    const keys = Object.getOwnPropertyNames(element)
-      .filter((key) => /^__reactEventHandlers\$/i.test(key));
-    for (const key of keys) {
-      const handlers = (element as Element & Record<string, unknown>)[key];
-      if (!handlers || typeof handlers !== "object") continue;
-      const handler = (handlers as Record<string, unknown>).onClick;
-      if (typeof handler !== "function") continue;
-      try {
-        window.open = ((url?: string | URL) => {
-          capture(url);
-          return null;
-        }) as typeof window.open;
-        const returned = handler({
-          preventDefault() {},
-          stopPropagation() {},
-          stopImmediatePropagation() {}
-        });
-        capture(returned);
-      } catch {
-        // A page may require a real browser event object.
-      } finally {
-        window.open = originalOpen;
-      }
+    try {
+      window.open = ((url?: string | URL) => {
+        capture(url);
+        return null;
+      }) as typeof window.open;
+      document.addEventListener("click", preventNavigation, true);
+      const EventConstructor = element.ownerDocument.defaultView?.MouseEvent ?? MouseEvent;
+      element.dispatchEvent(new EventConstructor("click", {
+        bubbles: true,
+        cancelable: true,
+        view: element.ownerDocument.defaultView
+      }));
+    } catch {
+      // Some controls require trusted pointer events; framework metadata is
+      // still inspected as a fallback.
+    } finally {
+      document.removeEventListener("click", preventNavigation, true);
+      window.open = originalOpen;
     }
     return captured;
+  };
+  const canonicalUrl = (value: string): string => {
+    const url = new URL(value, location.href);
+    for (const key of [...url.searchParams.keys()]) {
+      if (/^_\d{10,}$/.test(key) && !url.searchParams.get(key)) url.searchParams.delete(key);
+    }
+    return url.href;
   };
 
   const results: DynamicAgreementLink[] = [];
@@ -161,8 +167,8 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
       .sort((left, right) => right.score - left.score);
     const handlerUrl = urlFromReactEventHandler(element);
     if (handlerUrl) candidates.unshift({ title: agreementLabel(text), url: handlerUrl, score: 3 });
-    for (const reactClickUrl of urlsFromReactClick(element)) {
-      candidates.unshift({ title: agreementLabel(text), url: reactClickUrl, score: 4 });
+    for (const clickUrl of urlsFromClick(element)) {
+      candidates.unshift({ title: agreementLabel(text), url: clickUrl, score: 4 });
     }
     for (const candidate of candidates) {
       // A URL without the matching component label is too ambiguous: Vue/React
@@ -177,11 +183,12 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
       }
       if (!["http:", "https:"].includes(url.protocol)) continue;
       if (isHistoricalVersionLink(title, url)) continue;
-      if (seen.has(url.href)) continue;
-      seen.add(url.href);
+      const canonical = canonicalUrl(url.href);
+      if (seen.has(canonical)) continue;
+      seen.add(canonical);
       results.push({
         title: title.trim(),
-        url: url.href
+        url: canonical
       });
       break;
     }

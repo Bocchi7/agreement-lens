@@ -3,6 +3,7 @@ import { decodeHtmlBytes } from "@agreement-lens/shared";
 import { resolveDynamicAgreementLinks } from "./dynamic-discovery";
 import { needsRenderedFallback } from "./html-readiness";
 import { setTabBadge as updateTabBadge } from "./tab-badge";
+import { mergeDiscoveredSources } from "./frame-discovery";
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
 
@@ -38,6 +39,10 @@ interface BrowserFetchedSource extends BrowserSourceRequest {
   error?: string;
   linkedSources: CapturedAgreementLink[];
 }
+
+type FrameDiscoveryRecord = Omit<PageSnapshot, "tabId" | "pendingRecheck">;
+
+const discoveryUpdates = new Map<number, Promise<PageSnapshot | null>>();
 
 function base64FromBytes(bytes: Uint8Array): string {
   let binary = "";
@@ -410,10 +415,28 @@ async function maybeRecheck(payload: PageSnapshot) {
 }
 
 async function scanTab(tabId: number) {
+  const scanFrame = async (frameId: number) => {
+    await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["content.js"] });
+    await chrome.tabs.sendMessage(tabId, { type: "SCAN_PAGE" }, { frameId });
+  };
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
-    await chrome.tabs.sendMessage(tabId, { type: "SCAN_PAGE" });
-  } catch {
+    const frames = await chrome.webNavigation.getAllFrames({ tabId }).catch(() => [{ frameId: 0 }]);
+    const frameIds = [...new Set((frames ?? []).map((frame) => frame.frameId))];
+    await scanFrame(0);
+    await Promise.all(frameIds.filter((frameId) => frameId !== 0).map((frameId) =>
+      scanFrame(frameId).catch((error) => {
+        console.info("[agreement-lens] skipped inaccessible frame", {
+          tabId,
+          frameId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      })
+    ));
+  } catch (error) {
+    console.warn("[agreement-lens] page scan failed", {
+      tabId,
+      error: error instanceof Error ? error.message : String(error)
+    });
     await updateTabBadge(chrome, tabId, "?", "#69726d");
   }
 }
@@ -436,12 +459,106 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === "loading" || changeInfo.url) {
+    void chrome.storage.session.remove([`page:${tabId}`, `pageFrames:${tabId}`]);
+  }
   if (changeInfo.status !== "complete" || !tab.url?.startsWith("http")) return;
   const origin = new URL(tab.url).origin + "/*";
   chrome.permissions.contains({ origins: [origin] }, (allowed) => {
     if (allowed) void scanTab(tabId);
   });
 });
+
+chrome.webNavigation.onDOMContentLoaded.addListener((details) => {
+  if (details.frameId === 0 || !details.url.startsWith("http")) return;
+  const origin = new URL(details.url).origin + "/*";
+  chrome.permissions.contains({ origins: [origin] }, (allowed) => {
+    if (!allowed) return;
+    void chrome.scripting.executeScript({
+      target: { tabId: details.tabId, frameIds: [details.frameId] },
+      files: ["content.js"]
+    }).then(() => chrome.tabs.sendMessage(
+      details.tabId,
+      { type: "SCAN_PAGE" },
+      { frameId: details.frameId }
+    )).catch((error) => {
+      console.info("[agreement-lens] dynamic frame scan skipped", {
+        tabId: details.tabId,
+        frameId: details.frameId,
+        url: details.url,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
+  });
+});
+
+async function updatePageDiscovery(
+  incoming: PageSnapshot,
+  frameId: number
+): Promise<PageSnapshot | null> {
+  const tab = await chrome.tabs.get(incoming.tabId);
+  if (!tab.url?.startsWith("http")) return null;
+  if (frameId === 0) {
+    if (!samePageUrl(tab.url, incoming.pageUrl)) return null;
+  } else {
+    const frame = await chrome.webNavigation.getFrame({ tabId: incoming.tabId, frameId }).catch(() => null);
+    if (!frame || !samePageUrl(frame.url, incoming.pageUrl)) return null;
+  }
+
+  const framesKey = `pageFrames:${incoming.tabId}`;
+  const pageKey = `page:${incoming.tabId}`;
+  const stored = await chrome.storage.session.get([framesKey, pageKey]);
+  const previousPage = stored[pageKey] as PageSnapshot | undefined;
+  let records = {
+    ...((stored[framesKey] as Record<string, FrameDiscoveryRecord> | undefined) ?? {})
+  };
+  const previousTop = records["0"];
+  if ((previousTop && !samePageUrl(previousTop.pageUrl, tab.url))
+    || (previousPage && !samePageUrl(previousPage.pageUrl, tab.url))) records = {};
+  records[String(frameId)] = {
+    pageUrl: incoming.pageUrl,
+    pageTitle: incoming.pageTitle,
+    origin: incoming.origin,
+    sources: incoming.sources,
+    scannedAt: incoming.scannedAt
+  };
+
+  const liveFrames = await chrome.webNavigation.getAllFrames({ tabId: incoming.tabId }).catch(() => []);
+  const liveById = new Map((liveFrames ?? []).map((frame) => [String(frame.frameId), frame.url]));
+  for (const [id, record] of Object.entries(records)) {
+    if (id === "0") continue;
+    const liveUrl = liveById.get(id);
+    if (!liveUrl || !samePageUrl(liveUrl, record.pageUrl)) delete records[id];
+  }
+
+  const top = records["0"];
+  const orderedRecords = Object.entries(records)
+    .sort(([left], [right]) => Number(left) - Number(right))
+    .map(([, record]) => record);
+  const payload: PageSnapshot = {
+    tabId: incoming.tabId,
+    pageUrl: tab.url,
+    pageTitle: top?.pageTitle || tab.title || incoming.pageTitle,
+    origin: new URL(tab.url).origin,
+    sources: mergeDiscoveredSources(orderedRecords.map((record) => record.sources)),
+    scannedAt: incoming.scannedAt,
+    pendingRecheck: previousPage?.pendingRecheck
+  };
+  await chrome.storage.session.set({ [framesKey]: records });
+  return frameId === 0 && !payload.pendingRecheck ? maybeRecheck(payload) : payload;
+}
+
+function queuePageDiscovery(incoming: PageSnapshot, frameId: number): Promise<PageSnapshot | null> {
+  const previous = discoveryUpdates.get(incoming.tabId) ?? Promise.resolve(null);
+  const current = previous
+    .catch(() => null)
+    .then(() => updatePageDiscovery(incoming, frameId));
+  discoveryUpdates.set(incoming.tabId, current);
+  void current.finally(() => {
+    if (discoveryUpdates.get(incoming.tabId) === current) discoveryUpdates.delete(incoming.tabId);
+  });
+  return current;
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "RESOLVE_DYNAMIC_AGREEMENT_LINKS") {
@@ -450,18 +567,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
     void chrome.scripting.executeScript({
-      target: { tabId: sender.tab.id },
+      target: { tabId: sender.tab.id, frameIds: [sender.frameId ?? 0] },
       world: "MAIN",
       func: resolveDynamicAgreementLinks
     }).then(([result]) => {
       console.info("[agreement-lens] dynamic discovery completed", {
         tabId: sender.tab?.id,
+        frameId: sender.frameId ?? 0,
         links: result?.result ?? []
       });
       sendResponse({ links: result?.result ?? [] });
     }).catch((error) => {
       console.warn("[agreement-lens] dynamic discovery failed", {
         tabId: sender.tab?.id,
+        frameId: sender.frameId ?? 0,
         error: error instanceof Error ? error.message : String(error)
       });
       sendResponse({ links: [] });
@@ -470,15 +589,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === "PAGE_DISCOVERED") {
     const incoming = { ...message.payload, tabId: sender.tab?.id ?? message.payload.tabId } as PageSnapshot;
-    void chrome.tabs.get(incoming.tabId).then((tab) => {
-      if (!samePageUrl(tab.url, incoming.pageUrl)) return null;
-      return maybeRecheck(incoming);
-    }).then((payload) => {
+    void queuePageDiscovery(incoming, sender.frameId ?? 0).then(async (payload) => {
       if (!payload) {
         sendResponse({ ok: false, stale: true });
         return;
       }
-      void chrome.storage.session.set({ [`page:${payload.tabId}`]: payload, latestPage: payload });
+      await chrome.storage.session.set({ [`page:${payload.tabId}`]: payload, latestPage: payload });
       void chrome.runtime.sendMessage({ type: "PAGE_STATE_UPDATED", payload }).catch(() => undefined);
       const count = payload.sources.length;
       if (payload.tabId >= 0 && !payload.pendingRecheck) {

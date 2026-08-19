@@ -71,4 +71,35 @@ describe("dynamic agreement discovery", () => {
       { title: "隐私政策", url: "https://wx.mail.qq.com/list/readtemplate?name=app_intro.html#/agreement/appPolicy" }
     ]);
   });
+
+  it("captures URLs opened by native listeners on href-less agreement links", () => {
+    const dom = new JSDOM(`
+      <p>
+        <a id="user">《百度用户协议》</a>
+        <a id="child">《儿童个人信息保护声明》</a>
+        <a id="privacy">《百度隐私权保护声明》</a>
+      </p>
+    `, { url: "https://passport.baidu.com/v2/?reg" });
+    dom.window.document.querySelector("#user")?.addEventListener("click", () => {
+      dom.window.open("http://passport.baidu.com/static/passpc-account/html/protocal.html", "_blank");
+    });
+    dom.window.document.querySelector("#child")?.addEventListener("click", () => {
+      dom.window.open("https://privacy.baidu.com/policy/children-privacy-policy/index.html?_1787157891640", "_blank");
+    });
+    dom.window.document.querySelector("#privacy")?.addEventListener("click", () => {
+      dom.window.open("http://privacy.baidu.com/detail?id=288", "_blank");
+    });
+    vi.stubGlobal("document", dom.window.document);
+    vi.stubGlobal("location", dom.window.location);
+    vi.stubGlobal("window", dom.window);
+    vi.stubGlobal("MouseEvent", dom.window.MouseEvent);
+    vi.stubGlobal("URL", dom.window.URL);
+
+    const injectedResolver = new Function(`return (${resolveDynamicAgreementLinks.toString()})`)() as typeof resolveDynamicAgreementLinks;
+    expect(injectedResolver()).toEqual([
+      { title: "百度用户协议", url: "http://passport.baidu.com/static/passpc-account/html/protocal.html" },
+      { title: "儿童个人信息保护声明", url: "https://privacy.baidu.com/policy/children-privacy-policy/index.html" },
+      { title: "百度隐私权保护声明", url: "http://privacy.baidu.com/detail?id=288" }
+    ]);
+  });
 });

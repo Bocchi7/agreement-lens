@@ -22,7 +22,7 @@ async function collectSources() {
           relation: "primary"
         });
       }
-      if (response.links?.length) break;
+      if (response.links?.length || sources.length) break;
     } catch (error) {
       console.warn("[agreement-lens] dynamic discovery request failed", error);
     }
@@ -30,8 +30,8 @@ async function collectSources() {
   return sources.slice(0, 12);
 }
 
-function publishDiscovery(sources: ReturnType<typeof discoverAgreementSources>) {
-  void chrome.runtime.sendMessage({
+async function publishDiscovery(sources: ReturnType<typeof discoverAgreementSources>) {
+  await chrome.runtime.sendMessage({
     type: "PAGE_DISCOVERED",
     payload: {
       tabId: -1,
@@ -46,14 +46,14 @@ function publishDiscovery(sources: ReturnType<typeof discoverAgreementSources>) 
 
 async function sendDiscovery() {
   const sources = await collectSources();
-  publishDiscovery(sources);
+  await publishDiscovery(sources);
   return sources.length;
 }
 
 const runtimeWindow = window as Window & {
   __agreementLensContentVersion?: string;
 };
-const contentVersion = "2026-08-19-evidence-frames-v4";
+const contentVersion = "2026-08-19-cross-frame-discovery-v5";
 
 if (runtimeWindow.__agreementLensContentVersion !== contentVersion) chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === "SCAN_PAGE") {
@@ -78,7 +78,7 @@ if (runtimeWindow.__agreementLensContentVersion !== contentVersion) {
     const signature = sources.map((source) => `${source.title}|${source.url}`).join("\n");
     if (signature === lastSignature) return;
     lastSignature = signature;
-    publishDiscovery(sources);
+    await publishDiscovery(sources);
   };
   const scheduleScan = () => {
     if (timer !== undefined) window.clearTimeout(timer);

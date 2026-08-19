@@ -14,6 +14,7 @@ import { maxSourceDocuments } from "@agreement-lens/shared";
 import { api, ApiError } from "./api";
 import type { PageSnapshot } from "./types";
 import { evidenceSourceUrl, resultSourceLabel, uniqueSourceDocuments } from "./evidence-source";
+import { permissionPatternsForSite } from "./frame-discovery";
 
 type View = "overview" | "risks" | "sources" | "chat" | "versions";
 type Phase = "loading" | "pair" | "permission" | "scanning" | "prepare" | "preparing" | "running" | "result" | "offline" | "error";
@@ -418,14 +419,20 @@ export function App() {
     try {
       if (!permissionTarget) throw new Error("当前标签页不支持扫描，请切换到需要分析的网站后重试");
       const tab = permissionTarget;
-      const origin = new URL(tab.url).origin + "/*";
-      const granted = await chrome.permissions.request({ origins: [origin] });
+      const granted = await chrome.permissions.request({ origins: permissionPatternsForSite(tab.url) });
       if (!granted) throw new Error("未获得当前站点的读取权限");
-      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
-      await chrome.tabs.sendMessage(tab.id, { type: "SCAN_PAGE" });
+      const frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id }).catch(() => [{ frameId: 0 }]);
+      const scanFrame = async (frameId: number) => {
+        await chrome.scripting.executeScript({ target: { tabId: tab.id, frameIds: [frameId] }, files: ["content.js"] });
+        await chrome.tabs.sendMessage(tab.id, { type: "SCAN_PAGE" }, { frameId });
+      };
+      await scanFrame(0);
+      await Promise.all((frames ?? [])
+        .filter((frame) => frame.frameId !== 0)
+        .map((frame) => scanFrame(frame.frameId).catch(() => undefined)));
 
       let page: PageSnapshot | null = null;
-      for (let attempt = 0; attempt < 10; attempt++) {
+      for (let attempt = 0; attempt < 30; attempt++) {
         await new Promise((resolve) => window.setTimeout(resolve, 200));
         page = await currentSnapshot();
         if (page?.tabId === tab.id) break;
@@ -839,6 +846,7 @@ export function App() {
     <PrepareScreen
       snapshot={snapshot} sources={sources} setSources={setSources}
       context={context} setContext={setContext} start={startAnalysis}
+      rescan={grantAndScan}
       manualOpen={manualOpen} setManualOpen={setManualOpen}
       manualText={manualText} setManualText={setManualText}
       manualUrl={manualUrl} setManualUrl={setManualUrl}
@@ -875,13 +883,14 @@ function OfflineScreen({ detail }: { detail?: string }) {
 function PrepareScreen(props: {
   snapshot: PageSnapshot | null; sources: DiscoveredSource[]; setSources: React.Dispatch<React.SetStateAction<DiscoveredSource[]>>;
   context: UserContext; setContext: React.Dispatch<React.SetStateAction<UserContext>>; start: () => void;
+  rescan: () => void;
   manualOpen: boolean; setManualOpen: (v: boolean) => void; manualText: string; setManualText: (v: string) => void; addManualText: () => void;
   manualUrl: string; setManualUrl: (v: string) => void; addPdfFiles: (files: FileList | null) => void;
 }) {
   const { snapshot, sources, setSources, context, setContext } = props;
   return <main className="prepare">
     <section className="page-intro"><p className="eyebrow">当前页面</p><h1>{snapshot?.pageTitle ?? "未识别页面"}</h1><p className="page-url">{snapshot?.pageUrl}</p><div className="scan-summary"><CheckCircle2 size={17} /><span>发现 {sources.length} 份可能相关的规则</span></div></section>
-    <section className="section"><div className="section-heading"><div><span className="step">1</span><h2>确认分析材料</h2></div><button className="icon-button" title="重新扫描" onClick={() => location.reload()}><RefreshCw size={16} /></button></div>
+    <section className="section"><div className="section-heading"><div><span className="step">1</span><h2>确认分析材料</h2></div><button className="icon-button" title="重新扫描" onClick={props.rescan}><RefreshCw size={16} /></button></div>
       <div className="source-list">{sources.map((source) =>
         <label className="source-row" key={source.id}><input type="checkbox" checked={source.selected} onChange={(e) => setSources((items) => items.map((item) => item.id === source.id ? { ...item, selected: e.target.checked } : item))} /><span className="checkbox-ui"><Check size={13} /></span><FileText size={17} /><span><strong>{source.title}</strong><small>{source.kind === "text" ? "已提供文本" : new URL(source.url!).hostname}</small></span></label>
       )}</div>

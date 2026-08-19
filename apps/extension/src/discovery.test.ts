@@ -76,6 +76,17 @@ describe("agreement discovery", () => {
     ]);
   });
 
+  it("discovers agreement links rendered inside a registration iframe document", () => {
+    const dom = new JSDOM(`
+      <div class="agreement">
+        <a href="https://ptlogin.4399.com/resource/protocol.html?type=1&aids=1,3,6,7">《用户协议》</a>
+        <a href="https://ptlogin.4399.com/resource/protocol.html?type=2&aids=2,10">《隐私政策》</a>
+      </div>
+    `, { url: "https://ptlogin.4399.com/ptlogin/phoneLoginFrame.do" });
+    const sources = discoverAgreementSources(dom.window.document, dom.window.location.href);
+    expect(sources.map((source) => source.title)).toEqual(["《用户协议》", "《隐私政策》"]);
+  });
+
   it("finds agreement links inside open shadow roots and data-href components", () => {
     const dom = new JSDOM("<main></main>");
     const host = dom.window.document.createElement("agreement-footer");
