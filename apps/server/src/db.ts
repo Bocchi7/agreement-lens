@@ -106,6 +106,13 @@ export function updateJob(job: JobStatus) {
     );
 }
 
+export function discardAnalysisRecordForJob(jobId: string, discardedAnalysisId: string, replacementAnalysisId: string) {
+  db.transaction(() => {
+    db.prepare("UPDATE jobs SET analysis_id=? WHERE id=?").run(replacementAnalysisId, jobId);
+    db.prepare("DELETE FROM analyses WHERE id=?").run(discardedAnalysisId);
+  })();
+}
+
 export function getJob(id: string): JobStatus | undefined {
   const row = db.prepare("SELECT * FROM jobs WHERE id=?").get(id) as Record<string, unknown> | undefined;
   if (!row) return;

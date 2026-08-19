@@ -40,6 +40,32 @@ describe("source loading", () => {
     expect(fs.existsSync(`${snapshotDir}/${source?.snapshotPath}/raw.txt`)).toBe(true);
   });
 
+  it("deduplicates identical source snapshots before analysis", async () => {
+    const text = "同一份协议正文。".repeat(30);
+    const sources = await loadSourceGraph([
+      {
+        id: `duplicate-http-${Date.now()}`,
+        kind: "url",
+        title: "爱奇艺服务协议",
+        url: "http://www.iqiyi.com/user/register/protocol.html",
+        text,
+        selected: true,
+        relation: "primary"
+      },
+      {
+        id: `duplicate-https-${Date.now()}`,
+        kind: "url",
+        title: "爱奇艺服务协议",
+        url: "https://www.iqiyi.com/user/register/protocol.html",
+        text,
+        selected: true,
+        relation: "primary"
+      }
+    ], undefined, 1);
+    expect(sources).toHaveLength(1);
+    expect(sources[0]?.url).toBe("https://www.iqiyi.com/user/register/protocol.html");
+  });
+
   it("extracts agreement-specific direct links from rendered HTML", async () => {
     const sources = await loadSourceGraph([{
       id: `html-${Date.now()}`,

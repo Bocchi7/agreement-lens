@@ -3,7 +3,7 @@ import { analysisResultSchema, maxSourceDocuments, type CreateAnalysisInput, typ
 import type { AnalysisResult, VersionComparison } from "@agreement-lens/shared";
 import { refineChangeRoute, routeChangedContent, runWorkflow } from "@agreement-lens/agent-core";
 import type { MainAgentSession } from "@agreement-lens/agent-core";
-import { getAgentSession, getJob, openKnowledge, saveAgentSession, saveResult, saveVersionComparison, updateJob } from "./db.js";
+import { discardAnalysisRecordForJob, getAgentSession, getJob, openKnowledge, saveAgentSession, saveResult, saveVersionComparison, updateJob } from "./db.js";
 import { loadSourceGraph } from "./sources.js";
 import { repoRoot } from "./config.js";
 import path from "node:path";
@@ -81,29 +81,9 @@ export function enqueueRecheck(
       let route = routeChangedContent(previousResult.sources, sources);
       const now = new Date().toISOString();
       if (!route.changed) {
-        const unchanged: AnalysisResult = {
-          ...previousResult,
-          id: analysisId,
-          sources,
-          createdAt: now,
-          updatedAt: now,
-          saved: true
-        };
-        saveResult(unchanged);
-        const previousSession = getAgentSession(previousResult.id);
-        if (previousSession) saveAgentSession(analysisId, previousSession);
-        const comparison: VersionComparison = {
-          id: randomUUID(),
-          serviceId,
-          previousAnalysisId: previousResult.id,
-          currentAnalysisId: analysisId,
-          changed: false,
-          summary: "协议正文指纹未变化，本次未调用任何模型。",
-          decisionImpact: "对你上次决定没有新增影响。",
-          changedSections: [],
-          createdAt: now
-        };
-        saveVersionComparison(comparison);
+        // A no-op recheck is not a new agreement version. Reuse the previous
+        // analysis record so repeated clicks do not grow the version history.
+        discardAnalysisRecordForJob(jobId, analysisId, previousResult.id);
         setJob(jobId, { state: "complete", progress: 100, message: "正文未变化，已跳过模型分析" });
         return;
       }

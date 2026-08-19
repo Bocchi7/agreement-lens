@@ -13,7 +13,7 @@ import type {
 import { maxSourceDocuments } from "@agreement-lens/shared";
 import { api, ApiError } from "./api";
 import type { PageSnapshot } from "./types";
-import { evidenceSourceUrl, resultSourceLabel } from "./evidence-source";
+import { evidenceSourceUrl, resultSourceLabel, uniqueSourceDocuments } from "./evidence-source";
 
 type View = "overview" | "risks" | "sources" | "chat" | "versions";
 type Phase = "loading" | "pair" | "permission" | "scanning" | "prepare" | "preparing" | "running" | "result" | "offline" | "error";
@@ -282,8 +282,8 @@ export function App() {
           const restoredJob = persisted.jobId
             ? await api.getJob(persisted.jobId)
             : persisted.job;
-          if (restoredJob?.state === "complete" && (persisted.analysisId ?? restoredJob.analysisId)) {
-            const analysis = await api.getAnalysis(persisted.analysisId ?? restoredJob.analysisId);
+          if (restoredJob?.state === "complete" && restoredJob.analysisId) {
+            const analysis = await api.getAnalysis(restoredJob.analysisId);
             setResult(analysis);
             setPreserveResultWhileRunning(false);
             setSources(page.sources);
@@ -636,7 +636,7 @@ export function App() {
   }
 
   async function recheck() {
-    if (!result) return;
+    if (!result || phase === "running") return;
     try {
       const created = await api.recheck(result.serviceId);
       const pendingJob = {
@@ -649,12 +649,13 @@ export function App() {
           job: pendingJob,
           jobId: pendingJob.id,
           analysisId: pendingJob.analysisId,
+          previousAnalysisId: result.id,
           pageUrl: snapshot.pageUrl,
           sourceCount: result.sources.length
         });
       }
       setJob(pendingJob);
-      setPreserveResultWhileRunning(false);
+      setPreserveResultWhileRunning(true);
       setPhase("running");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法开始版本复核");
@@ -829,7 +830,7 @@ export function App() {
         {view === "risks" && <RiskList findings={result.findings} openEvidence={openEvidence} />}
         {view === "sources" && <SourcesView result={result} supplementing={supplementing || (phase === "running" && preserveResultWhileRunning)} onAddRelated={addRelatedSources} />}
         {view === "chat" && <ChatView messages={messages} suggestions={result.followUpSuggestions ?? []} input={chatInput} setInput={setChatInput} ask={ask} asking={asking} />}
-        {view === "versions" && <VersionsView versions={versions} onRecheck={recheck} />}
+        {view === "versions" && <VersionsView versions={versions} onRecheck={recheck} busy={phase === "running"} />}
       </main>
       {selectedFinding && <EvidenceDrawer result={result} finding={selectedFinding} onClose={() => setSelectedFinding(null)} onOpenSource={() => void openSourceEvidence(selectedFinding)} />}
     </Shell>;
@@ -948,13 +949,14 @@ function RiskList({ findings, openEvidence }: { findings: Finding[]; openEvidenc
 }
 
 function SourcesView({ result, supplementing, onAddRelated }: { result: AnalysisResult; supplementing: boolean; onAddRelated: (sources: Array<{ title: string; url: string }>) => void }) {
-  const included = new Set(result.sources.map((source) => source.url).filter(Boolean));
-  const remaining = Math.max(0, maxSourceDocuments - result.sources.length);
-  const related = result.sources.flatMap((source) => source.linkedSources ?? [])
+  const sources = uniqueSourceDocuments(result.sources);
+  const included = new Set(sources.map((source) => source.url).filter(Boolean));
+  const remaining = Math.max(0, maxSourceDocuments - sources.length);
+  const related = sources.flatMap((source) => source.linkedSources ?? [])
     .filter((item) => !included.has(item.url))
     .filter((item, index, all) => all.findIndex((other) => other.url === item.url) === index)
     .slice(0, Math.min(8, remaining));
-  return <section className="result-section no-top"><div className="view-heading"><h2>分析来源</h2><span>{result.sources.length} 份</span></div>{result.sources.map((source) => <div className="source-detail" key={source.id}><div className={`source-status ${source.status}`}><FileText size={17} /></div><div><strong>{source.title}</strong><p>{source.normalizedText.length > 0 ? `${source.sections.length} 个章节 · ${source.normalizedText.length.toLocaleString()} 字` : source.status === "failed" ? "读取失败" : "未取得有效正文"}</p><small>{source.status === "ready" ? "已完整读取并生成内容指纹" : source.error}</small></div>{source.url && <button title="打开来源" onClick={() => chromeAvailable() && chrome.tabs.create({ url: source.url })}><ExternalLink size={15} /></button>}</div>)}{related.length > 0 && <div className="related-box"><div><strong>发现 {related.length} 份更深层关联材料</strong><p>{related.map((item) => item.title).join("、")}</p></div><button disabled={supplementing} onClick={() => onAddRelated(related)}>{supplementing ? <><LoaderCircle className="spin" size={13} />正在处理</> : "确认并继续读取"}</button></div>}</section>;
+  return <section className="result-section no-top"><div className="view-heading"><h2>分析来源</h2><span>{sources.length} 份</span></div>{sources.map((source) => <div className="source-detail" key={source.id}><div className={`source-status ${source.status}`}><FileText size={17} /></div><div><strong>{source.title}</strong><p>{source.normalizedText.length > 0 ? `${source.sections.length} 个章节 · ${source.normalizedText.length.toLocaleString()} 字` : source.status === "failed" ? "读取失败" : "未取得有效正文"}</p><small>{source.status === "ready" ? "已完整读取并生成内容指纹" : source.error}</small></div>{source.url && <button title="打开来源" onClick={() => chromeAvailable() && chrome.tabs.create({ url: source.url })}><ExternalLink size={15} /></button>}</div>)}{related.length > 0 && <div className="related-box"><div><strong>发现 {related.length} 份更深层关联材料</strong><p>{related.map((item) => item.title).join("、")}</p></div><button disabled={supplementing} onClick={() => onAddRelated(related)}>{supplementing ? <><LoaderCircle className="spin" size={13} />正在处理</> : "确认并继续读取"}</button></div>}</section>;
 }
 
 function ChatView({ messages, suggestions, input, setInput, ask, asking }: { messages: Array<{ role: "user" | "assistant"; text: string }>; suggestions: string[]; input: string; setInput: (v: string) => void; ask: () => void; asking: boolean }) {
@@ -965,8 +967,8 @@ function ChatView({ messages, suggestions, input, setInput, ask, asking }: { mes
   return <section className="chat-view"><div className="chat-stream">{messages.length === 0 && <div className="chat-empty"><MessageCircle size={25} /><strong>继续追问这份协议</strong><p>可以问某项条款对你的具体影响，回答会附上当前来源中的依据。</p>{suggestions.length > 0 && <div className="suggestions">{suggestions.map((text) => <button key={text} onClick={() => setInput(text)}>{text}</button>)}</div>}</div>}{messages.map((message, index) => <div className={`message ${message.role}`} key={index}>{message.role === "assistant" ? <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a> }}>{message.text}</ReactMarkdown> : message.text}</div>)}{asking && <div className="message assistant thinking" aria-label="Agent 正在回答"><span /><span /><span /></div>}<div ref={endRef} /></div><div className="chat-composer"><textarea rows={1} value={input} disabled={asking} placeholder={asking ? "Agent 正在回答" : "追问条款或补充你的情况"} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); } }} /><button title={asking ? "正在回答" : "发送"} disabled={asking || !input.trim()} onClick={ask}>{asking ? <LoaderCircle size={17} className="spin" /> : <Send size={17} />}</button></div></section>;
 }
 
-function VersionsView({ versions, onRecheck }: { versions: { analyses: Array<{ analysisId: string; createdAt: string; recommendation: string; fingerprints: string[] }>; comparisons: VersionComparison[] }; onRecheck: () => void }) {
-  return <section className="result-section no-top"><div className="view-heading"><h2>版本记录</h2><button className="recheck-button" onClick={onRecheck}><RefreshCw size={14} />立即复核</button></div>{versions.comparisons[0] && <div className={`version-impact ${versions.comparisons[0].changed ? "changed" : ""}`}><strong>{versions.comparisons[0].changed ? "上次变化对你的影响" : "上次检查没有变化"}</strong><p>{versions.comparisons[0].decisionImpact}</p><small>{versions.comparisons[0].summary}</small></div>}{versions.analyses.length < 2 && <div className="version-empty"><History size={25} /><strong>正在守候下一次变化</strong><p>再次复核时会先比较正文指纹，没有变化就不会调用模型。</p></div>}{versions.analyses.map((version, index) => <div className="version-row" key={version.analysisId}><span className={index === 0 ? "current" : ""} /><div><strong>{index === 0 ? "当前版本" : "历史版本"}</strong><p>{new Date(version.createdAt).toLocaleString("zh-CN")}</p></div><small>{recommendationMeta[version.recommendation as keyof typeof recommendationMeta]?.label}</small></div>)}</section>;
+function VersionsView({ versions, onRecheck, busy }: { versions: { analyses: Array<{ analysisId: string; createdAt: string; recommendation: string; fingerprints: string[] }>; comparisons: VersionComparison[] }; onRecheck: () => void; busy: boolean }) {
+  return <section className="result-section no-top"><div className="view-heading"><h2>版本记录</h2><button className="recheck-button" onClick={onRecheck} disabled={busy}><RefreshCw size={14} className={busy ? "spin" : undefined} />{busy ? "正在复核" : "立即复核"}</button></div>{versions.comparisons[0] && <div className={`version-impact ${versions.comparisons[0].changed ? "changed" : ""}`}><strong>{versions.comparisons[0].changed ? "上次变化对你的影响" : "上次检查没有变化"}</strong><p>{versions.comparisons[0].decisionImpact}</p><small>{versions.comparisons[0].summary}</small></div>}{versions.analyses.length < 2 && <div className="version-empty"><History size={25} /><strong>正在守候下一次变化</strong><p>再次复核时会先比较正文指纹，没有变化就不会调用模型。</p></div>}{versions.analyses.map((version, index) => <div className="version-row" key={version.analysisId}><span className={index === 0 ? "current" : ""} /><div><strong>{index === 0 ? "当前版本" : "历史版本"}</strong><p>{new Date(version.createdAt).toLocaleString("zh-CN")}</p></div><small>{recommendationMeta[version.recommendation as keyof typeof recommendationMeta]?.label}</small></div>)}</section>;
 }
 
 function EvidenceDrawer({ result, finding, onClose, onOpenSource }: { result: AnalysisResult; finding: Finding; onClose: () => void; onOpenSource: () => void }) {

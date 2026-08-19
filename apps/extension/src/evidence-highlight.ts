@@ -37,6 +37,45 @@ function searchFragments(quote: string): string[] {
   return [...new Set(fragments.filter((fragment) => fragment.length >= 12))];
 }
 
+function matchingFragments(text: string, quote: string): Array<{ start: number; end: number; fragment: string }> {
+  return searchFragments(quote)
+    .sort((left, right) => right.length - left.length)
+    .flatMap((fragment) => {
+      const matches: Array<{ start: number; end: number; fragment: string }> = [];
+      let start = text.indexOf(fragment);
+      while (start >= 0) {
+        matches.push({ start, end: start + fragment.length, fragment });
+        start = text.indexOf(fragment, start + 1);
+      }
+      return matches;
+    })
+    .sort((left, right) => right.fragment.length - left.fragment.length || left.start - right.start);
+}
+
+function matchingRange(text: string, quote: string): { start: number; end: number; fragment: string } | null {
+  const normalizedQuote = normalize(quote);
+  const ellipsisParts = normalizedQuote.split(/(?:\.{3,}|…+)/).map((part) => part.trim()).filter(Boolean);
+  if (ellipsisParts.length >= 2) {
+    const prefixMatches = matchingFragments(text, ellipsisParts[0]!);
+    const suffixMatches = matchingFragments(text, ellipsisParts.at(-1)!);
+    const ranges = prefixMatches.flatMap((prefix) =>
+      suffixMatches
+        .filter((suffix) => suffix.start >= prefix.end)
+        .map((suffix) => ({
+          start: prefix.start,
+          end: suffix.end,
+          fragment: `${prefix.fragment}…${suffix.fragment}`
+        }))
+    );
+    if (ranges.length) {
+      return ranges.sort((left, right) =>
+        right.fragment.length - left.fragment.length || (left.end - left.start) - (right.end - right.start)
+      )[0]!;
+    }
+  }
+  return matchingFragments(text, normalizedQuote)[0] ?? null;
+}
+
 interface TextPosition {
   node: Text;
   offset: number;
@@ -176,24 +215,21 @@ export function highlightEvidence(document: Document, quote: string): boolean {
   const normalizedQuote = normalize(quote);
   if (normalizedQuote.length < 12) return false;
   const normalizedText = documentText(document);
-  const fragments = searchFragments(normalizedQuote);
   let matchText = normalizedText;
-  let fragment = fragments.find((candidate) => matchText.text.includes(candidate));
-  if (!fragment) {
+  let range = matchingRange(matchText.text, normalizedQuote);
+  if (!range) {
     const compactText = documentText(document, true);
-    const compactFragments = fragments.map(compact).filter((candidate) => candidate.length >= 12);
-    fragment = compactFragments.find((candidate) => compactText.text.includes(candidate));
+    range = matchingRange(compactText.text, compact(normalizedQuote));
     matchText = compactText;
   }
-  if (!fragment) return false;
-  const startIndex = matchText.text.indexOf(fragment);
-  const start = matchText.positions[startIndex];
-  const end = matchText.positions[startIndex + fragment.length - 1];
+  if (!range) return false;
+  const start = matchText.positions[range.start];
+  const end = matchText.positions[range.end - 1];
   if (!start || !end) return false;
   const endPosition = { node: end.node, offset: end.offset + 1 };
   const highlighted = wrapTextRange(document, start, endPosition);
   if (!highlighted) {
-    const element = findEvidenceElement(document, fragment);
+    const element = findEvidenceElement(document, range.fragment);
     if (!element) return false;
     element.dataset.agreementLensHighlight = "true";
     element.style.setProperty("background-color", "rgba(255, 228, 92, 0.35)", "important");

@@ -47,6 +47,64 @@ function canonicalAgreementUrl(url: URL): string {
   return normalized.href;
 }
 
+function sourceUrlIdentity(value: string): string {
+  try {
+    const url = new URL(value);
+    // HTTP and HTTPS copies of the same agreement are commonly exposed
+    // together. Treat them as one source while preferring HTTPS below.
+    const protocolIndependent = `${url.hostname.toLocaleLowerCase()}${url.port ? `:${url.port}` : ""}${url.pathname}${url.search}${url.hash}`;
+    return protocolIndependent.replace(/\/+$/, "") || "/";
+  } catch {
+    return value;
+  }
+}
+
+function discoveredSourcePreference(source: DiscoveredSource): number {
+  return (source.url?.startsWith("https://") ? 4 : 0)
+    + (source.renderedHtml ? 2 : 0)
+    + (source.relation === "primary" ? 1 : 0);
+}
+
+function deduplicateDiscoveredSources(sources: DiscoveredSource[]): DiscoveredSource[] {
+  const byIdentity = new Map<string, DiscoveredSource>();
+  for (const source of sources) {
+    const identity = source.url ? `url:${sourceUrlIdentity(source.url)}` : `id:${source.id}`;
+    const existing = byIdentity.get(identity);
+    if (!existing || discoveredSourcePreference(source) > discoveredSourcePreference(existing)) {
+      byIdentity.set(identity, source);
+    }
+  }
+  return [...byIdentity.values()];
+}
+
+function sourceIdentity(source: SourceDocument): string {
+  return source.url ? `url:${sourceUrlIdentity(source.url)}` : `id:${source.id}`;
+}
+
+function sourcePreference(source: SourceDocument): number {
+  return (source.url?.startsWith("https://") ? 4 : 0)
+    + (source.status === "ready" ? 2 : 0)
+    + Math.min(source.normalizedText.length / 1_000_000, 1);
+}
+
+function deduplicateSourceDocuments(sources: SourceDocument[]): SourceDocument[] {
+  const byIdentity = new Map<string, SourceDocument>();
+  for (const source of sources) {
+    const identity = sourceIdentity(source);
+    const existing = byIdentity.get(identity);
+    if (!existing) {
+      byIdentity.set(identity, source);
+      continue;
+    }
+    const preferred = sourcePreference(source) > sourcePreference(existing) ? source : existing;
+    const other = preferred === source ? existing : source;
+    const linkedSources = [...(preferred.linkedSources ?? []), ...(other.linkedSources ?? [])]
+      .filter((item, index, all) => all.findIndex((candidate) => candidate.url === item.url) === index);
+    byIdentity.set(identity, linkedSources.length ? { ...preferred, linkedSources } : preferred);
+  }
+  return [...byIdentity.values()];
+}
+
 function sourceErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : "来源读取失败";
   if (/fetch failed|ETIMEDOUT|ECONNRESET|ENETUNREACH/i.test(message)) {
@@ -298,6 +356,7 @@ export async function loadSourceGraph(
   maxDocuments = maxSourceDocuments,
   currentPageUrl?: string
 ): Promise<SourceDocument[]> {
+  selected = deduplicateDiscoveredSources(selected);
   const currentFamilies = new Set(selected.flatMap((source) => {
     if (!source.url) return [];
     const url = new URL(source.url);
@@ -323,9 +382,9 @@ export async function loadSourceGraph(
   }));
   if (rootDocuments.length >= maxDocuments) return rootDocuments;
   const seen = new Set([
-    ...roots.map((source) => source.url),
-    ...rootDocuments.map((source) => source.url)
-  ].filter((url): url is string => Boolean(url)));
+    ...roots.map((source) => source.url).filter((url): url is string => Boolean(url)).map(sourceUrlIdentity),
+    ...rootDocuments.map((source) => source.url).filter((url): url is string => Boolean(url)).map(sourceUrlIdentity)
+  ]);
   const normalizeTitle = (title: string) => normalize(title)
     .replace(/[《》"'“”‘’（）()[\]]/g, "")
     .toLocaleLowerCase();
@@ -341,8 +400,9 @@ export async function loadSourceGraph(
     if (roots[index]?.renderedHtml) continue;
     for (const link of document.linkedSources ?? []) {
       const normalizedTitle = normalizeTitle(link.title);
-      if (seen.has(link.url) || seenTitles.has(normalizedTitle) || direct.length + rootDocuments.length >= maxDocuments) continue;
-      seen.add(link.url);
+      const linkIdentity = sourceUrlIdentity(link.url);
+      if (seen.has(linkIdentity) || seenTitles.has(normalizedTitle) || direct.length + rootDocuments.length >= maxDocuments) continue;
+      seen.add(linkIdentity);
       seenTitles.add(normalizedTitle);
       direct.push({
         id: randomUUID(),
@@ -355,7 +415,7 @@ export async function loadSourceGraph(
     }
   }
   const directDocuments = await Promise.all(direct.map((source) => loadSource(source)));
-  return [...rootDocuments, ...directDocuments];
+  return deduplicateSourceDocuments([...rootDocuments, ...directDocuments]);
 }
 const agreementLinkKeywords = [
   "协议", "条款", "隐私", "privacy", "cookie", "cookies", "terms", "conditions",

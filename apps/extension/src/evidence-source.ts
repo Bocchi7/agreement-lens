@@ -1,5 +1,33 @@
 import type { AnalysisResult, Finding, SourceDocument } from "@agreement-lens/shared";
 
+function sourceDisplayKey(source: SourceDocument): string {
+  if (!source.url) return `fingerprint:${source.fingerprint}`;
+  try {
+    const url = new URL(source.url);
+    return `url:${url.hostname.toLocaleLowerCase()}${url.port ? `:${url.port}` : ""}${url.pathname.replace(/\/+$/, "")}${url.search}${url.hash}`;
+  } catch {
+    return `url:${source.url}`;
+  }
+}
+
+function sourceDisplayPreference(source: SourceDocument): number {
+  return (source.url?.startsWith("https://") ? 4 : 0)
+    + (source.status === "ready" ? 2 : 0)
+    + Math.min(source.normalizedText.length / 1_000_000, 1);
+}
+
+export function uniqueSourceDocuments(sources: SourceDocument[]): SourceDocument[] {
+  const byKey = new Map<string, SourceDocument>();
+  for (const source of sources) {
+    const key = sourceDisplayKey(source);
+    const existing = byKey.get(key);
+    if (!existing || sourceDisplayPreference(source) > sourceDisplayPreference(existing)) {
+      byKey.set(key, source);
+    }
+  }
+  return [...byKey.values()];
+}
+
 export function evidenceSource(
   result: AnalysisResult,
   evidence?: Finding["evidence"][number]

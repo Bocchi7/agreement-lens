@@ -18,6 +18,7 @@ import { enqueueAnalysis, enqueueRecheck, newJob } from "./jobs.js";
 import { allowedExtensionId, serverPort } from "./config.js";
 import { repoRoot } from "./config.js";
 import { mergeSupplementalSources } from "./supplemental-sources.js";
+import { compactVersionHistory } from "./version-history.js";
 import path from "node:path";
 
 const app = Fastify({ logger: true, bodyLimit: 80_000_000 });
@@ -186,6 +187,14 @@ app.post("/v1/services/:id/recheck", async (request, reply) => {
   const serviceId = (request.params as { id: string }).id;
   const service = db.prepare("SELECT latest_analysis_id FROM services WHERE id=?").get(serviceId) as { latest_analysis_id: string } | undefined;
   if (!service) return reply.code(404).send({ error: "服务不存在" });
+  const active = db.prepare(`
+    SELECT j.id AS job_id, j.analysis_id
+    FROM jobs j
+    JOIN analyses a ON a.id=j.analysis_id
+    WHERE a.service_id=? AND j.state IN ('queued','fetching','analyzing','verifying','integrating')
+    ORDER BY j.created_at DESC LIMIT 1
+  `).get(serviceId) as { job_id: string; analysis_id: string } | undefined;
+  if (active) return reply.code(202).send({ analysisId: active.analysis_id, jobId: active.job_id });
   const previous = getAnalysisRequest(service.latest_analysis_id);
   const previousResult = getAnalysis(service.latest_analysis_id);
   if (!previous || !previousResult) return reply.code(404).send({ error: "历史分析不存在" });
@@ -204,18 +213,15 @@ app.get("/v1/services/:id/versions", async (request) => {
   const serviceId = (request.params as { id: string }).id;
   const rows = db.prepare("SELECT id, result_json, created_at FROM analyses WHERE service_id=? AND result_json IS NOT NULL ORDER BY created_at DESC")
     .all(serviceId) as Array<{ id: string; result_json: string; created_at: string }>;
-  const comparisons = getVersionComparisons(serviceId);
-  return {
-    analyses: rows.map((row) => {
+  const analyses = rows.map((row) => {
     const result = JSON.parse(row.result_json);
     return {
       analysisId: row.id, createdAt: row.created_at,
       recommendation: result.recommendation,
       fingerprints: result.sources.map((source: { fingerprint: string }) => source.fingerprint)
     };
-    }),
-    comparisons
-  };
+  });
+  return compactVersionHistory(analyses, getVersionComparisons(serviceId));
 });
 
 cleanupExpired();

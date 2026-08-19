@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AnalysisResult } from "@agreement-lens/shared";
-import { resultSourceLabel } from "./evidence-source";
+import { resultSourceLabel, uniqueSourceDocuments } from "./evidence-source";
 
 function resultWithSource(source: Partial<AnalysisResult["sources"][number]>): AnalysisResult {
   return {
@@ -65,5 +65,12 @@ describe("resultSourceLabel", () => {
       quote: "无法关联到来源",
       verified: false
     })).toBe("来源快照");
+  });
+
+  it("deduplicates HTTP and HTTPS copies in the source view", () => {
+    const result = resultWithSource({});
+    const http = { ...result.sources[0]!, id: "http-copy", url: "http://example.com/privacy" };
+    expect(uniqueSourceDocuments([http, result.sources[0]!])).toHaveLength(1);
+    expect(uniqueSourceDocuments([http, result.sources[0]!])[0]?.url).toBe("https://example.com/privacy");
   });
 });

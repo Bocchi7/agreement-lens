@@ -195,6 +195,7 @@ button { color: inherit; }
 .version-empty strong { display: block; margin: 10px 0 5px; color: #27312d; }
 .version-empty p { font-size: 11px; line-height: 1.55; }
 .recheck-button { display: inline-flex; align-items: center; gap: 5px; border: 1px solid #cbd5cf; border-radius: 5px; background: white; color: #28634f; padding: 6px 8px; font-size: 10px; cursor: pointer; }
+.recheck-button:disabled { opacity: .6; cursor: default; }
 .version-impact { padding: 13px; margin-bottom: 13px; border: 1px solid #cfd9d3; border-radius: 6px; background: #e8f1ec; }
 .version-impact.changed { background: #fff2d8; border-color: #e4cc93; }
 .version-impact strong { font-size: 11px; }.version-impact p { margin: 5px 0; font-size: 11px; line-height: 1.45; }.version-impact small { color: #6c756f; font-size: 9px; }

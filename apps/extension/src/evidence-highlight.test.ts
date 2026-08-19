@@ -46,4 +46,23 @@ describe("evidence location", () => {
     expect(dom.window.document.querySelectorAll("mark[data-agreement-lens-highlight]").length).toBeGreaterThan(0);
     expect(dom.window.document.querySelector("#target")?.textContent).toContain("Agent 服务提供者");
   });
+
+  it("highlights the full span represented by an ellipsis in the quote", () => {
+    const dom = new JSDOM(`
+      <main>
+        <p id="target">我们可能会随时更新本协议的内容，该等更新构成本协议的一部分。我们将在本协议发生变更前通过公告通知您。若您继续使用，即表示您充分阅读、理解并同意接受经修订的《爱奇艺服务协议》的约束。</p>
+      </main>
+    `);
+    Object.defineProperty(dom.window.HTMLElement.prototype, "scrollIntoView", { value: () => undefined });
+    expect(highlightEvidence(
+      dom.window.document,
+      "我们可能会随时更新本协议的内容，该等更新构成本协议的一部分。……若您继续使用，即表示您充分阅读、理解并同意接受经修订的《爱奇艺服务协议》的约束。"
+    )).toBe(true);
+    const markText = [...dom.window.document.querySelectorAll("mark[data-agreement-lens-highlight]")]
+      .map((mark) => mark.textContent)
+      .join("");
+    expect(markText).toContain("我们可能会随时更新本协议的内容");
+    expect(markText).toContain("若您继续使用，即表示您充分阅读");
+    expect(markText).toContain("我们将在本协议发生变更前通过公告通知您");
+  });
 });
