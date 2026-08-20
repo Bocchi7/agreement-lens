@@ -52,26 +52,24 @@ function base64FromBytes(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-async function waitForTab(tabId: number): Promise<void> {
+async function waitForTab(tabId: number, timeoutMs = 8_000): Promise<boolean> {
   const current = await chrome.tabs.get(tabId);
-  if (current.status === "complete") return;
-  await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => {
+  if (current.status === "complete") return true;
+  return new Promise<boolean>((resolve) => {
+    const finish = (completed: boolean) => {
       chrome.tabs.onUpdated.removeListener(listener);
-      reject(new Error("来源页面加载超时"));
-    }, 30_000);
+      clearTimeout(timeout);
+      resolve(completed);
+    };
+    const timeout = setTimeout(() => finish(false), timeoutMs);
     const listener = (updatedTabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
       if (updatedTabId !== tabId || changeInfo.status !== "complete") return;
-      clearTimeout(timeout);
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve();
+      finish(true);
     };
     chrome.tabs.onUpdated.addListener(listener);
     void chrome.tabs.get(tabId).then((tab) => {
       if (tab.status !== "complete") return;
-      clearTimeout(timeout);
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve();
+      finish(true);
     }).catch(() => undefined);
   });
 }
@@ -359,7 +357,16 @@ async function fetchRenderedSource(
       tabId,
       status: tab.status
     });
-    if (tab.status !== "complete") await waitForTab(tab.id);
+    if (tab.status !== "complete") {
+      const completed = await waitForTab(tab.id);
+      if (!completed) {
+        console.info("[agreement-lens] source tab stayed loading; capturing current DOM", {
+          sourceId: source.id,
+          sourceUrl: source.url,
+          tabId
+        });
+      }
+    }
     console.info("[agreement-lens] browser source tab completed", {
       sourceId: source.id,
       sourceUrl: source.url,
