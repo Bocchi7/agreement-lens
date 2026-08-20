@@ -1,6 +1,23 @@
 export function isExtensionContextInvalidated(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /extension context invalidated/i.test(message);
+  const messages: string[] = [];
+  let current: unknown = error;
+  const visited = new Set<object>();
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth += 1) {
+    if (typeof current === "object") {
+      if (visited.has(current)) break;
+      visited.add(current);
+      const record = current as { message?: unknown; name?: unknown; stack?: unknown; cause?: unknown };
+      for (const value of [record.message, record.name, record.stack]) {
+        if (typeof value === "string") messages.push(value);
+      }
+      current = record.cause;
+      continue;
+    }
+    messages.push(String(current));
+    break;
+  }
+  if (!messages.length) messages.push(String(error));
+  return messages.some((message) => /extension context invalidated/i.test(message));
 }
 
 export function hasLiveExtensionContext(): boolean {

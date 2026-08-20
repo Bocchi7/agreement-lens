@@ -2,11 +2,16 @@ import { discoverAgreementSources, sanitizedRenderedHtml } from "./discovery";
 import { highlightEvidence } from "./evidence-highlight";
 import { hasLiveExtensionContext, isExtensionContextInvalidated } from "./extension-context";
 
-async function collectSources(isActive: () => boolean) {
+type CollectedSources = {
+  sources: ReturnType<typeof discoverAgreementSources>;
+  contextInvalidated: boolean;
+};
+
+async function collectSources(isActive: () => boolean): Promise<CollectedSources> {
   const sources = discoverAgreementSources(document, location.href);
   for (const delay of [0, 300, 900]) {
     if (delay) await new Promise((resolve) => window.setTimeout(resolve, delay));
-    if (!isActive() || !hasLiveExtensionContext()) throw new Error("Extension context invalidated.");
+    if (!isActive() || !hasLiveExtensionContext()) return { sources, contextInvalidated: true };
     try {
       const response = await chrome.runtime.sendMessage({ type: "RESOLVE_DYNAMIC_AGREEMENT_LINKS" }) as {
         links?: Array<{ title: string; url: string }>;
@@ -26,29 +31,38 @@ async function collectSources(isActive: () => boolean) {
       }
       if (response.links?.length || sources.length) break;
     } catch (error) {
-      if (isExtensionContextInvalidated(error) || !hasLiveExtensionContext()) throw error;
-      console.warn("[agreement-lens] dynamic discovery request failed", error);
+      if (isExtensionContextInvalidated(error) || !hasLiveExtensionContext()) {
+        return { sources, contextInvalidated: true };
+      }
+      // Dynamic resolution is optional. Static links remain usable when the
+      // message port disappears during a page or extension lifecycle change.
+      break;
     }
   }
-  return sources.slice(0, 12);
+  return { sources: sources.slice(0, 12), contextInvalidated: false };
 }
 
 async function publishDiscovery(
   sources: ReturnType<typeof discoverAgreementSources>,
   isActive: () => boolean
-) {
-  if (!isActive() || !hasLiveExtensionContext()) throw new Error("Extension context invalidated.");
-  await chrome.runtime.sendMessage({
-    type: "PAGE_DISCOVERED",
-    payload: {
-      tabId: -1,
-      pageUrl: location.href,
-      pageTitle: document.title || location.hostname,
-      origin: location.origin,
-      sources,
-      scannedAt: new Date().toISOString()
-    }
-  });
+): Promise<boolean> {
+  if (!isActive() || !hasLiveExtensionContext()) return false;
+  try {
+    await chrome.runtime.sendMessage({
+      type: "PAGE_DISCOVERED",
+      payload: {
+        tabId: -1,
+        pageUrl: location.href,
+        pageTitle: document.title || location.hostname,
+        origin: location.origin,
+        sources,
+        scannedAt: new Date().toISOString()
+      }
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const runtimeWindow = window as Window & {
@@ -79,33 +93,35 @@ runtimeWindow.__agreementLensContentController?.dispose();
       // The old content-script world cannot access chrome.runtime after reload.
     }
   };
-  const handleFailure = (error: unknown) => {
-    if (isExtensionContextInvalidated(error) || !hasLiveExtensionContext()) {
+  const sendDiscovery = async () => {
+    const collected = await collectSources(isActive);
+    if (collected.contextInvalidated || !isActive()) {
+      stop();
+      return 0;
+    }
+    if (!await publishDiscovery(collected.sources, isActive)) {
+      if (!hasLiveExtensionContext()) stop();
+      return 0;
+    }
+    return collected.sources.length;
+  };
+  const scanIfChanged = async () => {
+    const collected = await collectSources(isActive);
+    if (collected.contextInvalidated || !isActive()) {
       stop();
       return;
     }
-    console.warn("[agreement-lens] page discovery failed", error);
-  };
-  const sendDiscovery = async () => {
-    const sources = await collectSources(isActive);
-    if (!isActive()) return 0;
-    await publishDiscovery(sources, isActive);
-    return sources.length;
-  };
-  const scanIfChanged = async () => {
-    const sources = await collectSources(isActive);
-    if (!isActive()) return;
-    const signature = sources.map((source) => `${source.title}|${source.url}`).join("\n");
+    const signature = collected.sources.map((source) => `${source.title}|${source.url}`).join("\n");
     if (signature === lastSignature) return;
     lastSignature = signature;
-    await publishDiscovery(sources, isActive);
+    if (!await publishDiscovery(collected.sources, isActive) && !hasLiveExtensionContext()) stop();
   };
   function scheduleScan() {
     if (!isActive()) return;
     if (timer !== undefined) window.clearTimeout(timer);
     timer = window.setTimeout(() => {
       timer = undefined;
-      void scanIfChanged().catch(handleFailure);
+      void scanIfChanged().catch(stop);
     }, 800);
   }
   function handleDocumentClick(event: Event) {
@@ -121,8 +137,8 @@ runtimeWindow.__agreementLensContentController?.dispose();
     if (message.type === "SCAN_PAGE") {
       void sendDiscovery()
         .then((count) => sendResponse({ count }))
-        .catch((error) => {
-          handleFailure(error);
+        .catch(() => {
+          stop();
           try {
             sendResponse({ count: 0 });
           } catch {
@@ -141,7 +157,7 @@ runtimeWindow.__agreementLensContentController?.dispose();
   }
   const start = () => {
     if (!isActive()) return;
-    void scanIfChanged().catch(handleFailure);
+    void scanIfChanged().catch(stop);
     observer = new MutationObserver(scheduleScan);
     observer.observe(document.documentElement, { childList: true, subtree: true });
     window.addEventListener("popstate", scheduleScan);
