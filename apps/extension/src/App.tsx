@@ -234,10 +234,13 @@ export function App() {
   const [historyReturn, setHistoryReturn] = useState<HistoryReturnState | null>(null);
   const [historyMode, setHistoryMode] = useState(false);
   const [historyPageUrl, setHistoryPageUrl] = useState<string | null>(null);
+  const discoveryLockedRef = useRef(false);
+  const scanInProgressRef = useRef(false);
 
   useEffect(() => {
     void (async () => {
       const page = await currentSnapshot();
+      discoveryLockedRef.current = Boolean(page);
       setSnapshot(page);
       setSources(page?.sources ?? []);
       setContext((current) => ({ ...current, action: inferAction(page) }));
@@ -308,6 +311,7 @@ export function App() {
             : persisted.job;
           if (restoredJob?.state === "complete" && restoredJob.analysisId) {
             const analysis = await api.getAnalysis(restoredJob.analysisId);
+            discoveryLockedRef.current = true;
             setResult(analysis);
             setPreserveResultWhileRunning(false);
             setSources(page.sources);
@@ -346,6 +350,8 @@ export function App() {
     if (!chromeAvailable()) return;
     const listener = (message: { type?: string; payload?: PageSnapshot }) => {
       if (message.type !== "PAGE_STATE_UPDATED" || !message.payload) return;
+      if (discoveryLockedRef.current || scanInProgressRef.current) return;
+      discoveryLockedRef.current = true;
       setSnapshot(message.payload);
       setSources(message.payload.sources);
       setContext((current) => ({ ...current, action: inferAction(message.payload ?? null) }));
@@ -426,6 +432,7 @@ export function App() {
       setError("");
       await api.pair(pairCode);
       const page = await currentSnapshot();
+      discoveryLockedRef.current = Boolean(page);
       setSnapshot(page);
       setSources(page?.sources ?? []);
       setContext((current) => ({ ...current, action: inferAction(page) }));
@@ -438,6 +445,8 @@ export function App() {
   async function grantAndScan() {
     if (!chromeAvailable()) return;
     setError("");
+    discoveryLockedRef.current = false;
+    scanInProgressRef.current = true;
     setPhase("scanning");
     try {
       if (!permissionTarget) throw new Error("当前标签页不支持扫描，请切换到需要分析的网站后重试");
@@ -465,6 +474,7 @@ export function App() {
       }
       if (!page || page.tabId !== tab.id) page = topFrameResponse.snapshot ?? null;
       if (!page || page.tabId !== tab.id) throw new Error("扫描已执行，但没有收到当前页面的识别结果");
+      discoveryLockedRef.current = true;
       setSnapshot(page);
       setSources(page.sources);
       setContext((current) => ({ ...current, action: inferAction(page) }));
@@ -472,6 +482,8 @@ export function App() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法扫描当前站点");
       setPhase("error");
+    } finally {
+      scanInProgressRef.current = false;
     }
   }
 
