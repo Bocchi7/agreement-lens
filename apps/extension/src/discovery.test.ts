@@ -67,12 +67,14 @@ describe("agreement discovery", () => {
       <footer>
         <a aria-label="服务条款" onclick="openAgreement('https://service.qq.com/terms')">服务条款</a>
         <a aria-label="隐私政策" onclick="window.open('https://privacy.qq.com/policy')">隐私政策</a>
+        <a href="javascript:void(0)" data-target="https://privacy.qq.com/personal-information">个人信息保护政策</a>
       </footer>
     `);
     const sources = discoverAgreementSources(dom.window.document, "https://mail.qq.com/");
     expect(sources.map((source) => source.url)).toEqual([
       "https://service.qq.com/terms",
-      "https://privacy.qq.com/policy"
+      "https://privacy.qq.com/policy",
+      "https://privacy.qq.com/personal-information"
     ]);
   });
 
@@ -139,6 +141,32 @@ describe("agreement discovery", () => {
       "支付宝及客户端服务协议"
     ]);
     expect(sources.map((source) => source.url)).not.toContain("https://i.taobao.com/");
+  });
+
+  it("finds the privacy materials shown on the Ctrip login page", () => {
+    const dom = new JSDOM(`
+      <div class="login-notice">
+        新版<a href="https://contents.ctrip.com/huodong/privacypolicypc/index?type=1">《隐私政策》</a>已上线
+      </div>
+      <footer>
+        <a href="https://rulecenter.ctrip.com/statics/rule/72/latest.html">用户协议</a>
+        <a href="https://rulecenter.ctrip.com/statics/rule/74/latest.html">隐私政策</a>
+      </footer>
+    `, { url: "https://passport.ctrip.com/user/login" });
+    const sources = discoverAgreementSources(dom.window.document, dom.window.location.href);
+    expect(sources.map((source) => source.url)).toEqual([
+      "https://contents.ctrip.com/huodong/privacypolicypc/index?type=1",
+      "https://rulecenter.ctrip.com/statics/rule/72/latest.html",
+      "https://rulecenter.ctrip.com/statics/rule/74/latest.html"
+    ]);
+  });
+
+  it("uses agreement terms from link attributes when visible text is generic", () => {
+    const dom = new JSDOM(`
+      <a href="/privacy" aria-label="个人信息保护政策">了解详情</a>
+    `, { url: "https://example.com/login" });
+    const sources = discoverAgreementSources(dom.window.document, dom.window.location.href);
+    expect(sources[0]?.url).toBe("https://example.com/privacy");
   });
 
   it("does not discover historical agreement versions as current materials", () => {

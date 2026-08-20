@@ -1124,7 +1124,9 @@ function PrepareScreen(props: {
           <FileText size={17} />
           <span className="source-info">
             <strong>{source.title}</strong>
-            <small title={source.url ?? source.text ?? ""}>{source.kind === "text" ? (source.text ?? "已提供文本") : source.url}</small>
+            {source.kind === "text"
+              ? <small title={source.text ?? ""}>{source.text ?? "已提供文本"}</small>
+              : <a className="source-link" href={source.url} target="_blank" rel="noreferrer" title="打开材料页面" onClick={(event) => event.stopPropagation()}>{source.url}</a>}
           </span>
           {source.relation === "manual" && <span className="source-controls">
             {(source.kind === "url" || source.kind === "text") && <button type="button" className="icon-button compact-icon" title="修改手动材料" onClick={() => props.onEditManual(source)}><Pencil size={14} /></button>}

@@ -3,8 +3,9 @@ import type { DiscoveredSource } from "@agreement-lens/shared";
 const agreementLinkKeywords = [
   "协议", "条款", "隐私", "privacy", "cookie", "cookies", "terms", "conditions",
   "user agreement", "service agreement", "subscription", "auto-renew", "自动续费",
-  "社区规范", "community guidelines", "法律声明", "个人信息保护", "个人信息处理",
-  "数据保护", "数据须知", "收集使用信息", "账号注销"
+  "社区规范", "community guidelines", "法律声明", "隐私声明", "隐私权保护",
+  "保护政策", "保护声明", "个人信息", "个人信息保护", "个人信息处理",
+  "信息保护", "数据保护", "数据须知", "收集使用信息", "账号注销"
 ];
 
 function matchesAgreementLink(value: string): boolean {
@@ -38,7 +39,7 @@ export function isHistoricalVersionLink(label: string, url: URL): boolean {
 
 function classify(text: string, url: string): string {
   const value = `${text} ${url}`;
-  if (/隐私|privacy/i.test(value)) return "隐私政策";
+  if (/隐私|个人信息|信息保护|privacy/i.test(value)) return "隐私政策";
   if (/续费|付费|会员|subscription/i.test(value)) return "付费与续费规则";
   if (/社区|community/i.test(value)) return "社区规范";
   return "用户协议";
@@ -62,6 +63,17 @@ function linkLabel(link: Element): string {
   ).replace(/\s+/g, " ").trim();
 }
 
+function linkSearchText(link: Element): string {
+  return [
+    linkLabel(link),
+    link.getAttribute("aria-label"),
+    link.getAttribute("title"),
+    link.textContent,
+    link.getAttribute("data-name"),
+    link.getAttribute("data-title")
+  ].filter(Boolean).join(" ");
+}
+
 function linkRawTarget(link: Element): string {
   return [
     link.getAttribute("href"),
@@ -77,8 +89,8 @@ function linkRawTarget(link: Element): string {
 
 function linkUrl(link: Element, pageUrl: string): URL | null {
   const rawHref = link.getAttribute("href") || link.getAttribute("data-href") || link.getAttribute("data-url") || "";
+  const embeddedUrl = linkRawTarget(link).match(/https?:\/\/[^\s"'<>]+/i)?.[0];
   if (!rawHref) {
-    const embeddedUrl = linkRawTarget(link).match(/https?:\/\/[^\s"'<>]+/i)?.[0];
     try {
       return embeddedUrl ? new URL(embeddedUrl, pageUrl) : null;
     } catch {
@@ -86,9 +98,10 @@ function linkUrl(link: Element, pageUrl: string): URL | null {
     }
   }
   try {
-    return new URL(rawHref, pageUrl);
+    const resolved = new URL(rawHref, pageUrl);
+    if (["http:", "https:"].includes(resolved.protocol)) return resolved;
+    return embeddedUrl ? new URL(embeddedUrl, pageUrl) : null;
   } catch {
-    const embeddedUrl = linkRawTarget(link).match(/https?:\/\/[^\s"'<>]+/i)?.[0];
     try {
       return embeddedUrl ? new URL(embeddedUrl, pageUrl) : null;
     } catch {
@@ -110,7 +123,7 @@ export function discoverAgreementSources(document: Document, pageUrl: string): D
     const text = linkLabel(link);
     const rawTarget = linkRawTarget(link);
     const url = linkUrl(link, pageUrl);
-    const matchValue = text || rawTarget || url?.pathname || "";
+    const matchValue = linkSearchText(link) || text || rawTarget || url?.pathname || "";
     if (url && (!["http:", "https:"].includes(url.protocol)
       || isInteractiveAccountUrl(url)
       || isAccountDashboardLink(text, url)

@@ -83,6 +83,8 @@ button { color: inherit; }
 .source-row .source-info { display: flex; flex-direction: column; min-width: 0; }
 .source-row strong { font-size: 12px; overflow-wrap: anywhere; }
 .source-row small { margin-top: 3px; color: #78827d; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.source-row .source-link { margin-top: 3px; color: #2f6d58; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-decoration: underline; text-underline-offset: 2px; }
+.source-row .source-link:hover { color: #174d3f; }
 .source-controls { display: flex; gap: 2px; align-items: center; justify-content: flex-end; }
 .compact-icon { width: 25px; height: 25px; padding: 0; }
 .danger-icon { color: #a33e36; }

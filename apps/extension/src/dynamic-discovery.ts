@@ -106,8 +106,9 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
   const keywords = [
     "协议", "条款", "隐私", "privacy", "cookie", "cookies", "terms", "conditions",
     "user agreement", "service agreement", "subscription", "auto-renew", "自动续费",
-    "社区规范", "community guidelines", "法律声明", "个人信息保护", "个人信息处理",
-    "数据保护", "数据须知", "收集使用信息", "账号注销"
+    "社区规范", "community guidelines", "法律声明", "隐私声明", "隐私权保护",
+    "保护政策", "保护声明", "个人信息", "个人信息保护", "个人信息处理",
+    "信息保护", "数据保护", "数据须知", "收集使用信息", "账号注销"
   ];
   const normalize = (value: string) => value
     .replace(/\u00a0/g, " ")
