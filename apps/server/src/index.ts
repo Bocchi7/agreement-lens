@@ -12,7 +12,8 @@ import {
 import { answerFollowUp } from "@agreement-lens/agent-core";
 import {
   cleanupExpired, createAnalysisRecord, db, deleteAnalysis, getAgentSession, getAnalysis,
-  getAnalysisRequest, getJob, getVersionComparisons, openKnowledge, saveAgentSession, setSaved
+  getAnalysisRequest, getJob, getVersionComparisons, listRecentAnalyses, openKnowledge,
+  saveAgentSession, setSaved
 } from "./db.js";
 import { enqueueAnalysis, enqueueRecheck, newJob } from "./jobs.js";
 import { allowedExtensionId, serverPort } from "./config.js";
@@ -87,6 +88,12 @@ app.post("/v1/analyses", async (request, reply) => {
   });
   enqueueAnalysis(job.id, analysisId, serviceId, input);
   return reply.code(202).send({ analysisId, jobId: job.id });
+});
+
+app.get("/v1/analyses/history", async (request) => {
+  const rawLimit = Number((request.query as { limit?: string } | undefined)?.limit ?? 50);
+  const limit = Number.isFinite(rawLimit) ? rawLimit : 50;
+  return { analyses: listRecentAnalyses(limit) };
 });
 
 app.get("/v1/jobs/:id", async (request, reply) => {

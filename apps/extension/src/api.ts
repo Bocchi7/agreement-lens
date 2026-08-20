@@ -7,6 +7,19 @@ export interface VersionsResponse {
   comparisons: VersionComparison[];
 }
 
+export interface HistoryEntry {
+  analysisId: string;
+  serviceId: string;
+  serviceName: string;
+  pageUrl: string;
+  createdAt: string;
+  updatedAt: string;
+  recommendation: AnalysisResult["recommendation"];
+  saved: boolean;
+  sourceCount: number;
+  findingCount: number;
+}
+
 const baseUrl = "http://127.0.0.1:4317";
 
 export class ApiError extends Error {
@@ -57,6 +70,7 @@ export const api = {
     return result;
   },
   createAnalysis: (input: CreateAnalysisInput) => request<{ analysisId: string; jobId: string }>("/v1/analyses", { method: "POST", body: JSON.stringify(input) }),
+  history: (limit = 50) => request<{ analyses: HistoryEntry[] }>(`/v1/analyses/history?limit=${Math.max(1, Math.min(100, Math.floor(limit)))}`),
   getJob: (id: string) => request<JobStatus>(`/v1/jobs/${id}`),
   getAnalysis: (id: string) => request<AnalysisResult>(`/v1/analyses/${id}`),
   followUp: (id: string, message: string, history: Array<{ role: "user" | "assistant"; text: string }>) => request<FollowUpResponse>(

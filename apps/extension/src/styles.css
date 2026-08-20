@@ -15,11 +15,36 @@ button { color: inherit; }
 .brand div:nth-child(2) { display: flex; flex-direction: column; line-height: 1.05; }
 .brand strong { font-size: 15px; }
 .brand span { margin-top: 4px; color: #7b8580; font: 9px/1 system-ui; text-transform: uppercase; }
+.history-launcher { margin-left: auto; color: #315e4f; }
+.history-launcher + .status-dot { margin-left: 2px; }
 .status-dot { margin-left: auto; width: 7px; height: 7px; background: #3d9b70; border-radius: 50%; box-shadow: 0 0 0 4px #e5f3eb; }
 .status-dot.offline { background: #bd4932; box-shadow: 0 0 0 4px #f5dfda; }
 .centered, .pair-screen { min-height: calc(100vh - 138px); display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 34px 26px; text-align: center; }
 .centered h2, .pair-screen h1 { margin: 14px 0 7px; font-size: 23px; }
 .centered p, .muted { color: #67716c; line-height: 1.65; font-size: 13px; max-width: 330px; }
+.history-screen { min-height: calc(100vh - 62px); background: #f5f7f4; }
+.history-heading { padding: 24px 18px 20px; background: #fff; border-bottom: 1px solid #dfe5e0; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.history-heading .eyebrow { margin: 0 0 6px; }
+.history-heading h1 { margin: 0; font-size: 24px; }
+.history-heading p:last-child { margin: 8px 0 0; color: #67716c; font-size: 11px; line-height: 1.55; }
+.history-status { margin: 18px; padding: 18px 14px; border: 1px solid #d6dfd9; border-radius: 6px; background: #fff; display: flex; align-items: center; gap: 8px; color: #53625a; font-size: 11px; }
+.history-status.error { color: #983623; border-color: #e3b8ad; background: #fff5f2; flex-wrap: wrap; }
+.history-status.error span { flex: 1 1 160px; }
+.history-list { padding: 8px 16px 28px; }
+.history-row { width: 100%; min-height: 76px; display: grid; grid-template-columns: 30px minmax(0, 1fr) 20px; gap: 10px; align-items: center; padding: 12px 2px; border: 0; border-bottom: 1px solid #dce2de; background: transparent; text-align: left; cursor: pointer; }
+.history-row:hover { background: #eef2ef; }
+.history-row:disabled { cursor: wait; }
+.history-recommendation { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 5px; background: #e1e8e3; color: #557067; }
+.history-recommendation.positive { color: #24634e; background: #dcece5; }
+.history-recommendation.warning { color: #80631c; background: #f7ebc9; }
+.history-recommendation.danger { color: #983623; background: #f7ddd6; }
+.history-main { min-width: 0; display: flex; flex-direction: column; }
+.history-main strong { font-size: 12px; overflow-wrap: anywhere; }
+.history-main small, .history-main span { margin-top: 4px; color: #77817c; font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.history-row-end { color: #76817b; display: grid; place-items: center; }
+.history-empty { padding: 72px 25px; color: #637069; text-align: center; }
+.history-empty strong { display: block; margin-top: 10px; color: #27312d; font-size: 13px; }
+.history-empty p { margin: 6px auto 0; font-size: 11px; line-height: 1.5; }
 .pair-symbol { width: 56px; height: 56px; display: grid; place-items: center; color: #174d3f; background: #e3eee8; border: 1px solid #ccddd4; border-radius: 8px; }
 .pair-symbol.offline-symbol { color: #9c3725; background: #f8e2dc; border-color: #efc7bd; }
 .command-box { margin: 4px 0 18px; padding: 10px 12px; border: 1px solid #cad4ce; border-radius: 5px; background: white; color: #174d3f; font: 600 11px/1.4 ui-monospace, monospace; }
@@ -158,6 +183,7 @@ button { color: inherit; }
 .source-detail strong { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .source-detail p, .source-detail small { margin: 3px 0 0; color: #77817c; font-size: 9px; }
 .source-detail .source-detail-url { color: #4e7163; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.read-only-note { color: #7b6a35; font-size: 9px; line-height: 1.45; text-align: right; }
 .source-detail button { border: 0; background: transparent; cursor: pointer; }
 .related-box { margin-top: 15px; padding: 13px; border: 1px solid #cdd8d2; border-radius: 6px; background: #edf3ef; }
 .related-box strong { font-size: 11px; }.related-box p { margin: 5px 0 10px; color: #68736d; font-size: 9px; line-height: 1.45; }

@@ -12,12 +12,18 @@ import type {
 } from "@agreement-lens/shared";
 import { maxSourceDocuments } from "@agreement-lens/shared";
 import { api, ApiError } from "./api";
+import type { HistoryEntry } from "./api";
 import type { PageSnapshot } from "./types";
 import { evidenceSourceUrl, resultSourceLabel, uniqueSourceDocuments } from "./evidence-source";
 import { permissionPatternsForSite } from "./frame-discovery";
 
 type View = "overview" | "risks" | "sources" | "chat" | "versions";
-type Phase = "loading" | "pair" | "permission" | "scanning" | "prepare" | "preparing" | "running" | "result" | "offline" | "error";
+type Phase = "loading" | "pair" | "permission" | "scanning" | "prepare" | "preparing" | "running" | "result" | "history" | "offline" | "error";
+type HistoryReturnState = {
+  phase: Exclude<Phase, "history">;
+  result: AnalysisResult | null;
+  view: View;
+};
 
 const actionOptions: Array<{ value: UserContext["action"]; label: string }> = [
   { value: "register", label: "注册 / 重新同意" },
@@ -221,6 +227,13 @@ export function App() {
   const [asking, setAsking] = useState(false);
   const [supplementing, setSupplementing] = useState(false);
   const [preserveResultWhileRunning, setPreserveResultWhileRunning] = useState(false);
+  const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const [historyLoadingId, setHistoryLoadingId] = useState<string | null>(null);
+  const [historyReturn, setHistoryReturn] = useState<HistoryReturnState | null>(null);
+  const [historyMode, setHistoryMode] = useState(false);
+  const [historyPageUrl, setHistoryPageUrl] = useState<string | null>(null);
 
   useEffect(() => {
     void (async () => {
@@ -728,8 +741,63 @@ export function App() {
     try { setVersions(await api.versions(result.serviceId)); } catch { setVersions({ analyses: [], comparisons: [] }); }
   }
 
+  async function refreshHistory() {
+    setHistoryLoading(true);
+    setHistoryError("");
+    try {
+      setHistoryEntries((await api.history()).analyses);
+    } catch (cause) {
+      setHistoryError(cause instanceof Error ? cause.message : "无法读取历史分析");
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
+
+  async function openHistory() {
+    if (phase !== "history" && !historyMode) {
+      setHistoryReturn({ phase, result, view });
+    }
+    setHistoryMode(false);
+    setHistoryPageUrl(null);
+    setPhase("history");
+    await refreshHistory();
+  }
+
+  function returnFromHistory() {
+    if (!historyReturn) {
+      setPhase(snapshot ? (result ? "result" : "prepare") : "permission");
+      return;
+    }
+    setResult(historyReturn.result);
+    setView(historyReturn.view);
+    setHistoryMode(false);
+    setHistoryPageUrl(null);
+    setHistoryReturn(null);
+    setPhase(historyReturn.phase);
+  }
+
+  async function openHistoryEntry(entry: HistoryEntry) {
+    setHistoryLoadingId(entry.analysisId);
+    setHistoryError("");
+    try {
+      const analysis = await api.getAnalysis(entry.analysisId);
+      setResult(analysis);
+      setView("overview");
+      setMessages([]);
+      setSelectedFinding(null);
+      setError("");
+      setHistoryMode(true);
+      setHistoryPageUrl(entry.pageUrl);
+      setPhase("result");
+    } catch (cause) {
+      setHistoryError(cause instanceof Error ? cause.message : "无法读取这条历史分析");
+    } finally {
+      setHistoryLoadingId(null);
+    }
+  }
+
   async function recheck() {
-    if (!result || phase === "running") return;
+    if (!result || phase === "running" || historyMode) return;
     try {
       const created = await api.recheck(result.serviceId);
       const pendingJob = {
@@ -860,14 +928,16 @@ export function App() {
     setError("");
     try {
       await api.save(result.id);
-      const host = new URL(snapshot?.pageUrl ?? `https://${result.serviceId}`).hostname.replace(/^www\./, "");
-      if (chromeAvailable()) {
+      const pageUrl = historyMode ? historyPageUrl : snapshot?.pageUrl;
+      const host = new URL(pageUrl ?? `https://${result.serviceId}`).hostname.replace(/^www\./, "");
+      if (chromeAvailable() && !historyMode) {
         const stored = await chrome.storage.local.get("savedServices");
         await chrome.storage.local.set({
           savedServices: { ...(stored.savedServices ?? {}), [host]: result.serviceId }
         });
       }
       setResult({ ...result, saved: true });
+      if (historyMode) void refreshHistory();
     } catch (cause) {
       setError(`保存失败：${cause instanceof Error ? cause.message : "未知错误"}`);
     } finally {
@@ -878,6 +948,15 @@ export function App() {
   async function removeAnalysis() {
     if (!result) return;
     await api.delete(result.id);
+    if (historyMode) {
+      setResult(null);
+      setMessages([]);
+      setHistoryMode(false);
+      setHistoryPageUrl(null);
+      await refreshHistory();
+      setPhase("history");
+      return;
+    }
     if (chromeAvailable()) {
       const stored = await chrome.storage.local.get("savedServices");
       const savedServices = { ...(stored.savedServices ?? {}) } as Record<string, string>;
@@ -894,18 +973,20 @@ export function App() {
   }
 
   const topFindings = useMemo(() => result?.topFindingIds.map((id) => result.findings.find((item) => item.id === id)).filter(Boolean) as Finding[] ?? [], [result]);
+  const historyLauncher = phase === "pair" || phase === "loading" || phase === "offline" ? undefined : openHistory;
 
   if (phase === "loading") return <Shell><Centered><LoaderCircle className="spin" /><p>正在连接当前页面</p></Centered></Shell>;
   if (phase === "pair") return <Shell><PairScreen code={pairCode} setCode={setPairCode} onPair={pair} error={error} /></Shell>;
-  if (phase === "permission") return <Shell><PermissionScreen onGrant={grantAndScan} /></Shell>;
-  if (phase === "scanning") return <Shell><Centered><LoaderCircle className="spin" /><p className="eyebrow">正在读取当前站点</p><h2>扫描协议入口</h2></Centered></Shell>;
-  if (phase === "preparing") return <Shell><Centered><LoaderCircle className="spin" /><p className="eyebrow">正在准备分析</p><h2>读取协议原文</h2><p>正在获取所选页面并整理分析材料。</p></Centered></Shell>;
-  if (phase === "running" && job && !(preserveResultWhileRunning && result)) return <Shell><RunningScreen job={job} sources={sources} /></Shell>;
+  if (phase === "permission") return <Shell onOpenHistory={historyLauncher}><PermissionScreen onGrant={grantAndScan} /></Shell>;
+  if (phase === "scanning") return <Shell onOpenHistory={historyLauncher}><Centered><LoaderCircle className="spin" /><p className="eyebrow">正在读取当前站点</p><h2>扫描协议入口</h2></Centered></Shell>;
+  if (phase === "preparing") return <Shell onOpenHistory={historyLauncher}><Centered><LoaderCircle className="spin" /><p className="eyebrow">正在准备分析</p><h2>读取协议原文</h2><p>正在获取所选页面并整理分析材料。</p></Centered></Shell>;
+  if (phase === "running" && job && !(preserveResultWhileRunning && result)) return <Shell onOpenHistory={historyLauncher}><RunningScreen job={job} sources={sources} /></Shell>;
   if (phase === "offline") return <Shell offline><OfflineScreen detail={error} /></Shell>;
-  if (phase === "error") return <Shell><Centered><AlertTriangle size={30} /><h2>操作失败</h2><p>{error}</p><button className="primary" onClick={() => { setError(""); setPhase(snapshot ? "prepare" : "permission"); }}><RefreshCw size={16} />返回并重试</button></Centered></Shell>;
+  if (phase === "error") return <Shell onOpenHistory={historyLauncher}><Centered><AlertTriangle size={30} /><h2>操作失败</h2><p>{error}</p><button className="primary" onClick={() => { setError(""); setPhase(snapshot ? "prepare" : "permission"); }}><RefreshCw size={16} />返回并重试</button></Centered></Shell>;
+  if (phase === "history") return <Shell onOpenHistory={historyLauncher}><HistoryScreen entries={historyEntries} loading={historyLoading} error={historyError} loadingId={historyLoadingId} onRetry={() => void refreshHistory()} onOpen={openHistoryEntry} onBack={returnFromHistory} hasReturn={Boolean(historyReturn)} /></Shell>;
   if ((phase === "result" || (phase === "running" && preserveResultWhileRunning)) && result) {
-    return <Shell>
-      <ResultHeader result={result} saving={saving} onSave={() => void saveAnalysis()} onDelete={() => void removeAnalysis()} />
+    return <Shell onOpenHistory={historyLauncher}>
+      <ResultHeader result={result} saving={saving} historyMode={historyMode} onHistory={() => void openHistory()} onSave={() => void saveAnalysis()} onDelete={() => void removeAnalysis()} />
       {(supplementing || (phase === "running" && job)) && <section className="supplement-progress"><LoaderCircle className="spin" size={16} /><div><strong>{supplementing ? "正在读取补充材料" : job?.message ?? "正在深入分析"}</strong><p>{supplementing ? "原分析结果会保留，读取完成后再启动分析。" : `当前进度 ${job?.progress ?? 0}%`}</p></div></section>}
       {error && <p className="inline-error result-error">{error}</p>}
       <nav className="tabs">
@@ -921,14 +1002,14 @@ export function App() {
       <main className="result-body">
         {view === "overview" && <Overview result={result} topFindings={topFindings} openEvidence={openEvidence} setView={setView} />}
         {view === "risks" && <RiskList findings={result.findings} openEvidence={openEvidence} />}
-        {view === "sources" && <SourcesView result={result} supplementing={supplementing || (phase === "running" && preserveResultWhileRunning)} onAddRelated={addRelatedSources} />}
+        {view === "sources" && <SourcesView result={result} supplementing={supplementing || (phase === "running" && preserveResultWhileRunning)} readOnly={historyMode} onAddRelated={addRelatedSources} />}
         {view === "chat" && <ChatView messages={messages} suggestions={result.followUpSuggestions ?? []} input={chatInput} setInput={setChatInput} ask={ask} asking={asking} />}
-        {view === "versions" && <VersionsView versions={versions} onRecheck={recheck} busy={phase === "running"} />}
+        {view === "versions" && <VersionsView versions={versions} onRecheck={recheck} busy={phase === "running" || historyMode} />}
       </main>
       {selectedFinding && <EvidenceDrawer result={result} finding={selectedFinding} onClose={() => setSelectedFinding(null)} onOpenSource={() => void openSourceEvidence(selectedFinding)} />}
     </Shell>;
   }
-  return <Shell>
+  return <Shell onOpenHistory={historyLauncher}>
     <PrepareScreen
       snapshot={snapshot} sources={sources} setSources={setSources}
       context={context} setContext={setContext} start={startAnalysis}
@@ -946,8 +1027,8 @@ export function App() {
   </Shell>;
 }
 
-function Shell({ children, offline = false }: { children: React.ReactNode; offline?: boolean }) {
-  return <div className="app"><header className="brand"><div className="brand-mark"><Search size={18} /></div><div><strong>协议明镜</strong><span>Agreement Lens</span></div><i className={`status-dot ${offline ? "offline" : ""}`} title={offline ? "本地分析服务未连接" : "本地分析服务已连接"} /></header>{children}</div>;
+function Shell({ children, offline = false, onOpenHistory }: { children: React.ReactNode; offline?: boolean; onOpenHistory?: () => void }) {
+  return <div className="app"><header className="brand"><div className="brand-mark"><Search size={18} /></div><div><strong>协议明镜</strong><span>Agreement Lens</span></div>{onOpenHistory && <button className="icon-button history-launcher" title="最近分析" onClick={() => void onOpenHistory()}><History size={17} /></button>}<i className={`status-dot ${offline ? "offline" : ""}`} title={offline ? "本地分析服务未连接" : "本地分析服务已连接"} /></header>{children}</div>;
 }
 
 function Centered({ children }: { children: React.ReactNode }) { return <main className="centered">{children}</main>; }
@@ -965,6 +1046,58 @@ function PairScreen({ code, setCode, onPair, error }: { code: string; setCode: (
 
 function PermissionScreen({ onGrant }: { onGrant: () => void }) {
   return <Centered><div className="pair-symbol"><Shield size={28} /></div><h2>允许读取当前站点</h2><p>授权后自动发现用户协议和隐私政策链接。权限仅针对当前站点。</p><button className="primary" onClick={onGrant}>允许并扫描 <ChevronRight size={17} /></button></Centered>;
+}
+
+function HistoryScreen({
+  entries, loading, error, loadingId, onRetry, onOpen, onBack, hasReturn
+}: {
+  entries: HistoryEntry[];
+  loading: boolean;
+  error: string;
+  loadingId: string | null;
+  onRetry: () => void;
+  onOpen: (entry: HistoryEntry) => void;
+  onBack: () => void;
+  hasReturn: boolean;
+}) {
+  return <main className="history-screen">
+    <section className="history-heading">
+      <div>
+        <p className="eyebrow">分析记录</p>
+        <h1>最近分析</h1>
+        <p>这里保留不同网页的已完成分析，收起侧边栏后也可以从这里继续查看。</p>
+      </div>
+      {hasReturn && <button className="icon-button" title="返回当前页面" onClick={onBack}><ArrowLeft size={18} /></button>}
+    </section>
+    {loading && <div className="history-status"><LoaderCircle size={19} className="spin" /><span>正在读取历史分析</span></div>}
+    {error && <div className="history-status error"><AlertTriangle size={18} /><span>{error}</span><button className="text-button" onClick={onRetry}><RefreshCw size={14} />重试</button></div>}
+    {!loading && !error && entries.length === 0 && <div className="history-empty"><History size={28} /><strong>还没有完成的分析</strong><p>完成一次协议分析后，它会出现在这里。</p></div>}
+    {!loading && entries.length > 0 && <section className="history-list">{entries.map((entry) => {
+      const meta = recommendationMeta[entry.recommendation];
+      const domain = historyDomain(entry.pageUrl);
+      const isLoading = loadingId === entry.analysisId;
+      return <button className="history-row" key={entry.analysisId} onClick={() => void onOpen(entry)} disabled={Boolean(loadingId)}>
+        <span className={`history-recommendation ${meta.tone}`}><Shield size={15} /></span>
+        <span className="history-main"><strong>{entry.serviceName || domain}</strong><small title={entry.pageUrl}>{domain || entry.pageUrl}</small><span>{formatHistoryDate(entry.updatedAt || entry.createdAt)} · {entry.sourceCount} 份材料 · {entry.findingCount} 项告警</span></span>
+        <span className="history-row-end">{isLoading ? <LoaderCircle size={16} className="spin" /> : <ChevronRight size={17} />}</span>
+      </button>;
+    })}</section>}
+  </main>;
+}
+
+function historyDomain(pageUrl: string): string {
+  try {
+    return new URL(pageUrl).hostname.replace(/^www\./, "");
+  } catch {
+    return pageUrl;
+  }
+}
+
+function formatHistoryDate(value: string): string {
+  const timestamp = Date.parse(value);
+  return Number.isNaN(timestamp) ? "时间未知" : new Date(timestamp).toLocaleString("zh-CN", {
+    month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit"
+  });
 }
 
 function OfflineScreen({ detail }: { detail?: string }) {
@@ -1038,9 +1171,9 @@ function RunningScreen({ job, sources }: { job: JobStatus; sources: DiscoveredSo
   })}</div><p className="muted small">关闭侧边栏不会中断任务</p></main>;
 }
 
-function ResultHeader({ result, saving, onSave, onDelete }: { result: AnalysisResult; saving: boolean; onSave: () => void; onDelete: () => void }) {
+function ResultHeader({ result, saving, historyMode, onHistory, onSave, onDelete }: { result: AnalysisResult; saving: boolean; historyMode: boolean; onHistory: () => void; onSave: () => void; onDelete: () => void }) {
   const meta = recommendationMeta[result.recommendation];
-  return <header className="result-header"><div><p>{result.serviceName}</p><h1 className={meta.tone}>{meta.label}</h1></div><div className="header-actions"><button className="icon-button light" disabled={saving || result.saved} title={result.saved ? "已保存" : saving ? "正在保存" : "保存本次分析"} onClick={onSave}>{saving ? <LoaderCircle size={17} className="spin" /> : result.saved ? <Check size={17} /> : <Save size={17} />}</button><button className="icon-button light delete-action" title="删除本次分析" onClick={onDelete}><X size={17} /></button></div></header>;
+  return <header className="result-header"><div><p>{historyMode ? "历史分析 · " : ""}{result.serviceName}</p><h1 className={meta.tone}>{meta.label}</h1></div><div className="header-actions">{historyMode && <button className="icon-button light" title="返回最近分析" onClick={onHistory}><History size={17} /></button>}<button className="icon-button light" disabled={saving || result.saved} title={result.saved ? "已保存" : saving ? "正在保存" : "保存本次分析"} onClick={onSave}>{saving ? <LoaderCircle size={17} className="spin" /> : result.saved ? <Check size={17} /> : <Save size={17} />}</button><button className="icon-button light delete-action" title="删除本次分析" onClick={onDelete}><X size={17} /></button></div></header>;
 }
 
 function Overview({ result, topFindings, openEvidence, setView }: { result: AnalysisResult; topFindings: Finding[]; openEvidence: (finding: Finding) => void; setView: (view: View) => void }) {
@@ -1062,7 +1195,7 @@ function RiskList({ findings, openEvidence }: { findings: Finding[]; openEvidenc
   return <section className="result-section no-top"><div className="view-heading"><h2>全部风险</h2><span>{findings.length} 项</span></div><div className="finding-list">{findings.map((finding, index) => <FindingRow key={finding.id} finding={finding} index={index + 1} onClick={() => openEvidence(finding)} />)}</div></section>;
 }
 
-function SourcesView({ result, supplementing, onAddRelated }: { result: AnalysisResult; supplementing: boolean; onAddRelated: (sources: Array<{ title: string; url: string }>) => void }) {
+function SourcesView({ result, supplementing, readOnly, onAddRelated }: { result: AnalysisResult; supplementing: boolean; readOnly: boolean; onAddRelated: (sources: Array<{ title: string; url: string }>) => void }) {
   const sources = uniqueSourceDocuments(result.sources);
   const included = new Set(sources.map((source) => source.url).filter(Boolean));
   const remaining = Math.max(0, maxSourceDocuments - sources.length);
@@ -1070,7 +1203,7 @@ function SourcesView({ result, supplementing, onAddRelated }: { result: Analysis
     .filter((item) => !included.has(item.url))
     .filter((item, index, all) => all.findIndex((other) => other.url === item.url) === index)
     .slice(0, Math.min(8, remaining));
-  return <section className="result-section no-top"><div className="view-heading"><h2>分析来源</h2><span>{sources.length} 份</span></div>{sources.map((source) => <div className="source-detail" key={source.id}><div className={`source-status ${source.status}`}><FileText size={17} /></div><div><strong>{source.title}</strong>{source.url && <small className="source-detail-url" title={source.url}>{source.url}</small>}<p>{source.normalizedText.length > 0 ? `${source.sections.length} 个章节 · ${source.normalizedText.length.toLocaleString()} 字` : source.status === "failed" ? "读取失败" : "未取得有效正文"}</p><small>{source.status === "ready" ? "已完整读取并生成内容指纹" : source.error}</small></div>{source.url && <button title="打开来源" onClick={() => chromeAvailable() && chrome.tabs.create({ url: source.url })}><ExternalLink size={15} /></button>}</div>)}{related.length > 0 && <div className="related-box"><div><strong>发现 {related.length} 份更深层关联材料</strong><p>{related.map((item) => item.title).join("、")}</p></div><button disabled={supplementing} onClick={() => onAddRelated(related)}>{supplementing ? <><LoaderCircle className="spin" size={13} />正在处理</> : "确认并继续读取"}</button></div>}</section>;
+  return <section className="result-section no-top"><div className="view-heading"><h2>分析来源</h2><span>{sources.length} 份</span></div>{sources.map((source) => <div className="source-detail" key={source.id}><div className={`source-status ${source.status}`}><FileText size={17} /></div><div><strong>{source.title}</strong>{source.url && <small className="source-detail-url" title={source.url}>{source.url}</small>}<p>{source.normalizedText.length > 0 ? `${source.sections.length} 个章节 · ${source.normalizedText.length.toLocaleString()} 字` : source.status === "failed" ? "读取失败" : "未取得有效正文"}</p><small>{source.status === "ready" ? "已完整读取并生成内容指纹" : source.error}</small></div>{source.url && <button title="打开来源" onClick={() => chromeAvailable() && chrome.tabs.create({ url: source.url })}><ExternalLink size={15} /></button>}</div>)}{related.length > 0 && <div className="related-box"><div><strong>发现 {related.length} 份更深层关联材料</strong><p>{related.map((item) => item.title).join("、")}</p></div>{readOnly ? <small className="read-only-note">历史分析仅供查看，返回当前页面后可补充材料。</small> : <button disabled={supplementing} onClick={() => onAddRelated(related)}>{supplementing ? <><LoaderCircle className="spin" size={13} />正在处理</> : "确认并继续读取"}</button>}</div>}</section>;
 }
 
 function ChatView({ messages, suggestions, input, setInput, ask, asking }: { messages: Array<{ role: "user" | "assistant"; text: string }>; suggestions: string[]; input: string; setInput: (v: string) => void; ask: () => void; asking: boolean }) {

@@ -151,6 +151,45 @@ export function getAnalysis(id: string): AnalysisResult | undefined {
   return row?.result_json ? JSON.parse(row.result_json) as AnalysisResult : undefined;
 }
 
+export function listRecentAnalyses(limit = 50) {
+  const safeLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+  const rows = db.prepare(`
+    SELECT id, service_id, service_name, page_url, result_json, saved, created_at, updated_at
+    FROM analyses
+    WHERE result_json IS NOT NULL
+    ORDER BY updated_at DESC, created_at DESC
+    LIMIT ?
+  `).all(safeLimit) as Array<{
+    id: string;
+    service_id: string;
+    service_name: string;
+    page_url: string;
+    result_json: string;
+    saved: number;
+    created_at: string;
+    updated_at: string;
+  }>;
+  return rows.flatMap((row) => {
+    try {
+      const result = JSON.parse(row.result_json) as AnalysisResult;
+      return [{
+        analysisId: row.id,
+        serviceId: row.service_id,
+        serviceName: row.service_name,
+        pageUrl: row.page_url,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        recommendation: result.recommendation,
+        saved: Boolean(row.saved),
+        sourceCount: result.sources.length,
+        findingCount: result.findings.length
+      }];
+    } catch {
+      return [];
+    }
+  });
+}
+
 export function getAnalysisRequest(id: string) {
   const row = db.prepare("SELECT * FROM analyses WHERE id=?").get(id) as Record<string, unknown> | undefined;
   if (!row) return;
