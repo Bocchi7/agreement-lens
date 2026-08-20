@@ -3,6 +3,91 @@ export interface DynamicAgreementLink {
   url: string;
 }
 
+export async function resolveAgreementLinksFromLoadedScripts(labels: string[]): Promise<DynamicAgreementLink[]> {
+  // This fallback is also serialized into the page's MAIN world, so keep all
+  // helpers local. It is only used for href-less controls whose destination is
+  // closed over inside a framework bundle.
+  const normalize = (value: string) => value.replace(/\s+/g, " ").trim().toLocaleLowerCase();
+  const normalizedLabels = [...new Set(labels.map((label) => label.replace(/\s+/g, " ").trim()).filter(Boolean))].slice(0, 12);
+  if (!normalizedLabels.length) return [];
+  const runtimeWindow = typeof window === "undefined" ? undefined : window as Window & {
+    __agreementLensScriptLinkCache?: Record<string, DynamicAgreementLink[]>;
+  };
+  const cacheKey = normalizedLabels.map(normalize).sort().join("|");
+  const cached = runtimeWindow?.__agreementLensScriptLinkCache?.[cacheKey];
+  if (cached) return cached;
+  const scriptUrls = [...new Set([
+    ...performance.getEntriesByType("resource").map((entry) => entry.name),
+    ...[...document.scripts].map((script) => script.src)
+  ].filter((url) => /^https?:\/\/.+\.js(?:[?#]|$)/i.test(url)))].slice(0, 24);
+  const candidates: Array<{ url: string; position: number; source: string }> = [];
+  const addCandidate = (rawUrl: string, position: number, source: string) => {
+    try {
+      const url = new URL(rawUrl.replace(/\\\//g, "/"), location.href);
+      if (!["http:", "https:"].includes(url.protocol)) return;
+      candidates.push({ url: url.href, position, source });
+    } catch {
+      // Ignore malformed strings found inside minified bundles.
+    }
+  };
+  await Promise.all(scriptUrls.map(async (scriptUrl) => {
+    try {
+      const response = await fetch(scriptUrl, { signal: AbortSignal.timeout(6_000) });
+      if (!response.ok) return;
+      const source = await response.text();
+      if (source.length > 3_000_000 || !normalizedLabels.some((label) => normalize(source).includes(normalize(label)))) return;
+      const directPattern = /(?:https?:)?\\?\/\\?\/[a-z0-9.-]+(?::\d+)?(?:\\?\/[^"'`\s),;}]*)?/gi;
+      for (const match of source.matchAll(directPattern)) {
+        addCandidate(match[0], match.index ?? 0, source);
+      }
+      const concatPattern = /["'`]((?:https?:)?\/\/[^"'`\s]+)["'`]\s*\.\s*concat\(\s*["'`]([^"'`]+)["'`]\s*\)/gi;
+      for (const match of source.matchAll(concatPattern)) {
+        addCandidate(`${match[1]}${match[2]}`, match.index ?? 0, source);
+      }
+      const emptyConcatPattern = /["'`]\s*["'`]\s*\.\s*concat\(\s*["'`]((?:https?:)?\/\/[^"'`\s]+)["'`]\s*,\s*["'`]([^"'`]+)["'`]\s*\)/gi;
+      for (const match of source.matchAll(emptyConcatPattern)) {
+        addCandidate(`${match[1]}${match[2]}`, match.index ?? 0, source);
+      }
+    } catch {
+      // A blocked or slow bundle should not prevent other discovery paths.
+    }
+  }));
+  const results: DynamicAgreementLink[] = [];
+  const seen = new Set<string>();
+  for (const title of normalizedLabels) {
+    const label = normalize(title);
+    const privacy = /隐私|privacy|cookie/.test(label);
+    let best: { url: string; score: number } | undefined;
+    for (const candidate of candidates) {
+      const candidateValue = normalize(candidate.url);
+      if (!/协议|条款|隐私|privacy|cookie|terms?|agreement|conditions?|policy/.test(candidateValue)) continue;
+      let nearest = Number.POSITIVE_INFINITY;
+      let from = 0;
+      while (from < candidate.source.length) {
+        const index = normalize(candidate.source.slice(from)).indexOf(label);
+        if (index < 0) break;
+        const absolute = from + index;
+        nearest = Math.min(nearest, Math.abs(candidate.position - absolute));
+        from = absolute + Math.max(title.length, 1);
+      }
+      if (!Number.isFinite(nearest) || nearest > 1_000) continue;
+      const familyMatch = privacy
+        ? /隐私|privacy|cookie|policy/.test(candidateValue)
+        : !/隐私|privacy|cookie/.test(candidateValue) && /协议|条款|terms?|agreement|conditions?/.test(candidateValue);
+      const score = (familyMatch ? 10_000 : 0) - nearest;
+      if (!best || score > best.score) best = { url: candidate.url, score };
+    }
+    if (!best || seen.has(best.url)) continue;
+    seen.add(best.url);
+    results.push({ title, url: best.url });
+  }
+  if (runtimeWindow) {
+    runtimeWindow.__agreementLensScriptLinkCache ??= {};
+    runtimeWindow.__agreementLensScriptLinkCache[cacheKey] = results;
+  }
+  return results;
+}
+
 export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
   // `chrome.scripting.executeScript({ func })` serializes this function
   // without module-level closures, so every runtime helper must be local.
@@ -47,7 +132,20 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
       const record = current as Element & Record<string, unknown>;
       for (const key of Object.getOwnPropertyNames(record)) {
         if (/^__vue__$|^__reactProps\$|^__reactFiber\$|^__reactInternalInstance\$|^__reactEventHandlers\$|^__svelte/i.test(key)) {
-          roots.push(record[key]);
+          let value = record[key];
+          roots.push(value);
+          // React stores href-less link data on a parent fiber's props. Walk
+          // the return chain explicitly before the generic object traversal;
+          // otherwise the large rendered subtree can exhaust the inspection
+          // budget before reaching the footer component's data.
+          const seenFibers = new Set<object>();
+          for (let fiberDepth = 0; value && typeof value === "object" && fiberDepth < 40; fiberDepth += 1) {
+            if (seenFibers.has(value)) break;
+            seenFibers.add(value);
+            const fiber = value as Record<string, unknown>;
+            roots.unshift(fiber.memoizedProps, fiber.pendingProps);
+            value = fiber.return;
+          }
         }
       }
     }
@@ -78,7 +176,7 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
       if (item.depth >= 10) continue;
       for (const [key, value] of entries) {
         if (!value || typeof value !== "object"
-          || /^(?:\$parent|\$root|\$children|\$el|_vnode|_watcher|_scope|parent|return|child|sibling|stateNode)$/i.test(key)) continue;
+          || /^(?:\$parent|\$root|\$children|\$el|_vnode|_watcher|_scope|parent|child|sibling|stateNode)$/i.test(key)) continue;
         queue.push({ value, depth: item.depth + 1 });
       }
     }
@@ -109,7 +207,6 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
     if (directTarget || !element.matches("a,area,[role='link']")) return [];
     const captured: string[] = [];
     const originalOpen = window.open;
-    const preventNavigation = (event: Event) => event.preventDefault();
     const capture = (value: unknown) => {
       if (typeof value !== "string" && !(value instanceof URL)) return;
       try {
@@ -124,18 +221,20 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
         capture(url);
         return null;
       }) as typeof window.open;
-      document.addEventListener("click", preventNavigation, true);
       const EventConstructor = element.ownerDocument.defaultView?.MouseEvent ?? MouseEvent;
       element.dispatchEvent(new EventConstructor("click", {
         bubbles: true,
         cancelable: true,
         view: element.ownerDocument.defaultView
       }));
+      runtimeWindow?.__agreementLensDynamicClickRecords?.push({
+        title: agreementLabel(element.textContent || "") ?? "",
+        captured: [...captured]
+      });
     } catch {
       // Some controls require trusted pointer events; framework metadata is
       // still inspected as a fallback.
     } finally {
-      document.removeEventListener("click", preventNavigation, true);
       window.open = originalOpen;
     }
     return captured;
@@ -148,6 +247,10 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
     return url.href;
   };
 
+  const runtimeWindow = typeof window === "undefined" ? undefined : window as Window & {
+    __agreementLensDynamicClickRecords?: Array<{ title: string; captured: string[] }>;
+  };
+  if (runtimeWindow) runtimeWindow.__agreementLensDynamicClickRecords = [];
   const results: DynamicAgreementLink[] = [];
   const seen = new Set<string>();
   for (const element of elementsIn(document)) {

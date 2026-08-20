@@ -309,24 +309,28 @@ export async function loadSource(source: DiscoveredSource, renderedHtml?: string
       if (!location) throw new Error("重定向缺少目标");
       const redirected = new URL(location, url);
       await validateRemoteUrl(redirected.href);
-      return loadSource({ ...source, url: redirected.href }, renderedHtml, redirects + 1);
+      const redirectedDocument = await loadSource({ ...source, url: redirected.href }, renderedHtml, redirects + 1);
+      // Keep the URL the user selected as the source identity. The final
+      // redirect target is still used for fetching, but replacing the URL in
+      // the result makes manually supplied materials appear to change.
+      return source.url ? { ...redirectedDocument, url: source.url } : redirectedDocument;
     }
     if (!response.ok) throw new Error(`来源返回 HTTP ${response.status}`);
     const contentType = response.headers.get("content-type") ?? "";
     if (contentType.includes("pdf") || source.kind === "pdf" || url.pathname.toLowerCase().endsWith(".pdf")) {
       const bytes = new Uint8Array(await response.arrayBuffer());
-      return persistSnapshot(await parsePdf(source.id, source.title, bytes, url.href), bytes, {
+      return persistSnapshot(await parsePdf(source.id, source.title, bytes, source.url), bytes, {
         status: response.status,
         headers: Object.fromEntries(response.headers.entries())
       });
     }
     const bytes = new Uint8Array(await response.arrayBuffer());
     const html = decodeHtmlBytes(bytes, contentType);
-    const parsed = parseHtml(source.id, source.title, html, url.href);
+    const parsed = parseHtml(source.id, source.title, html, source.url);
     if (parsed.normalizedText.length < 1000) {
       const dynamicHtml = await fetchJdPrivacyApiHtml(url);
       if (dynamicHtml) {
-        return persistSnapshot(parseHtml(source.id, source.title, dynamicHtml, url.href), dynamicHtml, {
+        return persistSnapshot(parseHtml(source.id, source.title, dynamicHtml, source.url), dynamicHtml, {
           status: response.status,
           headers: {
             ...Object.fromEntries(response.headers.entries()),

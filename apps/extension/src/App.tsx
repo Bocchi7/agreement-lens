@@ -4,8 +4,8 @@ import remarkGfm from "remark-gfm";
 import {
   AlertTriangle, ArrowLeft, BookOpen, Check, CheckCircle2, ChevronRight,
   Circle, CircleDollarSign, Database, ExternalLink, FileText, History, LoaderCircle,
-  LockKeyhole, MessageCircle, Plus, RefreshCw, Save, Search, Send, Shield,
-  Sparkles, Upload, UserRoundX, X
+  LockKeyhole, MessageCircle, Pencil, Plus, RefreshCw, Save, Search, Send, Shield,
+  Sparkles, Trash2, Upload, UserRoundX, X
 } from "lucide-react";
 import type {
   AnalysisResult, DiscoveredSource, Finding, JobStatus, UserContext, VersionComparison
@@ -71,6 +71,15 @@ function inferAction(page: PageSnapshot | null): UserContext["action"] {
 
 function chromeAvailable() {
   return typeof chrome !== "undefined" && Boolean(chrome.runtime?.id);
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 type PersistedAnalysisState = {
@@ -203,6 +212,7 @@ export function App() {
   const [manualText, setManualText] = useState("");
   const [manualUrl, setManualUrl] = useState("");
   const [manualOpen, setManualOpen] = useState(false);
+  const [editingSourceId, setEditingSourceId] = useState<string | null>(null);
   const [chatInput, setChatInput] = useState("");
   const [messages, setMessages] = useState<Array<{ role: "user" | "assistant"; text: string }>>([]);
   const [versions, setVersions] = useState<{ analyses: Array<{ analysisId: string; createdAt: string; recommendation: string; fingerprints: string[] }>; comparisons: VersionComparison[] }>({ analyses: [], comparisons: [] });
@@ -424,9 +434,12 @@ export function App() {
       const frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id }).catch(() => [{ frameId: 0 }]);
       const scanFrame = async (frameId: number) => {
         await chrome.scripting.executeScript({ target: { tabId: tab.id, frameIds: [frameId] }, files: ["content.js"] });
-        await chrome.tabs.sendMessage(tab.id, { type: "SCAN_PAGE" }, { frameId });
+        return chrome.tabs.sendMessage(tab.id, { type: "SCAN_PAGE" }, { frameId }) as Promise<{
+          count?: number;
+          snapshot?: PageSnapshot;
+        }>;
       };
-      await scanFrame(0);
+      const topFrameResponse = await scanFrame(0);
       await Promise.all((frames ?? [])
         .filter((frame) => frame.frameId !== 0)
         .map((frame) => scanFrame(frame.frameId).catch(() => undefined)));
@@ -437,6 +450,7 @@ export function App() {
         page = await currentSnapshot();
         if (page?.tabId === tab.id) break;
       }
+      if (!page || page.tabId !== tab.id) page = topFrameResponse.snapshot ?? null;
       if (!page || page.tabId !== tab.id) throw new Error("扫描已执行，但没有收到当前页面的识别结果");
       setSnapshot(page);
       setSources(page.sources);
@@ -452,8 +466,39 @@ export function App() {
     const text = manualText.trim();
     const url = manualUrl.trim();
     if (!text && !url) return;
+    if (editingSourceId) {
+      const currentSource = sources.find((source) => source.id === editingSourceId);
+      if (!currentSource) return;
+      if (currentSource.kind === "text") {
+        if (!text) return;
+        setSources((current) => current.map((source) =>
+          source.id === editingSourceId
+            ? { ...source, text, title: "手动补充文本" }
+            : source
+        ));
+      } else {
+        if (!isHttpUrl(url)) return;
+        setSources((current) => current.map((source) =>
+          source.id === editingSourceId
+            ? {
+                ...source,
+                kind: (/\.pdf(?:$|\?)/i.test(url) ? "pdf" : "url") as "pdf" | "url",
+                url,
+                title: "手动补充链接",
+                dataBase64: undefined,
+                renderedHtml: undefined
+              }
+            : source
+        ));
+      }
+      setEditingSourceId(null);
+      setManualText("");
+      setManualUrl("");
+      setManualOpen(false);
+      return;
+    }
     setSources((current) => [...current,
-      ...(url ? [{
+      ...(isHttpUrl(url) ? [{
         id: crypto.randomUUID(), kind: /\.pdf(?:$|\?)/i.test(url) ? "pdf" as const : "url" as const,
         title: "手动补充链接", url, selected: true, relation: "manual" as const
       }] : []),
@@ -465,6 +510,47 @@ export function App() {
     setManualText("");
     setManualUrl("");
     setManualOpen(false);
+  }
+
+  function isManualFormValid(): boolean {
+    const text = manualText.trim();
+    const url = manualUrl.trim();
+    if (editingSourceId) {
+      const source = sources.find((item) => item.id === editingSourceId);
+      return source?.kind === "text" ? Boolean(text) : isHttpUrl(url);
+    }
+    return (!url || isHttpUrl(url)) && Boolean(text || url);
+  }
+
+  function editManualSource(source: DiscoveredSource) {
+    setEditingSourceId(source.id);
+    setManualUrl(source.url ?? "");
+    setManualText(source.text ?? "");
+    setManualOpen(true);
+  }
+
+  function beginManualAdd() {
+    setEditingSourceId(null);
+    setManualText("");
+    setManualUrl("");
+    setManualOpen(true);
+  }
+
+  function cancelManualEdit() {
+    setEditingSourceId(null);
+    setManualText("");
+    setManualUrl("");
+    setManualOpen(false);
+  }
+
+  function removeManualSource(sourceId: string) {
+    setSources((current) => current.filter((source) => source.id !== sourceId));
+    if (editingSourceId === sourceId) {
+      setEditingSourceId(null);
+      setManualText("");
+      setManualUrl("");
+      setManualOpen(false);
+    }
   }
 
   async function addPdfFiles(files: FileList | null) {
@@ -847,9 +933,14 @@ export function App() {
       snapshot={snapshot} sources={sources} setSources={setSources}
       context={context} setContext={setContext} start={startAnalysis}
       rescan={grantAndScan}
-      manualOpen={manualOpen} setManualOpen={setManualOpen}
+      manualOpen={manualOpen} manualFormValid={isManualFormValid()}
       manualText={manualText} setManualText={setManualText}
       manualUrl={manualUrl} setManualUrl={setManualUrl}
+      editingSourceId={editingSourceId}
+      onEditManual={editManualSource}
+      onRemoveManual={removeManualSource}
+      onBeginManualAdd={beginManualAdd}
+      onCancelManualEdit={cancelManualEdit}
       addManualText={addManualText} addPdfFiles={addPdfFiles}
     />
   </Shell>;
@@ -884,22 +975,36 @@ function PrepareScreen(props: {
   snapshot: PageSnapshot | null; sources: DiscoveredSource[]; setSources: React.Dispatch<React.SetStateAction<DiscoveredSource[]>>;
   context: UserContext; setContext: React.Dispatch<React.SetStateAction<UserContext>>; start: () => void;
   rescan: () => void;
-  manualOpen: boolean; setManualOpen: (v: boolean) => void; manualText: string; setManualText: (v: string) => void; addManualText: () => void;
+  manualOpen: boolean; manualText: string; setManualText: (v: string) => void; addManualText: () => void;
   manualUrl: string; setManualUrl: (v: string) => void; addPdfFiles: (files: FileList | null) => void;
+  editingSourceId: string | null; onEditManual: (source: DiscoveredSource) => void; onRemoveManual: (sourceId: string) => void;
+  onBeginManualAdd: () => void; onCancelManualEdit: () => void; manualFormValid: boolean;
 }) {
   const { snapshot, sources, setSources, context, setContext } = props;
   return <main className="prepare">
     <section className="page-intro"><p className="eyebrow">当前页面</p><h1>{snapshot?.pageTitle ?? "未识别页面"}</h1><p className="page-url">{snapshot?.pageUrl}</p><div className="scan-summary"><CheckCircle2 size={17} /><span>发现 {sources.length} 份可能相关的规则</span></div></section>
     <section className="section"><div className="section-heading"><div><span className="step">1</span><h2>确认分析材料</h2></div><button className="icon-button" title="重新扫描" onClick={props.rescan}><RefreshCw size={16} /></button></div>
       <div className="source-list">{sources.map((source) =>
-        <label className="source-row" key={source.id}><input type="checkbox" checked={source.selected} onChange={(e) => setSources((items) => items.map((item) => item.id === source.id ? { ...item, selected: e.target.checked } : item))} /><span className="checkbox-ui"><Check size={13} /></span><FileText size={17} /><span><strong>{source.title}</strong><small>{source.kind === "text" ? "已提供文本" : new URL(source.url!).hostname}</small></span></label>
+        <div className="source-row" key={source.id}>
+          <input type="checkbox" checked={source.selected} aria-label={`选择 ${source.title}`} onChange={(e) => setSources((items) => items.map((item) => item.id === source.id ? { ...item, selected: e.target.checked } : item))} />
+          <span className="checkbox-ui"><Check size={13} /></span>
+          <FileText size={17} />
+          <span className="source-info">
+            <strong>{source.title}</strong>
+            <small title={source.url ?? source.text ?? ""}>{source.kind === "text" ? (source.text ?? "已提供文本") : source.url}</small>
+          </span>
+          {source.relation === "manual" && <span className="source-controls">
+            {(source.kind === "url" || source.kind === "text") && <button type="button" className="icon-button compact-icon" title="修改手动材料" onClick={() => props.onEditManual(source)}><Pencil size={14} /></button>}
+            <button type="button" className="icon-button compact-icon danger-icon" title="删除手动材料" onClick={() => props.onRemoveManual(source.id)}><Trash2 size={14} /></button>
+          </span>}
+        </div>
       )}</div>
       <div className="source-actions">
-        <button className="text-button" onClick={() => props.setManualOpen(true)}><Plus size={16} />补充链接或文本</button>
+        <button className="text-button" onClick={props.onBeginManualAdd}><Plus size={16} />补充链接或文本</button>
         <label className="text-button upload-button"><Upload size={16} />上传 PDF<input type="file" accept="application/pdf,.pdf" multiple onChange={(event) => void props.addPdfFiles(event.target.files)} /></label>
       </div>
       {props.manualOpen &&
-        <div className="manual-box"><input type="url" placeholder="https://example.com/terms" value={props.manualUrl} onChange={(e) => props.setManualUrl(e.target.value)} /><textarea placeholder="或粘贴协议、补充规则和相关说明" value={props.manualText} onChange={(e) => props.setManualText(e.target.value)} /><div><button className="ghost" onClick={() => props.setManualOpen(false)}>取消</button><button className="small-primary" onClick={props.addManualText}>加入材料</button></div></div>}
+        <div className="manual-box"><input type="url" placeholder="https://example.com/terms" value={props.manualUrl} onChange={(e) => props.setManualUrl(e.target.value)} /><textarea placeholder="或粘贴协议、补充规则和相关说明" value={props.manualText} onChange={(e) => props.setManualText(e.target.value)} /><div><button className="ghost" onClick={props.onCancelManualEdit}>取消</button><button className="small-primary" disabled={!props.manualFormValid} onClick={props.addManualText}>{props.editingSourceId ? "保存修改" : "加入材料"}</button></div></div>}
     </section>
     <section className="section"><div className="section-heading"><div><span className="step">2</span><h2>这次你准备做什么</h2></div></div>
       <div className="segmented">{actionOptions.map((option) => <button key={option.value} className={context.action === option.value ? "active" : ""} onClick={() => setContext({ ...context, action: option.value })}>{option.label}</button>)}</div>
@@ -965,7 +1070,7 @@ function SourcesView({ result, supplementing, onAddRelated }: { result: Analysis
     .filter((item) => !included.has(item.url))
     .filter((item, index, all) => all.findIndex((other) => other.url === item.url) === index)
     .slice(0, Math.min(8, remaining));
-  return <section className="result-section no-top"><div className="view-heading"><h2>分析来源</h2><span>{sources.length} 份</span></div>{sources.map((source) => <div className="source-detail" key={source.id}><div className={`source-status ${source.status}`}><FileText size={17} /></div><div><strong>{source.title}</strong><p>{source.normalizedText.length > 0 ? `${source.sections.length} 个章节 · ${source.normalizedText.length.toLocaleString()} 字` : source.status === "failed" ? "读取失败" : "未取得有效正文"}</p><small>{source.status === "ready" ? "已完整读取并生成内容指纹" : source.error}</small></div>{source.url && <button title="打开来源" onClick={() => chromeAvailable() && chrome.tabs.create({ url: source.url })}><ExternalLink size={15} /></button>}</div>)}{related.length > 0 && <div className="related-box"><div><strong>发现 {related.length} 份更深层关联材料</strong><p>{related.map((item) => item.title).join("、")}</p></div><button disabled={supplementing} onClick={() => onAddRelated(related)}>{supplementing ? <><LoaderCircle className="spin" size={13} />正在处理</> : "确认并继续读取"}</button></div>}</section>;
+  return <section className="result-section no-top"><div className="view-heading"><h2>分析来源</h2><span>{sources.length} 份</span></div>{sources.map((source) => <div className="source-detail" key={source.id}><div className={`source-status ${source.status}`}><FileText size={17} /></div><div><strong>{source.title}</strong>{source.url && <small className="source-detail-url" title={source.url}>{source.url}</small>}<p>{source.normalizedText.length > 0 ? `${source.sections.length} 个章节 · ${source.normalizedText.length.toLocaleString()} 字` : source.status === "failed" ? "读取失败" : "未取得有效正文"}</p><small>{source.status === "ready" ? "已完整读取并生成内容指纹" : source.error}</small></div>{source.url && <button title="打开来源" onClick={() => chromeAvailable() && chrome.tabs.create({ url: source.url })}><ExternalLink size={15} /></button>}</div>)}{related.length > 0 && <div className="related-box"><div><strong>发现 {related.length} 份更深层关联材料</strong><p>{related.map((item) => item.title).join("、")}</p></div><button disabled={supplementing} onClick={() => onAddRelated(related)}>{supplementing ? <><LoaderCircle className="spin" size={13} />正在处理</> : "确认并继续读取"}</button></div>}</section>;
 }
 
 function ChatView({ messages, suggestions, input, setInput, ask, asking }: { messages: Array<{ role: "user" | "assistant"; text: string }>; suggestions: string[]; input: string; setInput: (v: string) => void; ask: () => void; asking: boolean }) {

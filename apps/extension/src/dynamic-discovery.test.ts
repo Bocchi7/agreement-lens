@@ -1,6 +1,6 @@
 import { JSDOM } from "jsdom";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { resolveDynamicAgreementLinks } from "./dynamic-discovery";
+import { resolveAgreementLinksFromLoadedScripts, resolveDynamicAgreementLinks } from "./dynamic-discovery";
 
 describe("dynamic agreement discovery", () => {
   afterEach(() => vi.unstubAllGlobals());
@@ -100,6 +100,53 @@ describe("dynamic agreement discovery", () => {
       { title: "百度用户协议", url: "http://passport.baidu.com/static/passpc-account/html/protocal.html" },
       { title: "儿童个人信息保护声明", url: "https://privacy.baidu.com/policy/children-privacy-policy/index.html" },
       { title: "百度隐私权保护声明", url: "http://privacy.baidu.com/detail?id=288" }
+    ]);
+  });
+
+  it("finds URLs in an ancestor React fiber reached through the return chain", () => {
+    const dom = new JSDOM(`
+      <a><span>服务协议</span></a>
+    `, { url: "https://www.pinduoduo.com/" });
+    const link = dom.window.document.querySelector("a") as unknown as Element & Record<string, unknown>;
+    const fiberKey = "__reactInternalInstance$test";
+    const ancestor = {
+      memoizedProps: {
+        footer: [
+          { name: "服务协议", url: "https://www.pinduoduo.com/pdd_user_services_agreement.pdf" }
+        ]
+      }
+    };
+    (link as Record<string, unknown>)[fiberKey] = {
+      memoizedProps: { children: "服务协议" },
+      return: { memoizedProps: { children: "服务协议" }, return: ancestor }
+    };
+    vi.stubGlobal("document", dom.window.document);
+    vi.stubGlobal("location", dom.window.location);
+    vi.stubGlobal("window", dom.window);
+
+    const injectedResolver = new Function(`return (${resolveDynamicAgreementLinks.toString()})`)() as typeof resolveDynamicAgreementLinks;
+    expect(injectedResolver()).toEqual([
+      { title: "服务协议", url: "https://www.pinduoduo.com/pdd_user_services_agreement.pdf" }
+    ]);
+  });
+
+  it("recovers href-less agreement destinations from loaded framework bundles", async () => {
+    const dom = new JSDOM("<script src=\"https://cdn.example.com/commons.js\"></script>", {
+      url: "https://www.pinduoduo.com/"
+    });
+    vi.stubGlobal("document", dom.window.document);
+    vi.stubGlobal("location", dom.window.location);
+    vi.stubGlobal("performance", {
+      getEntriesByType: () => [{ name: "https://cdn.example.com/commons.js" }]
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(`
+      {url:"".concat("//www.pinduoduo.com","/pdd_user_services_agreement.pdf"),name:"服务协议"},
+      {url:"".concat("//www.pinduoduo.com","/pdd_privacy_policy.pdf"),name:"隐私政策"}
+    `)));
+
+    expect(await resolveAgreementLinksFromLoadedScripts(["服务协议", "隐私政策"])).toEqual([
+      { title: "服务协议", url: "https://www.pinduoduo.com/pdd_user_services_agreement.pdf" },
+      { title: "隐私政策", url: "https://www.pinduoduo.com/pdd_privacy_policy.pdf" }
     ]);
   });
 });

@@ -1,5 +1,5 @@
 import type { PageSnapshot } from "./types";
-import { resolveDynamicAgreementLinks } from "./dynamic-discovery";
+import { resolveAgreementLinksFromLoadedScripts, resolveDynamicAgreementLinks } from "./dynamic-discovery";
 import { setTabBadge as updateTabBadge } from "./tab-badge";
 import { mergeDiscoveredSources } from "./frame-discovery";
 
@@ -73,6 +73,38 @@ async function waitForTab(tabId: number): Promise<void> {
       chrome.tabs.onUpdated.removeListener(listener);
       resolve();
     }).catch(() => undefined);
+  });
+}
+
+async function waitForOpenedTabUrl(tabId: number, timeoutMs = 5_000): Promise<string | undefined> {
+  const readUrl = async (): Promise<string | undefined> => {
+    const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+    return tab?.url?.startsWith("http") ? tab.url : undefined;
+  };
+  const initialUrl = await readUrl();
+  if (initialUrl) return initialUrl;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (url?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve(url);
+    };
+    const timeout = setTimeout(() => {
+      void readUrl().then((url) => finish(url));
+    }, timeoutMs);
+    const listener = (updatedTabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
+      if (updatedTabId !== tabId || !changeInfo.url) return;
+      void readUrl().then((url) => {
+        if (url) finish(url);
+      });
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    void readUrl().then((url) => {
+      if (url) finish(url);
+    });
   });
 }
 
@@ -599,21 +631,74 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ links: [] });
       return;
     }
+    const tabId = sender.tab.id;
+    const frameId = sender.frameId ?? 0;
+    const openedTabs = new Map<number, string | undefined>();
+    const onCreated = (tab: chrome.tabs.Tab) => {
+      if (tab.id !== undefined && tab.openerTabId === tabId) openedTabs.set(tab.id, tab.url);
+    };
+    chrome.tabs.onCreated.addListener(onCreated);
     void chrome.scripting.executeScript({
-      target: { tabId: sender.tab.id, frameIds: [sender.frameId ?? 0] },
+      target: { tabId, frameIds: [frameId] },
       world: "MAIN",
       func: resolveDynamicAgreementLinks
-    }).then(([result]) => {
+    }).then(async ([result]) => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      chrome.tabs.onCreated.removeListener(onCreated);
+      const recordsResult = await chrome.scripting.executeScript({
+        target: { tabId, frameIds: [frameId] },
+        world: "MAIN",
+        func: () => {
+          const runtimeWindow = window as Window & {
+            __agreementLensDynamicClickRecords?: Array<{ title: string; captured: string[] }>;
+          };
+          const records = runtimeWindow.__agreementLensDynamicClickRecords ?? [];
+          delete runtimeWindow.__agreementLensDynamicClickRecords;
+          return records;
+        }
+      }).catch(() => [{ result: [] as Array<{ title: string; captured: string[] }> }]);
+      const records = recordsResult[0]?.result ?? [];
+      const openedTabIds = [...openedTabs.keys()];
+      const openedUrls = await Promise.all(openedTabIds.map(async (openedTabId) =>
+        (await waitForOpenedTabUrl(openedTabId)) ?? openedTabs.get(openedTabId)
+      ));
+      await Promise.all(openedTabIds.map((openedTabId) => chrome.tabs.remove(openedTabId).catch(() => undefined)));
+      const fallbackLinks = records
+        .filter((record) => record.title && record.captured.length === 0)
+        .map((record, index) => {
+          const url = openedUrls[index];
+          if (!url) return undefined;
+          return { title: record.title, url };
+        })
+        .filter((item): item is { title: string; url: string } => Boolean(item));
+      const resolvedLinks = [...((result?.result ?? []) as Array<{ title: string; url: string }>), ...fallbackLinks];
+      const unresolvedLabels = records
+        .map((record) => record.title)
+        .filter((title) => title && !resolvedLinks.some((link) => link.title === title));
+      const scriptLinks = unresolvedLabels.length
+        ? await chrome.scripting.executeScript({
+            target: { tabId, frameIds: [frameId] },
+            world: "MAIN",
+            func: resolveAgreementLinksFromLoadedScripts,
+            args: [unresolvedLabels]
+          }).then(([scriptResult]) => scriptResult?.result ?? []).catch(() => [])
+        : [];
+      const links = [...resolvedLinks, ...scriptLinks]
+        .filter((item, index, all) => all.findIndex((candidate) => candidate.url === item.url) === index);
       console.info("[agreement-lens] dynamic discovery completed", {
-        tabId: sender.tab?.id,
-        frameId: sender.frameId ?? 0,
-        links: result?.result ?? []
+        tabId,
+        frameId,
+        links,
+        openedTabCount: openedTabIds.length,
+        clickRecords: records
       });
-      sendResponse({ links: result?.result ?? [] });
+      sendResponse({ links });
     }).catch((error) => {
+      chrome.tabs.onCreated.removeListener(onCreated);
+      for (const openedTabId of openedTabs.keys()) void chrome.tabs.remove(openedTabId).catch(() => undefined);
       console.warn("[agreement-lens] dynamic discovery failed", {
-        tabId: sender.tab?.id,
-        frameId: sender.frameId ?? 0,
+        tabId,
+        frameId,
         error: error instanceof Error ? error.message : String(error)
       });
       sendResponse({ links: [] });
@@ -633,7 +718,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (payload.tabId >= 0 && !payload.pendingRecheck) {
         void updateTabBadge(chrome, payload.tabId, count ? String(count) : "", count ? "#c7482d" : "#69726d");
       }
-      sendResponse({ ok: true });
+      sendResponse({ ok: true, payload });
     }).catch(() => sendResponse({ ok: false, stale: true }));
     return true;
   }

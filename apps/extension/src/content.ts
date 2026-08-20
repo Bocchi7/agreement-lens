@@ -6,6 +6,7 @@ import {
   isExtensionContextInvalidated,
   requiresContentScriptMigration
 } from "./extension-context";
+import type { PageSnapshot } from "./types";
 
 type CollectedSources = {
   sources: ReturnType<typeof discoverAgreementSources>;
@@ -50,10 +51,10 @@ async function collectSources(isActive: () => boolean): Promise<CollectedSources
 async function publishDiscovery(
   sources: ReturnType<typeof discoverAgreementSources>,
   isActive: () => boolean
-): Promise<boolean> {
-  if (!isActive() || !hasLiveExtensionContext()) return false;
+): Promise<PageSnapshot | null> {
+  if (!isActive() || !hasLiveExtensionContext()) return null;
   try {
-    await chrome.runtime.sendMessage({
+    const response = await chrome.runtime.sendMessage({
       type: "PAGE_DISCOVERED",
       payload: {
         tabId: -1,
@@ -63,10 +64,10 @@ async function publishDiscovery(
         sources,
         scannedAt: new Date().toISOString()
       }
-    });
-    return true;
+    }) as { ok?: boolean; payload?: PageSnapshot };
+    return response.payload ?? null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -120,11 +121,12 @@ runtimeWindow.__agreementLensContentController?.dispose();
       stop();
       return 0;
     }
-    if (!await publishDiscovery(collected.sources, isActive)) {
+    const snapshot = await publishDiscovery(collected.sources, isActive);
+    if (!snapshot) {
       if (!hasLiveExtensionContext()) stop();
-      return 0;
+      return { count: 0 };
     }
-    return collected.sources.length;
+    return { count: collected.sources.length, snapshot };
   };
   const scanIfChanged = async () => {
     const collected = await collectSources(isActive);
@@ -157,7 +159,7 @@ runtimeWindow.__agreementLensContentController?.dispose();
   function handleMessage(message: { type?: string; quote?: string }, _sender: unknown, sendResponse: (response: unknown) => void) {
     if (message.type === "SCAN_PAGE") {
       void sendDiscovery()
-        .then((count) => sendResponse({ count }))
+        .then((result) => sendResponse(result))
         .catch(() => {
           stop();
           try {
