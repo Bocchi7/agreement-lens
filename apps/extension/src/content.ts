@@ -1,10 +1,12 @@
 import { discoverAgreementSources, sanitizedRenderedHtml } from "./discovery";
 import { highlightEvidence } from "./evidence-highlight";
+import { hasLiveExtensionContext, isExtensionContextInvalidated } from "./extension-context";
 
-async function collectSources() {
+async function collectSources(isActive: () => boolean) {
   const sources = discoverAgreementSources(document, location.href);
   for (const delay of [0, 300, 900]) {
     if (delay) await new Promise((resolve) => window.setTimeout(resolve, delay));
+    if (!isActive() || !hasLiveExtensionContext()) throw new Error("Extension context invalidated.");
     try {
       const response = await chrome.runtime.sendMessage({ type: "RESOLVE_DYNAMIC_AGREEMENT_LINKS" }) as {
         links?: Array<{ title: string; url: string }>;
@@ -24,13 +26,18 @@ async function collectSources() {
       }
       if (response.links?.length || sources.length) break;
     } catch (error) {
+      if (isExtensionContextInvalidated(error) || !hasLiveExtensionContext()) throw error;
       console.warn("[agreement-lens] dynamic discovery request failed", error);
     }
   }
   return sources.slice(0, 12);
 }
 
-async function publishDiscovery(sources: ReturnType<typeof discoverAgreementSources>) {
+async function publishDiscovery(
+  sources: ReturnType<typeof discoverAgreementSources>,
+  isActive: () => boolean
+) {
+  if (!isActive() || !hasLiveExtensionContext()) throw new Error("Extension context invalidated.");
   await chrome.runtime.sendMessage({
     type: "PAGE_DISCOVERED",
     payload: {
@@ -44,64 +51,105 @@ async function publishDiscovery(sources: ReturnType<typeof discoverAgreementSour
   });
 }
 
-async function sendDiscovery() {
-  const sources = await collectSources();
-  await publishDiscovery(sources);
-  return sources.length;
-}
-
 const runtimeWindow = window as Window & {
-  __agreementLensContentVersion?: string;
+  __agreementLensContentController?: {
+    dispose: () => void;
+  };
 };
-const contentVersion = "2026-08-19-cross-frame-discovery-v5";
 
-if (runtimeWindow.__agreementLensContentVersion !== contentVersion) chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type === "SCAN_PAGE") {
-    void sendDiscovery().then((count) => sendResponse({ count }));
-    return true;
-  }
-  if (message.type === "GET_RENDERED_HTML") {
-    sendResponse({ html: sanitizedRenderedHtml(document) });
-    return;
-  }
-  if (message.type === "HIGHLIGHT_EVIDENCE") {
-    sendResponse({ found: highlightEvidence(document, String(message.quote || "")) });
-  }
-});
+runtimeWindow.__agreementLensContentController?.dispose();
 
-if (runtimeWindow.__agreementLensContentVersion !== contentVersion) {
-  runtimeWindow.__agreementLensContentVersion = contentVersion;
+{
+  let disposed = false;
   let lastSignature = "";
   let timer: number | undefined;
+  let observer: MutationObserver | undefined;
+  const isActive = () => !disposed;
+  const stop = () => {
+    if (disposed) return;
+    disposed = true;
+    if (timer !== undefined) window.clearTimeout(timer);
+    observer?.disconnect();
+    window.removeEventListener("popstate", scheduleScan);
+    window.removeEventListener("hashchange", scheduleScan);
+    document.removeEventListener("click", handleDocumentClick, true);
+    try {
+      chrome.runtime.onMessage.removeListener(handleMessage);
+    } catch {
+      // The old content-script world cannot access chrome.runtime after reload.
+    }
+  };
+  const handleFailure = (error: unknown) => {
+    if (isExtensionContextInvalidated(error) || !hasLiveExtensionContext()) {
+      stop();
+      return;
+    }
+    console.warn("[agreement-lens] page discovery failed", error);
+  };
+  const sendDiscovery = async () => {
+    const sources = await collectSources(isActive);
+    if (!isActive()) return 0;
+    await publishDiscovery(sources, isActive);
+    return sources.length;
+  };
   const scanIfChanged = async () => {
-    const sources = await collectSources();
+    const sources = await collectSources(isActive);
+    if (!isActive()) return;
     const signature = sources.map((source) => `${source.title}|${source.url}`).join("\n");
     if (signature === lastSignature) return;
     lastSignature = signature;
-    await publishDiscovery(sources);
+    await publishDiscovery(sources, isActive);
   };
-  const scheduleScan = () => {
+  function scheduleScan() {
+    if (!isActive()) return;
     if (timer !== undefined) window.clearTimeout(timer);
     timer = window.setTimeout(() => {
       timer = undefined;
-      void scanIfChanged();
+      void scanIfChanged().catch(handleFailure);
     }, 800);
-  };
+  }
+  function handleDocumentClick(event: Event) {
+    const elementTarget = event.target instanceof Element
+      ? event.target.closest("a,area,[role='link'],[data-href],[data-url]")
+      : null;
+    const label = elementTarget?.textContent?.replace(/\s+/g, " ").trim() ?? "";
+    if (elementTarget && /用户(服务)?协议|服务条款|使用条款|隐私(权)?政策|隐私协议|会员协议|terms|privacy|user agreement|subscription/i.test(label)) {
+      scheduleScan();
+    }
+  }
+  function handleMessage(message: { type?: string; quote?: string }, _sender: unknown, sendResponse: (response: unknown) => void) {
+    if (message.type === "SCAN_PAGE") {
+      void sendDiscovery()
+        .then((count) => sendResponse({ count }))
+        .catch((error) => {
+          handleFailure(error);
+          try {
+            sendResponse({ count: 0 });
+          } catch {
+            // The message port is already gone when the extension was reloaded.
+          }
+        });
+      return true;
+    }
+    if (message.type === "GET_RENDERED_HTML") {
+      sendResponse({ html: sanitizedRenderedHtml(document) });
+      return;
+    }
+    if (message.type === "HIGHLIGHT_EVIDENCE") {
+      sendResponse({ found: highlightEvidence(document, String(message.quote || "")) });
+    }
+  }
   const start = () => {
-    void scanIfChanged();
-    new MutationObserver(scheduleScan).observe(document.documentElement, { childList: true, subtree: true });
+    if (!isActive()) return;
+    void scanIfChanged().catch(handleFailure);
+    observer = new MutationObserver(scheduleScan);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
     window.addEventListener("popstate", scheduleScan);
     window.addEventListener("hashchange", scheduleScan);
-    document.addEventListener("click", (event) => {
-      const elementTarget = event.target instanceof Element
-        ? event.target.closest("a,area,[role='link'],[data-href],[data-url]")
-        : null;
-      const label = elementTarget?.textContent?.replace(/\s+/g, " ").trim() ?? "";
-      if (elementTarget && /用户(服务)?协议|服务条款|使用条款|隐私(权)?政策|隐私协议|会员协议|terms|privacy|user agreement|subscription/i.test(label)) {
-        scheduleScan();
-      }
-    }, true);
+    document.addEventListener("click", handleDocumentClick, true);
   };
+  chrome.runtime.onMessage.addListener(handleMessage);
+  runtimeWindow.__agreementLensContentController = { dispose: stop };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start, { once: true });
   else start();
 }
