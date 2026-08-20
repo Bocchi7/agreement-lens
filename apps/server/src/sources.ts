@@ -250,7 +250,9 @@ async function persistSnapshot(
 
 async function parsePdf(id: string, title: string, bytes: Uint8Array, url?: string): Promise<SourceDocument> {
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-  const pdf = await pdfjs.getDocument({ data: bytes }).promise;
+  // PDF.js transfers and detaches the supplied ArrayBuffer. Parse a copy so
+  // the original bytes remain available for the immutable raw snapshot.
+  const pdf = await pdfjs.getDocument({ data: Uint8Array.from(bytes) }).promise;
   const sections: SourceSection[] = [];
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
     const page = await pdf.getPage(pageNumber);
