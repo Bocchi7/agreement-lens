@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { hasLiveExtensionContext, isExtensionContextInvalidated } from "./extension-context";
+import {
+  CONTENT_SCRIPT_VERSION,
+  hasLiveExtensionContext,
+  isExtensionContextInvalidated,
+  requiresContentScriptMigration
+} from "./extension-context";
 
 describe("extension context helpers", () => {
   it("recognizes the error emitted after an extension reload", () => {
@@ -13,5 +18,27 @@ describe("extension context helpers", () => {
     vi.stubGlobal("chrome", { runtime: {} });
     expect(hasLiveExtensionContext()).toBe(false);
     vi.unstubAllGlobals();
+  });
+
+  it("requires a page reload for legacy scripts without a disposer", () => {
+    expect(requiresContentScriptMigration({
+      hasController: false,
+      hasLoadedMarker: true
+    })).toBe(true);
+    expect(requiresContentScriptMigration({
+      hasController: false,
+      hasLoadedMarker: false,
+      contentVersion: "2026-08-19-cross-frame-discovery-v5"
+    })).toBe(true);
+    expect(requiresContentScriptMigration({
+      hasController: true,
+      hasLoadedMarker: true,
+      contentVersion: "2026-08-19-cross-frame-discovery-v5"
+    })).toBe(false);
+    expect(requiresContentScriptMigration({
+      hasController: false,
+      hasLoadedMarker: false,
+      contentVersion: CONTENT_SCRIPT_VERSION
+    })).toBe(false);
   });
 });

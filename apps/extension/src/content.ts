@@ -1,6 +1,11 @@
 import { discoverAgreementSources, sanitizedRenderedHtml } from "./discovery";
 import { highlightEvidence } from "./evidence-highlight";
-import { hasLiveExtensionContext, isExtensionContextInvalidated } from "./extension-context";
+import {
+  CONTENT_SCRIPT_VERSION,
+  hasLiveExtensionContext,
+  isExtensionContextInvalidated,
+  requiresContentScriptMigration
+} from "./extension-context";
 
 type CollectedSources = {
   sources: ReturnType<typeof discoverAgreementSources>;
@@ -66,11 +71,27 @@ async function publishDiscovery(
 }
 
 const runtimeWindow = window as Window & {
+  __agreementLensLoaded?: boolean;
+  __agreementLensContentVersion?: string;
+  __agreementLensContentMigrationPending?: boolean;
   __agreementLensContentController?: {
     dispose: () => void;
   };
 };
 
+if (requiresContentScriptMigration({
+  hasController: Boolean(runtimeWindow.__agreementLensContentController),
+  hasLoadedMarker: Boolean(runtimeWindow.__agreementLensLoaded),
+  contentVersion: runtimeWindow.__agreementLensContentVersion
+})) {
+  // The earliest content scripts did not expose a disposer, so their
+  // observers and message listeners cannot be removed from this page.
+  // Reload once to discard those stale isolated-world contexts cleanly.
+  if (!runtimeWindow.__agreementLensContentMigrationPending) {
+    runtimeWindow.__agreementLensContentMigrationPending = true;
+    window.location.reload();
+  }
+} else {
 runtimeWindow.__agreementLensContentController?.dispose();
 
 {
@@ -165,7 +186,10 @@ runtimeWindow.__agreementLensContentController?.dispose();
     document.addEventListener("click", handleDocumentClick, true);
   };
   chrome.runtime.onMessage.addListener(handleMessage);
+  runtimeWindow.__agreementLensLoaded = false;
+  runtimeWindow.__agreementLensContentVersion = CONTENT_SCRIPT_VERSION;
   runtimeWindow.__agreementLensContentController = { dispose: stop };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start, { once: true });
   else start();
+}
 }

@@ -1,3 +1,17 @@
+export const CONTENT_SCRIPT_VERSION = "2026-08-20-context-migration-v8";
+
+export type ContentScriptRuntimeState = {
+  hasController: boolean;
+  hasLoadedMarker: boolean;
+  contentVersion?: string;
+};
+
+export function requiresContentScriptMigration(state: ContentScriptRuntimeState): boolean {
+  if (state.hasController) return false;
+  return state.hasLoadedMarker
+    || Boolean(state.contentVersion && state.contentVersion !== CONTENT_SCRIPT_VERSION);
+}
+
 export function isExtensionContextInvalidated(error: unknown): boolean {
   const messages: string[] = [];
   let current: unknown = error;

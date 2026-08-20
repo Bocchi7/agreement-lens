@@ -41,6 +41,7 @@ interface BrowserFetchedSource extends BrowserSourceRequest {
 type FrameDiscoveryRecord = Omit<PageSnapshot, "tabId" | "pendingRecheck">;
 
 const discoveryUpdates = new Map<number, Promise<PageSnapshot | null>>();
+let existingPageMigration: Promise<void> | undefined;
 
 function base64FromBytes(bytes: Uint8Array): string {
   let binary = "";
@@ -441,6 +442,51 @@ function samePageUrl(left: string | undefined, right: string | undefined): boole
   }
 }
 
+async function migrateExistingPageContentScripts(): Promise<void> {
+  const tabs = await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] });
+  let injected = 0;
+  for (const tab of tabs) {
+    if (!tab.id || !tab.url) continue;
+    let origin: string;
+    try {
+      origin = new URL(tab.url).origin + "/*";
+    } catch {
+      continue;
+    }
+    const allowed = await chrome.permissions.contains({ origins: [origin] }).catch(() => false);
+    if (!allowed) continue;
+    try {
+      // Reinject into tabs that survived an extension reload. The current
+      // script disposes newer controllers and reloads pages with legacy
+      // scripts that have no way to unregister their listeners.
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ["content.js"]
+      });
+      injected += 1;
+    } catch (error) {
+      console.info("[agreement-lens] existing page migration skipped", {
+        tabId: tab.id,
+        url: tab.url,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+  console.info("[agreement-lens] existing page content scripts migrated", {
+    tabCount: tabs.length,
+    injected
+  });
+}
+
+function queueExistingPageContentScriptMigration(): void {
+  if (existingPageMigration) return;
+  existingPageMigration = migrateExistingPageContentScripts().catch((error) => {
+    console.info("[agreement-lens] existing page migration unavailable", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
+}
+
 chrome.action.onClicked.addListener((tab) => {
   if (tab.id) void scanTab(tab.id);
 });
@@ -608,3 +654,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 });
+
+// A service-worker restart does not refresh pages that already contain an old
+// content script. Run this once per worker lifetime so extension reloads clean
+// up those pages without injecting on every message.
+queueExistingPageContentScriptMigration();
