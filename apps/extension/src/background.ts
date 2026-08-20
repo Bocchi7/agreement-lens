@@ -1,7 +1,5 @@
 import type { PageSnapshot } from "./types";
-import { decodeHtmlBytes } from "@agreement-lens/shared";
 import { resolveDynamicAgreementLinks } from "./dynamic-discovery";
-import { needsRenderedFallback } from "./html-readiness";
 import { setTabBadge as updateTabBadge } from "./tab-badge";
 import { mergeDiscoveredSources } from "./frame-discovery";
 
@@ -51,14 +49,6 @@ function base64FromBytes(bytes: Uint8Array): string {
     binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
   }
   return btoa(binary);
-}
-
-function isSpaRouteUrl(value: string): boolean {
-  try {
-    return /^#(?:!\/|\/)/.test(new URL(value).hash);
-  } catch {
-    return false;
-  }
 }
 
 async function waitForTab(tabId: number): Promise<void> {
@@ -281,52 +271,67 @@ async function fetchRenderedSource(
   source: BrowserSourceRequest,
   preferredTabId?: number
 ): Promise<BrowserFetchedSource> {
+  const startedAt = Date.now();
+  console.info("[agreement-lens] fetching browser source", {
+    sourceId: source.id,
+    sourceUrl: source.url
+  });
   const currentTabSource = await fetchCurrentTabSource(source, preferredTabId);
-  if (currentTabSource) return currentTabSource;
-
-  let lastError = "浏览器无法读取来源";
-  let staticHtmlFallback: string | undefined;
-  try {
-    const response = await fetch(source.url, {
-      credentials: "include",
-      redirect: "follow",
-      signal: AbortSignal.timeout(12_000)
+  if (currentTabSource) {
+    console.info("[agreement-lens] browser source read from current tab", {
+      sourceId: source.id,
+      sourceUrl: source.url,
+      elapsedMs: Date.now() - startedAt
     });
-    if (response.ok) {
-      const contentType = response.headers.get("content-type") ?? "";
-      if (source.kind === "pdf" || contentType.includes("pdf") || /\.pdf(?:$|\?)/i.test(source.url)) {
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        if (bytes.length <= MAX_PDF_BYTES) {
-          return { ...source, dataBase64: base64FromBytes(bytes), linkedSources: [] as CapturedAgreementLink[] };
-        }
-        lastError = "PDF 超过 8 MB";
-      } else {
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        const html = decodeHtmlBytes(bytes, contentType);
-        if (html.length <= MAX_HTML_BYTES && !isSpaRouteUrl(source.url) && !needsRenderedFallback(html)) {
-          staticHtmlFallback = html;
-        }
-        lastError = html.length > MAX_HTML_BYTES
-          ? "页面超过 2 MB"
-          : staticHtmlFallback
-            ? "正在用浏览器确认完整正文"
-            : "页面需要在浏览器中完成动态渲染";
-      }
-    } else {
-      lastError = `来源返回 HTTP ${response.status}`;
-    }
-  } catch (error) {
-    lastError = error instanceof Error ? error.message : lastError;
+    return currentTabSource;
   }
 
-  if (source.kind === "pdf") return { ...source, error: lastError, linkedSources: [] as CapturedAgreementLink[] };
+  if (source.kind === "pdf") {
+    try {
+      const response = await fetch(source.url, {
+        credentials: "include",
+        redirect: "follow",
+        signal: AbortSignal.timeout(12_000)
+      });
+      if (!response.ok) throw new Error(`来源返回 HTTP ${response.status}`);
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (bytes.length > MAX_PDF_BYTES) throw new Error("PDF 超过 8 MB");
+      console.info("[agreement-lens] browser source fetched as PDF", {
+        sourceId: source.id,
+        sourceUrl: source.url,
+        elapsedMs: Date.now() - startedAt
+      });
+      return { ...source, dataBase64: base64FromBytes(bytes), linkedSources: [] as CapturedAgreementLink[] };
+    } catch (error) {
+      return {
+        ...source,
+        error: error instanceof Error ? error.message : "浏览器无法读取 PDF",
+        linkedSources: [] as CapturedAgreementLink[]
+      };
+    }
+  }
 
   let tabId: number | undefined;
   try {
+    console.info("[agreement-lens] opening browser source tab", {
+      sourceId: source.id,
+      sourceUrl: source.url
+    });
     const tab = await chrome.tabs.create({ url: source.url, active: false });
     if (!tab.id) throw new Error("无法打开来源页面");
     tabId = tab.id;
+    console.info("[agreement-lens] browser source tab opened", {
+      sourceId: source.id,
+      sourceUrl: source.url,
+      tabId,
+      status: tab.status
+    });
     if (tab.status !== "complete") await waitForTab(tab.id);
+    console.info("[agreement-lens] browser source tab completed", {
+      sourceId: source.id,
+      sourceUrl: source.url,
+      tabId
+    });
     const captured = await captureRenderedTab(tabId);
     console.info("[agreement-lens] captured rendered source", {
       sourceUrl: source.url,
@@ -339,26 +344,20 @@ async function fetchRenderedSource(
       ? { ...source, renderedHtml: captured.html, textLength: captured.textLength, linkedSources: captured.links }
       : { ...source, error: "页面正文为空或超过 2 MB", linkedSources: [] as CapturedAgreementLink[] };
   } catch (error) {
-    if (staticHtmlFallback) {
-      return {
-        ...source,
-        renderedHtml: staticHtmlFallback,
-        linkedSources: [] as CapturedAgreementLink[]
-      };
-    }
-    return { ...source, error: error instanceof Error ? error.message : lastError, linkedSources: [] as CapturedAgreementLink[] };
+    const result = {
+      ...source,
+      error: error instanceof Error ? error.message : "浏览器无法读取来源",
+      linkedSources: [] as CapturedAgreementLink[]
+    };
+    console.warn("[agreement-lens] browser source failed", {
+      sourceId: source.id,
+      sourceUrl: source.url,
+      elapsedMs: Date.now() - startedAt,
+      error: result.error
+    });
+    return result;
   } finally {
     if (tabId !== undefined) await chrome.tabs.remove(tabId).catch(() => undefined);
-  }
-}
-
-function canonicalSourceUrl(value: string): string {
-  try {
-    const url = new URL(value);
-    if (url.hash && !/^#(?:!\/|\/)/.test(url.hash)) url.hash = "";
-    return url.href;
-  } catch {
-    return value;
   }
 }
 
@@ -367,27 +366,15 @@ async function fetchSourceGraphInBrowser(
   preferredTabId?: number
 ) {
   const queued = roots.slice(0, MAX_BROWSER_SOURCES);
-  const seen = new Set(queued.map((source) => canonicalSourceUrl(source.url)));
   const results: BrowserFetchedSource[] = [];
   while (queued.length && results.length < MAX_BROWSER_SOURCES) {
-    const batch = queued.splice(0, Math.min(3, MAX_BROWSER_SOURCES - results.length));
-    const acquired = await Promise.all(batch.map((source) => fetchRenderedSource(source, preferredTabId)));
-    results.push(...acquired);
-    for (const source of acquired) {
-      if (!source.renderedHtml) continue;
-      for (const link of source.linkedSources ?? []) {
-        const url = canonicalSourceUrl(link.url);
-        if (seen.has(url) || queued.length + results.length >= MAX_BROWSER_SOURCES) continue;
-        seen.add(url);
-        queued.push({
-          id: crypto.randomUUID(),
-          title: link.title,
-          url,
-          kind: /\.pdf(?:$|\?)/i.test(url) ? "pdf" : "url",
-          relation: "direct"
-        });
-      }
-    }
+    // Some agreement pages use global singleton scripts and behave badly when
+    // several hidden tabs render the same document at once. Read sources
+    // serially so one page cannot stall the whole analysis batch.
+    const source = queued.shift();
+    if (!source) continue;
+    const acquired = await fetchRenderedSource(source, preferredTabId);
+    results.push(acquired);
   }
   return results;
 }
