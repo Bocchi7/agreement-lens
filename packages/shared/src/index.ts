@@ -164,7 +164,8 @@ export type AgentProgress = z.infer<typeof agentProgressSchema>;
 export const jobStatusSchema = z.object({
   id: z.string(),
   analysisId: z.string(),
-  state: z.enum(["queued", "fetching", "analyzing", "verifying", "integrating", "complete", "failed"]),
+  kind: z.enum(["analysis", "recheck", "version-check"]).default("analysis"),
+  state: z.enum(["queued", "fetching", "analyzing", "verifying", "integrating", "complete", "failed", "cancelled"]),
   progress: z.number().int().min(0).max(100),
   message: z.string(),
   error: z.string().optional(),

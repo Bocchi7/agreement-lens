@@ -730,7 +730,10 @@ async function updatePageDiscovery(
     pendingRecheck: previousPage?.pendingRecheck
   };
   await chrome.storage.session.set({ [framesKey]: records });
-  return frameId === 0 && !payload.pendingRecheck ? maybeRecheck(payload) : payload;
+  // Version checks are initiated by the side panel after it has shown the
+  // matching history entry. Starting one here would create a hidden job before
+  // the user sees the preparation screen.
+  return payload;
 }
 
 function queuePageDiscovery(incoming: PageSnapshot, frameId: number): Promise<PageSnapshot | null> {

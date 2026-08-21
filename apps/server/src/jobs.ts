@@ -26,8 +26,12 @@ function pump() {
 
 function setJob(jobId: string, patch: Partial<JobStatus>) {
   const current = getJob(jobId);
-  if (!current) return;
+  if (!current || current.state === "cancelled") return;
   updateJob({ ...current, ...patch, updatedAt: new Date().toISOString() });
+}
+
+function isCancelled(jobId: string): boolean {
+  return getJob(jobId)?.state === "cancelled";
 }
 
 function assertUsableSources(sources: Awaited<ReturnType<typeof loadSourceGraph>>) {
@@ -44,6 +48,7 @@ export function enqueueAnalysis(jobId: string, analysisId: string, serviceId: st
       setJob(jobId, { state: "fetching", progress: 10, message: "正在读取并整理协议来源" });
       const selected = input.sources.filter((source) => source.selected).slice(0, maxSourceDocuments);
       const sources = await loadSourceGraph(selected, input.renderedHtml, maxSourceDocuments, input.pageUrl);
+      if (isCancelled(jobId)) return;
       assertUsableSources(sources);
       setJob(jobId, { state: "analyzing", progress: 30, message: "来源已就绪，开始多视角分析" });
       let mainAgentSession: MainAgentSession | undefined;
@@ -54,6 +59,7 @@ export function enqueueAnalysis(jobId: string, analysisId: string, serviceId: st
       }, openKnowledge(), (progress) => setJob(jobId, {
         state: progress.stage, progress: progress.progress, message: progress.message, agents: progress.agents
       }));
+      if (isCancelled(jobId)) return;
       saveResult(analysisResultSchema.parse(result));
       if (mainAgentSession) saveAgentSession(analysisId, mainAgentSession);
       setJob(jobId, { state: "complete", progress: 100, message: "分析完成" });
@@ -77,6 +83,7 @@ export function enqueueRecheck(
       setJob(jobId, { state: "fetching", progress: 12, message: "正在重新抓取并计算内容指纹" });
       const selected = input.sources.filter((source) => source.selected).slice(0, maxSourceDocuments);
       const sources = await loadSourceGraph(selected, input.renderedHtml, maxSourceDocuments, input.pageUrl);
+      if (isCancelled(jobId)) return;
       assertUsableSources(sources);
       let route = routeChangedContent(previousResult.sources, sources);
       const now = new Date().toISOString();
@@ -87,6 +94,7 @@ export function enqueueRecheck(
         setJob(jobId, { state: "complete", progress: 100, message: "正文未变化，已跳过模型分析" });
         return;
       }
+      if (isCancelled(jobId)) return;
       const knowledge = openKnowledge();
       route = await refineChangeRoute(
         route,
@@ -137,6 +145,7 @@ export function enqueueRecheck(
           ...(progress.agents ?? {})
         }
       }));
+      if (isCancelled(jobId)) return;
       saveResult(analysisResultSchema.parse(result));
       if (mainAgentSession) saveAgentSession(analysisId, mainAgentSession);
       const previousTitles = new Set(previousResult.findings.map((finding) => finding.title));
@@ -164,7 +173,36 @@ export function enqueueRecheck(
   pump();
 }
 
-export function newJob(analysisId: string): JobStatus {
+export function enqueueVersionCheck(
+  jobId: string,
+  analysisId: string,
+  serviceId: string,
+  input: CreateAnalysisInput,
+  previousResult: AnalysisResult
+) {
+  queue.push(async () => {
+    try {
+      setJob(jobId, { state: "fetching", progress: 12, message: "正在检查协议版本是否变化" });
+      const selected = input.sources.filter((source) => source.selected).slice(0, maxSourceDocuments);
+      const sources = await loadSourceGraph(selected, input.renderedHtml, maxSourceDocuments, input.pageUrl);
+      if (isCancelled(jobId)) return;
+      assertUsableSources(sources);
+      const changed = routeChangedContent(previousResult.sources, sources).changed;
+      discardAnalysisRecordForJob(jobId, analysisId, previousResult.id);
+      setJob(jobId, {
+        state: "complete",
+        progress: 100,
+        message: changed ? "检测到协议版本变化，请点击开始分析" : "协议版本未变化，可直接沿用历史分析"
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "版本检查失败";
+      setJob(jobId, { state: "failed", progress: 100, message: "版本检查失败", error: message });
+    }
+  });
+  pump();
+}
+
+export function newJob(analysisId: string, kind: JobStatus["kind"] = "analysis"): JobStatus {
   const now = new Date().toISOString();
-  return { id: randomUUID(), analysisId, state: "queued", progress: 0, message: "任务已进入队列", createdAt: now, updatedAt: now };
+  return { id: randomUUID(), analysisId, kind, state: "queued", progress: 0, message: "任务已进入队列", createdAt: now, updatedAt: now };
 }

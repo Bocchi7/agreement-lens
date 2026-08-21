@@ -34,6 +34,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
     analysis_id TEXT NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL DEFAULT 'analysis',
     state TEXT NOT NULL,
     progress INTEGER NOT NULL,
     message TEXT NOT NULL,
@@ -70,6 +71,11 @@ try {
 } catch {
   // Existing databases already have this column.
 }
+try {
+  db.exec("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'analysis'");
+} catch {
+  // Existing databases already have this column.
+}
 
 export function createAnalysisRecord(record: {
   id: string; serviceId: string; serviceName: string; pageUrl: string;
@@ -79,11 +85,12 @@ export function createAnalysisRecord(record: {
     (id, service_id, service_name, page_url, context_json, request_json, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(record.id, record.serviceId, record.serviceName, record.pageUrl, JSON.stringify(record.context), JSON.stringify(record.request), record.job.createdAt, record.job.updatedAt);
-  db.prepare(`INSERT INTO jobs (id, analysis_id, state, progress, message, agents_json, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+  db.prepare(`INSERT INTO jobs (id, analysis_id, kind, state, progress, message, agents_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(
       record.job.id,
       record.id,
+      record.job.kind,
       record.job.state,
       record.job.progress,
       record.job.message,
@@ -118,11 +125,27 @@ export function getJob(id: string): JobStatus | undefined {
   if (!row) return;
   return {
     id: row.id as string, analysisId: row.analysis_id as string,
+    kind: (row.kind as JobStatus["kind"] | undefined) ?? "analysis",
     state: row.state as JobStatus["state"], progress: row.progress as number,
     message: row.message as string, error: row.error as string | undefined,
     agents: row.agents_json ? JSON.parse(row.agents_json as string) : undefined,
     createdAt: row.created_at as string, updatedAt: row.updated_at as string
   };
+}
+
+export function cancelJob(id: string): JobStatus | undefined {
+  const current = getJob(id);
+  if (!current || ["complete", "failed", "cancelled"].includes(current.state)) return current;
+  const next: JobStatus = {
+    ...current,
+    state: "cancelled",
+    progress: current.progress,
+    message: "分析已中断",
+    updatedAt: new Date().toISOString()
+  };
+  db.prepare("UPDATE jobs SET state=?, message=?, updated_at=? WHERE id=?")
+    .run(next.state, next.message, next.updatedAt, id);
+  return next;
 }
 
 export function saveResult(result: AnalysisResult) {

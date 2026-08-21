@@ -26,6 +26,7 @@ export interface RecheckInput {
   sources?: CreateAnalysisInput["sources"];
   context?: CreateAnalysisInput["context"];
   renderedHtml?: string;
+  checkOnly?: boolean;
 }
 
 const baseUrl = "http://127.0.0.1:4317";
@@ -80,6 +81,7 @@ export const api = {
   createAnalysis: (input: CreateAnalysisInput) => request<{ analysisId: string; jobId: string }>("/v1/analyses", { method: "POST", body: JSON.stringify(input) }),
   history: (limit = 50) => request<{ analyses: HistoryEntry[] }>(`/v1/analyses/history?limit=${Math.max(1, Math.min(100, Math.floor(limit)))}`),
   getJob: (id: string) => request<JobStatus>(`/v1/jobs/${id}`),
+  cancelJob: (id: string) => request<JobStatus>(`/v1/jobs/${id}/cancel`, { method: "POST" }),
   getAnalysis: (id: string) => request<AnalysisResult>(`/v1/analyses/${id}`),
   followUp: (id: string, message: string, history: Array<{ role: "user" | "assistant"; text: string }>) => request<FollowUpResponse>(
     `/v1/analyses/${id}/follow-up`,

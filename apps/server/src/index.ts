@@ -11,11 +11,11 @@ import {
 } from "@agreement-lens/shared";
 import { answerFollowUp } from "@agreement-lens/agent-core";
 import {
-  cleanupExpired, createAnalysisRecord, db, deleteAnalysis, getAgentSession, getAnalysis,
+  cancelJob, cleanupExpired, createAnalysisRecord, db, deleteAnalysis, getAgentSession, getAnalysis,
   getAnalysisRequest, getJob, getVersionComparisons, listRecentAnalyses, openKnowledge,
   saveAgentSession, setSaved
 } from "./db.js";
-import { enqueueAnalysis, enqueueRecheck, newJob } from "./jobs.js";
+import { enqueueAnalysis, enqueueRecheck, enqueueVersionCheck, newJob } from "./jobs.js";
 import { allowedExtensionId, serverPort } from "./config.js";
 import { repoRoot } from "./config.js";
 import { mergeSupplementalSources } from "./supplemental-sources.js";
@@ -98,6 +98,11 @@ app.get("/v1/analyses/history", async (request) => {
 
 app.get("/v1/jobs/:id", async (request, reply) => {
   const job = getJob((request.params as { id: string }).id);
+  return job ?? reply.code(404).send({ error: "任务不存在" });
+});
+
+app.post("/v1/jobs/:id/cancel", async (request, reply) => {
+  const job = cancelJob((request.params as { id: string }).id);
   return job ?? reply.code(404).send({ error: "任务不存在" });
 });
 
@@ -206,7 +211,7 @@ app.post("/v1/services/:id/recheck", async (request, reply) => {
   const previousResult = getAnalysis(service.latest_analysis_id);
   if (!previous || !previousResult) return reply.code(404).send({ error: "历史分析不存在" });
   const body = request.body && typeof request.body === "object"
-    ? request.body as Partial<CreateAnalysisInput>
+    ? request.body as Partial<CreateAnalysisInput> & { checkOnly?: boolean }
     : {};
   const inputCandidate = {
     ...(previous.request as CreateAnalysisInput),
@@ -223,12 +228,14 @@ app.post("/v1/services/:id/recheck", async (request, reply) => {
   }
   const input = parsedInput.data;
   const analysisId = randomUUID();
-  const job = newJob(analysisId);
+  const checkOnly = body.checkOnly === true;
+  const job = newJob(analysisId, checkOnly ? "version-check" : "recheck");
   createAnalysisRecord({
     id: analysisId, serviceId, serviceName: previous.serviceName,
     pageUrl: previous.pageUrl, context: previous.context, request: input, job
   });
-  enqueueRecheck(job.id, analysisId, serviceId, input, previousResult);
+  if (checkOnly) enqueueVersionCheck(job.id, analysisId, serviceId, input, previousResult);
+  else enqueueRecheck(job.id, analysisId, serviceId, input, previousResult);
   return reply.code(202).send({ analysisId, jobId: job.id });
 });
 
