@@ -1391,12 +1391,28 @@ function PrepareScreen(props: {
   onOpenHistoryEntry: () => void; onCancel?: () => void;
 }) {
   const { snapshot, sources, setSources, context, setContext } = props;
+  const historyVersionSummary = props.currentHistory?.versionInfoAvailable
+    ? props.currentHistory.versionConsistent
+      ? "历史记录之间采用的是同一正文版本"
+      : "历史记录之间采用过多个正文版本，请注意版本差异"
+    : "暂时无法读取历史版本信息";
+  const currentVersionSummary = props.historyCheckState === "checking"
+    ? "正在检查当前协议是否变化"
+    : props.historyCheckState === "unchanged"
+      ? "当前协议与历史版本一致"
+      : props.historyCheckState === "changed"
+        ? "当前协议与历史版本相比已有变化"
+        : props.historyCheckState === "failed"
+          ? "版本检查失败，请重试"
+          : props.historyCheckState === "cancelled"
+            ? "版本检查已中断，点击开始分析可直接分析"
+            : "正在检查当前协议版本";
   return <main className="prepare">
     <section className="page-intro"><p className="eyebrow">当前页面</p><h1>{snapshot?.pageTitle ?? "未识别页面"}</h1><p className="page-url">{snapshot?.pageUrl}</p><div className="scan-summary"><CheckCircle2 size={17} /><span>发现 {sources.length} 份可能相关的规则</span></div></section>
     {props.historyLoading && <div className="history-preview loading"><LoaderCircle size={16} className="spin" /><span>正在查找当前网页的历史分析</span></div>}
     {!props.historyLoading && props.currentHistory && <button className="history-preview" type="button" onClick={props.onOpenHistoryEntry}>
       <span className="history-preview-icon"><History size={17} /></span>
-      <span className="history-preview-main"><strong>已有历史分析</strong><small>{formatHistoryDate(props.currentHistory.updatedAt || props.currentHistory.createdAt)} · {props.currentHistory.sourceCount} 份材料 · {props.currentHistory.findingCount} 项告警 · {props.currentHistory.versionInfoAvailable ? `${props.currentHistory.versionCount} 个正文版本` : "正文版本信息暂不可用"}</small><em>{props.currentHistory.versionInfoAvailable ? (props.currentHistory.versionConsistent ? "历史分析采用的协议版本一致" : "历史分析采用过多个不同正文版本，请注意版本差异") : "暂时无法读取历史版本信息"}；{props.historyCheckState === "checking" ? "正在检查当前协议是否变化" : props.historyCheckState === "unchanged" ? "当前协议未变化" : props.historyCheckState === "changed" ? "当前协议已变化" : props.historyCheckState === "failed" ? "版本检查失败，请重试" : props.historyCheckState === "cancelled" ? "版本检查已中断，点击开始分析可直接分析" : "正在检查当前协议版本"}</em></span>
+      <span className="history-preview-main"><strong>已有历史分析</strong><small>{formatHistoryDate(props.currentHistory.updatedAt || props.currentHistory.createdAt)} · {props.currentHistory.sourceCount} 份材料 · {props.currentHistory.findingCount} 项告警 · {props.currentHistory.versionInfoAvailable ? `${props.currentHistory.versionCount} 个正文版本` : "正文版本信息暂不可用"}</small><em><span>{historyVersionSummary}</span><span>{currentVersionSummary}</span></em></span>
       <ChevronRight size={17} />
     </button>}
     {props.historyCheckState === "checking" && props.onCancel && <button className="text-button history-check-cancel" onClick={props.onCancel}><X size={14} />中断版本检查</button>}

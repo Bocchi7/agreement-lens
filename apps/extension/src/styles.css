@@ -55,6 +55,7 @@ button { color: inherit; }
 .history-preview-main strong { font-size: 11px; }
 .history-preview-main small { margin-top: 4px; color: #65736b; font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .history-preview-main em { margin-top: 5px; color: #28634f; font-size: 9px; line-height: 1.4; font-style: normal; }
+.history-preview-main em span { display: block; }
 .history-check-cancel { margin: -6px 18px 14px; color: #983623; }
 .running-history { width: min(100%, 360px); margin: 12px auto 18px; padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; border: 1px solid #cadbd1; border-radius: 6px; background: #edf5f0; color: #28634f; font-size: 10px; line-height: 1.45; text-align: left; }
 .running-history svg { flex: none; margin-top: 1px; }
