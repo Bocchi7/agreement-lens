@@ -81,6 +81,17 @@ export const sourceDocumentSchema = z.object({
 });
 export type SourceDocument = z.infer<typeof sourceDocumentSchema>;
 
+export const analysisInputSourceSchema = discoveredSourceSchema.omit({
+  dataBase64: true,
+  renderedHtml: true
+});
+export const analysisInputSchema = z.object({
+  pageUrl: z.string().url(),
+  sources: z.array(analysisInputSourceSchema),
+  context: userContextSchema
+});
+export type AnalysisInputSnapshot = z.infer<typeof analysisInputSchema>;
+
 export const evidenceReferenceSchema = z.object({
   sourceId: z.string(),
   sectionId: z.string(),
@@ -126,6 +137,7 @@ export const analysisResultSchema = z.object({
   topFindingIds: z.array(z.string()).max(3),
   followUpSuggestions: z.array(z.string().max(200)).max(5).default([]),
   sources: z.array(sourceDocumentSchema),
+  analysisInput: analysisInputSchema.optional(),
   coverageGaps: z.array(coverageGapSchema),
   actionChecklist: z.array(z.string()),
   createdAt: z.string(),

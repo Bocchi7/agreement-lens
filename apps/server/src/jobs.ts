@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { analysisResultSchema, maxSourceDocuments, type CreateAnalysisInput, type JobStatus } from "@agreement-lens/shared";
+import { analysisResultSchema, maxSourceDocuments, type AnalysisInputSnapshot, type CreateAnalysisInput, type JobStatus } from "@agreement-lens/shared";
 import type { AnalysisResult, VersionComparison } from "@agreement-lens/shared";
-import { refineChangeRoute, routeChangedContent, runWorkflow } from "@agreement-lens/agent-core";
+import { routeChangedContent, runWorkflow } from "@agreement-lens/agent-core";
 import type { MainAgentSession } from "@agreement-lens/agent-core";
 import { discardAnalysisRecordForJob, getAgentSession, getJob, openKnowledge, saveAgentSession, saveResult, saveVersionComparison, updateJob } from "./db.js";
 import { loadSourceGraph } from "./sources.js";
@@ -11,6 +11,16 @@ import path from "node:path";
 const queue: Array<() => Promise<void>> = [];
 let active = 0;
 const maxConcurrency = 2;
+
+function analysisInputSnapshot(input: CreateAnalysisInput): AnalysisInputSnapshot {
+  return {
+    pageUrl: input.pageUrl,
+    sources: input.sources
+      .filter((source) => source.selected)
+      .map(({ dataBase64: _dataBase64, renderedHtml: _renderedHtml, ...source }) => source),
+    context: input.context
+  };
+}
 
 function pump() {
   while (active < maxConcurrency && queue.length) {
@@ -55,6 +65,7 @@ export function enqueueAnalysis(jobId: string, analysisId: string, serviceId: st
       const result = await runWorkflow({
         analysisId, serviceId, serviceName: input.serviceName,
         sources, context: input.context, promptDir: path.join(repoRoot, "prompts"),
+        analysisInput: analysisInputSnapshot(input),
         onMainAgentSession: (session) => { mainAgentSession = session; }
       }, openKnowledge(), (progress) => setJob(jobId, {
         state: progress.stage, progress: progress.progress, message: progress.message, agents: progress.agents
@@ -95,35 +106,12 @@ export function enqueueRecheck(
         return;
       }
       if (isCancelled(jobId)) return;
-      const knowledge = openKnowledge();
-      route = await refineChangeRoute(
-        route,
-        previousResult.sources,
-        sources,
-        knowledge,
-        path.join(repoRoot, "prompts"),
-        (routerProgress) => {
-          const current = getJob(jobId);
-          if (!current) return;
-          setJob(jobId, {
-            state: "analyzing",
-            progress: 25,
-            message: routerProgress.message ?? "正在判断需要复核的视角",
-            agents: { ...(current.agents ?? {}), router: {
-              status: "running",
-              rounds: 0,
-              retries: 0,
-              ...current.agents?.router,
-              ...routerProgress
-            } }
-          });
-        }
-      );
       setJob(jobId, {
         state: "analyzing",
         progress: 32,
-        message: route.structural ? "检测到结构性变化，正在全面复核" : `正在复核 ${route.domains.length} 个受影响视角`
+        message: "检测到原文变化，正在基于新材料重新分析"
       });
+      const knowledge = openKnowledge();
       let mainAgentSession: MainAgentSession | undefined;
       const result = await runWorkflow({
         analysisId,
@@ -132,8 +120,7 @@ export function enqueueRecheck(
         sources,
         context: input.context,
         promptDir: path.join(repoRoot, "prompts"),
-        domains: route.domains,
-        previousResult,
+        analysisInput: analysisInputSnapshot(input),
         saved: true,
         onMainAgentSession: (session) => { mainAgentSession = session; }
       }, knowledge, (progress) => setJob(jobId, {
@@ -148,18 +135,16 @@ export function enqueueRecheck(
       if (isCancelled(jobId)) return;
       saveResult(analysisResultSchema.parse(result));
       if (mainAgentSession) saveAgentSession(analysisId, mainAgentSession);
-      const previousTitles = new Set(previousResult.findings.map((finding) => finding.title));
-      const added = result.findings.filter((finding) => !previousTitles.has(finding.title)).map((finding) => finding.title);
       const comparison: VersionComparison = {
         id: randomUUID(),
         serviceId,
         previousAnalysisId: previousResult.id,
         currentAnalysisId: analysisId,
         changed: true,
-        summary: added.length ? `新增或显著变化的风险：${added.slice(0, 3).join("、")}` : "条款内容有变化，风险结论已重新核验。",
-        decisionImpact: previousResult.recommendation === result.recommendation
-          ? `整体建议仍为“${result.recommendation}”，请重点查看变化章节。`
-          : `整体建议由“${previousResult.recommendation}”变为“${result.recommendation}”。`,
+        summary: route.changedSections.length
+          ? `原文变化位置：${route.changedSections.slice(0, 3).join("、")}${route.changedSections.length > 3 ? "等" : ""}`
+          : "协议原文材料发生变化，已基于新材料重新分析。",
+        decisionImpact: "本次结论完全基于当前抓取的协议原文重新生成，未复用历史分析结论。",
         changedSections: route.changedSections,
         createdAt: now
       };

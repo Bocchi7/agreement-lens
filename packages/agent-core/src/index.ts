@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   type AnalysisResult,
+  type AnalysisInputSnapshot,
   type AgentProgress,
   type Finding,
   type SourceDocument,
@@ -38,6 +39,7 @@ export interface WorkflowInput {
   serviceId: string;
   serviceName: string;
   sources: SourceDocument[];
+  analysisInput?: AnalysisInputSnapshot;
   context: UserContext;
   saved?: boolean;
   promptDir?: string;
@@ -492,6 +494,7 @@ export async function runWorkflow(
     topFindingIds: decision.topFindingIds.length ? decision.topFindingIds : findings.filter((finding) => finding.status === "verified").slice(0, 3).map((finding) => finding.id),
     followUpSuggestions: decision.followUpSuggestions,
     sources: input.sources,
+    analysisInput: input.analysisInput,
     coverageGaps: gaps,
     actionChecklist: decision.actionChecklist,
     createdAt: now,

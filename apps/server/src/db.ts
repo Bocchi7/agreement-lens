@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
-import type { AnalysisResult, JobStatus, UserContext, VersionComparison } from "@agreement-lens/shared";
+import type { AnalysisInputSnapshot, AnalysisResult, CreateAnalysisInput, JobStatus, UserContext, VersionComparison } from "@agreement-lens/shared";
 import type { MainAgentSession } from "@agreement-lens/agent-core";
 import { appDbPath, dataDir, knowledgeDbPath, snapshotDir } from "./config.js";
 import { runKnowledgeShell } from "./knowledge-shell.js";
@@ -170,8 +170,20 @@ export function getAgentSession(analysisId: string): MainAgentSession | undefine
 }
 
 export function getAnalysis(id: string): AnalysisResult | undefined {
-  const row = db.prepare("SELECT result_json FROM analyses WHERE id=?").get(id) as { result_json: string | null } | undefined;
-  return row?.result_json ? JSON.parse(row.result_json) as AnalysisResult : undefined;
+  const row = db.prepare("SELECT result_json, request_json FROM analyses WHERE id=?").get(id) as { result_json: string | null; request_json: string } | undefined;
+  if (!row?.result_json) return;
+  const result = JSON.parse(row.result_json) as AnalysisResult;
+  if (!result.analysisInput && row.request_json) {
+    const request = JSON.parse(row.request_json) as CreateAnalysisInput;
+    result.analysisInput = {
+      pageUrl: request.pageUrl,
+      sources: request.sources
+        .filter((source) => source.selected)
+        .map(({ dataBase64: _dataBase64, renderedHtml: _renderedHtml, ...source }) => source),
+      context: request.context
+    } satisfies AnalysisInputSnapshot;
+  }
+  return result;
 }
 
 export function listRecentAnalyses(limit = 50) {

@@ -1212,33 +1212,6 @@ export function App() {
     }
   }
 
-  async function removeAnalysis() {
-    if (!result) return;
-    await api.delete(result.id);
-    if (historyMode) {
-      setResult(null);
-      setMessages([]);
-      setHistoryMode(false);
-      setHistoryPageUrl(null);
-      await refreshHistory();
-      setPhase("history");
-      return;
-    }
-    if (chromeAvailable()) {
-      const stored = await chrome.storage.local.get("savedServices");
-      const savedServices = { ...(stored.savedServices ?? {}) } as Record<string, string>;
-      for (const [host, serviceId] of Object.entries(savedServices)) {
-        if (serviceId === result.serviceId) delete savedServices[host];
-      }
-      await chrome.storage.local.set({ savedServices });
-    }
-    if (snapshot?.tabId !== undefined) await clearAnalysisState(snapshot.tabId);
-    setResult(null);
-    setMessages([]);
-    setView("overview");
-    setPhase("prepare");
-  }
-
   const topFindings = useMemo(() => result?.topFindingIds.map((id) => result.findings.find((item) => item.id === id)).filter(Boolean) as Finding[] ?? [], [result]);
   const historyLauncher = phase === "pair" || phase === "loading" || phase === "offline" ? undefined : openHistory;
 
@@ -1253,7 +1226,7 @@ export function App() {
   if (phase === "history") return <Shell onOpenHistory={historyLauncher}><HistoryScreen entries={historyEntries} loading={historyLoading} error={historyError} loadingId={historyLoadingId} deletingId={historyDeletingId} onRetry={() => void refreshHistory()} onOpen={openHistoryEntry} onDelete={deleteHistoryEntry} onBack={returnFromHistory} hasReturn={Boolean(historyReturn)} /></Shell>;
   if ((phase === "result" || (phase === "running" && preserveResultWhileRunning)) && result) {
     return <Shell onOpenHistory={historyLauncher}>
-      <ResultHeader result={result} saving={saving} historyMode={historyMode} onHistory={() => historyMode ? returnFromHistory() : void openHistory()} onSave={() => void saveAnalysis()} onDelete={() => void removeAnalysis()} />
+      <ResultHeader result={result} saving={saving} historyMode={historyMode} onHistory={() => historyMode ? returnFromHistory() : void openHistory()} onSave={() => void saveAnalysis()} />
       {(supplementing || (phase === "running" && job)) && <section className="supplement-progress"><LoaderCircle className="spin" size={16} /><div><strong>{supplementing ? "正在读取补充材料" : job?.message ?? "正在深入分析"}</strong><p>{supplementing ? "原分析结果会保留，读取完成后再启动分析。" : `当前进度 ${job?.progress ?? 0}%`}</p></div>{job && <button className="icon-button compact-icon" title="中断当前任务" onClick={() => void cancelRunningJob()}><X size={15} /></button>}</section>}
       {error && <p className="inline-error result-error">{error}</p>}
       <nav className="tabs">
@@ -1468,19 +1441,37 @@ function RunningScreen({ job, sources, currentHistory, historyCheckState, onCanc
   })}</div><button className="cancel-analysis" onClick={onCancel}><X size={15} />中断并返回</button><p className="muted small">关闭侧边栏不会中断任务</p></main>;
 }
 
-function ResultHeader({ result, saving, historyMode, onHistory, onSave, onDelete }: { result: AnalysisResult; saving: boolean; historyMode: boolean; onHistory: () => void; onSave: () => void; onDelete: () => void }) {
+function ResultHeader({ result, saving, historyMode, onHistory, onSave }: { result: AnalysisResult; saving: boolean; historyMode: boolean; onHistory: () => void; onSave: () => void }) {
   const meta = recommendationMeta[result.recommendation];
-  return <header className="result-header"><div><p>{historyMode ? "历史分析 · " : ""}{result.serviceName}</p><h1 className={meta.tone}>{meta.label}</h1></div><div className="header-actions">{historyMode && <button className="icon-button light" title="返回最近分析" onClick={onHistory}><History size={17} /></button>}<button className="icon-button light" disabled={saving || result.saved} title={result.saved ? "已保存" : saving ? "正在保存" : "保存本次分析"} onClick={onSave}>{saving ? <LoaderCircle size={17} className="spin" /> : result.saved ? <Check size={17} /> : <Save size={17} />}</button><button className="icon-button light delete-action" title="删除本次分析" onClick={onDelete}><X size={17} /></button></div></header>;
+  return <header className="result-header"><div><p>{historyMode ? "历史分析 · " : ""}{result.serviceName}</p><h1 className={meta.tone}>{meta.label}</h1></div><div className="header-actions">{historyMode && <button className="icon-button light" title="返回最近分析" onClick={onHistory}><ArrowLeft size={17} /></button>}<button className="icon-button light" disabled={saving || result.saved} title={result.saved ? "已保存" : saving ? "正在保存" : "保存本次分析"} onClick={onSave}>{saving ? <LoaderCircle size={17} className="spin" /> : result.saved ? <Check size={17} /> : <Save size={17} />}</button></div></header>;
 }
 
 function Overview({ result, topFindings, openEvidence, setView }: { result: AnalysisResult; topFindings: Finding[]; openEvidence: (finding: Finding) => void; setView: (view: View) => void }) {
   return <><section className="decision"><p>{result.recommendationReason}</p>{result.actionChecklist.length > 0 && <div className="checklist"><strong>确认前建议</strong>{result.actionChecklist.slice(0, 3).map((item) => <span key={item}><CheckCircle2 size={16} />{item}</span>)}</div>}</section>
+    <AnalysisInputView input={result.analysisInput} />
     <section className="result-section"><div className="result-title"><div><AlertTriangle size={18} /><h2>重点告警</h2></div><button onClick={() => setView("risks")}>查看全部 {result.findings.length}</button></div>
       <div className="finding-list">{topFindings.map((finding, index) => <FindingRow key={finding.id} finding={finding} index={index + 1} onClick={() => openEvidence(finding)} />)}</div>
       {!topFindings.length && <div className="empty-inline"><CheckCircle2 size={22} /><span>已读材料中暂未发现可核验的重点告警</span></div>}
     </section>
     {result.coverageGaps.length > 0 && <section className="coverage"><AlertTriangle size={17} /><div><strong>仍有 {result.coverageGaps.length} 项待核实</strong><p>{coverageGapSummary(result.coverageGaps[0])}</p></div></section>}
   </>;
+}
+
+function AnalysisInputView({ input }: { input: AnalysisResult["analysisInput"] }) {
+  const action = actionOptions.find((item) => item.value === input?.context.action)?.label ?? input?.context.action;
+  const concerns = input?.context.concerns.map((concern) => concernOptions.find((item) => item.value === concern)?.label ?? concern) ?? [];
+  return <details className="analysis-input">
+    <summary><FileText size={16} /><strong>本次分析设置</strong><span>查看材料与关注点</span><ChevronRight size={16} /></summary>
+    {!input
+      ? <p className="analysis-input-empty">这条历史分析未保存当时的分析设置。</p>
+      : <div className="analysis-input-body">
+        <div className="analysis-input-group"><strong>确认分析材料 · {input.sources.length} 份</strong><div className="analysis-input-sources">{input.sources.map((source) => <div className="analysis-input-source" key={source.id}><span>{source.title}</span>{source.url ? <a href={source.url} target="_blank" rel="noreferrer" title="打开当时选择的材料">{source.url}</a> : <small>{source.text?.replace(/\s+/g, " ").trim().slice(0, 180) || "手动提供的文本"}</small>}</div>)}</div></div>
+        <div className="analysis-input-group"><strong>这次你准备做什么</strong><p>{action || "未记录"}</p></div>
+        <div className="analysis-input-group"><strong>你更在意哪些问题</strong><p>{concerns.length ? concerns.join("、") : "未特别指定"}</p></div>
+        {input.context.redlines.length > 0 && <div className="analysis-input-group"><strong>不能接受的情况</strong><p>{input.context.redlines.join("、")}</p></div>}
+        {input.context.notes && <div className="analysis-input-group"><strong>补充说明</strong><p>{input.context.notes}</p></div>}
+      </div>}
+  </details>;
 }
 
 function FindingRow({ finding, index, onClick }: { finding: Finding; index: number; onClick: () => void }) {
