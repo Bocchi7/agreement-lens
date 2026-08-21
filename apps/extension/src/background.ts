@@ -2,12 +2,14 @@ import type { PageSnapshot } from "./types";
 import { resolveAgreementLinksFromLoadedScripts, resolveDynamicAgreementLinks } from "./dynamic-discovery";
 import { setTabBadge as updateTabBadge } from "./tab-badge";
 import { mergeDiscoveredSources } from "./frame-discovery";
+import { needsRenderedFallback, visibleTextLength } from "./html-readiness";
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
 
 const MAX_HTML_BYTES = 2_000_000;
 const MAX_PDF_BYTES = 8_000_000;
 const MAX_BROWSER_SOURCES = 8;
+const DIRECT_HTML_TIMEOUT_MS = 20_000;
 
 interface BrowserSourceRequest {
   id: string;
@@ -115,7 +117,7 @@ async function captureRenderedTab(tabId: number): Promise<CapturedRenderedPage> 
     url: string;
     links: CapturedAgreementLink[];
   };
-  const capture = async (target: CaptureTarget) => chrome.scripting.executeScript({
+  const capture = async (target: CaptureTarget): Promise<Array<{ result?: unknown }>> => chrome.scripting.executeScript({
     target,
     func: async () => {
       const visibleTextLength = () => {
@@ -125,17 +127,14 @@ async function captureRenderedTab(tabId: number): Promise<CapturedRenderedPage> 
         clone.querySelectorAll("script,style,noscript,template").forEach((node) => node.remove());
         return (clone.textContent ?? "").replace(/\s+/g, " ").trim().length;
       };
-      let previousLength = -1;
-      let stablePolls = 0;
       const startedAt = Date.now();
-      for (let attempt = 0; attempt < 60; attempt += 1) {
+      for (let attempt = 0; attempt < 12; attempt += 1) {
         const textLength = visibleTextLength();
-        if (textLength === previousLength) stablePolls += 1;
-        else stablePolls = 0;
-        previousLength = textLength;
         const elapsed = Date.now() - startedAt;
-        if (textLength >= 300 && elapsed >= 2_000 && stablePolls >= 4) break;
-        if (textLength >= 80 && elapsed >= 12_000 && stablePolls >= 4) break;
+        // A readable agreement is more valuable than a perfectly idle page.
+        // Sites with timers or analytics can keep mutating their DOM forever.
+        if (textLength >= 300 && elapsed >= 500) break;
+        if (textLength >= 80 && (document.readyState === "complete" || elapsed >= 4_000)) break;
         await new Promise((resolve) => setTimeout(resolve, 500));
       }
       const clone = document.documentElement.cloneNode(true) as HTMLElement;
@@ -189,7 +188,9 @@ async function captureRenderedTab(tabId: number): Promise<CapturedRenderedPage> 
   });
   let rendered: Array<{ result?: unknown }> = [];
   try {
-    rendered = await capture({ tabId, allFrames: true });
+    // Read the top-level document first. An unrelated slow iframe must not
+    // hold up a complete agreement document in the main frame.
+    rendered = await capture({ tabId });
   } catch {
     try {
       const frames = await chrome.webNavigation.getAllFrames({ tabId });
@@ -210,13 +211,11 @@ async function captureRenderedTab(tabId: number): Promise<CapturedRenderedPage> 
         && typeof (entry as { textLength?: unknown }).textLength === "number"));
   if ((candidates.sort((left, right) => right.textLength - left.textLength)[0]?.textLength ?? 0) < 80) {
     try {
-      const frames = await chrome.webNavigation.getAllFrames({ tabId });
-      const frameResults = await Promise.allSettled(
-        (frames ?? []).map((frame) => capture({ tabId, frameIds: [frame.frameId] }))
-      );
-      candidates = frameResults
-        .flatMap((item) => item.status === "fulfilled" ? item.value : [])
-        .map((entry) => entry.result)
+      const frameResults = await capture({ tabId, allFrames: true });
+      candidates = [
+        ...candidates,
+        ...frameResults.flatMap((entry) => entry.result ? [entry.result] : [])
+      ]
         .filter((entry): entry is RenderedFrameResult =>
           Boolean(entry && typeof entry === "object"
             && typeof (entry as { html?: unknown }).html === "string"
@@ -298,6 +297,60 @@ async function fetchCurrentTabSource(
   }
 }
 
+async function fetchStaticHtmlSource(
+  source: BrowserSourceRequest,
+  startedAt: number
+): Promise<BrowserFetchedSource | undefined> {
+  try {
+    const response = await fetch(source.url, {
+      credentials: "include",
+      redirect: "follow",
+      signal: AbortSignal.timeout(DIRECT_HTML_TIMEOUT_MS)
+    });
+    if (!response.ok) throw new Error(`来源返回 HTTP ${response.status}`);
+    const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+    if (contentType && !contentType.includes("html") && !contentType.includes("xhtml")) {
+      throw new Error(`来源不是 HTML 页面（${contentType}）`);
+    }
+    const html = await response.text();
+    if (!html) throw new Error("来源返回空白页面");
+    if (html.length > MAX_HTML_BYTES) throw new Error("页面超过 2 MB");
+    const textLength = visibleTextLength(html);
+    if (textLength < 80) throw new Error(`静态正文过短（仅 ${textLength} 字）`);
+    if (needsRenderedFallback(html)) {
+      console.info("[agreement-lens] static source needs rendered fallback", {
+        sourceId: source.id,
+        sourceUrl: source.url,
+        responseUrl: response.url,
+        textLength
+      });
+      return undefined;
+    }
+    console.info("[agreement-lens] browser source fetched directly", {
+      sourceId: source.id,
+      sourceUrl: source.url,
+      responseUrl: response.url,
+      textLength,
+      htmlLength: html.length,
+      elapsedMs: Date.now() - startedAt
+    });
+    return {
+      ...source,
+      renderedHtml: html,
+      textLength,
+      linkedSources: []
+    };
+  } catch (error) {
+    console.info("[agreement-lens] direct source fetch unavailable; using rendered fallback", {
+      sourceId: source.id,
+      sourceUrl: source.url,
+      elapsedMs: Date.now() - startedAt,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return undefined;
+  }
+}
+
 async function fetchRenderedSource(
   source: BrowserSourceRequest,
   preferredTabId?: number
@@ -342,6 +395,9 @@ async function fetchRenderedSource(
     }
   }
 
+  const directlyFetchedSource = await fetchStaticHtmlSource(source, startedAt);
+  if (directlyFetchedSource) return directlyFetchedSource;
+
   let tabId: number | undefined;
   try {
     console.info("[agreement-lens] opening browser source tab", {
@@ -367,7 +423,7 @@ async function fetchRenderedSource(
         });
       }
     }
-    console.info("[agreement-lens] browser source tab completed", {
+    console.info("[agreement-lens] browser source tab ready for capture", {
       sourceId: source.id,
       sourceUrl: source.url,
       tabId
