@@ -1391,17 +1391,12 @@ function PrepareScreen(props: {
   onOpenHistoryEntry: () => void; onCancel?: () => void;
 }) {
   const { snapshot, sources, setSources, context, setContext } = props;
-  const historyVersionSummary = props.currentHistory?.versionInfoAvailable
-    ? props.currentHistory.versionConsistent
-      ? "历史记录之间采用的是同一正文版本"
-      : "历史记录之间采用过多个正文版本，请注意版本差异"
-    : "暂时无法读取历史版本信息";
   const currentVersionSummary = props.historyCheckState === "checking"
     ? "正在检查当前协议是否变化"
     : props.historyCheckState === "unchanged"
-      ? "当前协议与历史版本一致"
+      ? "当前协议材料与历史分析一致"
       : props.historyCheckState === "changed"
-        ? "当前协议与历史版本相比已有变化"
+        ? "当前协议材料与历史分析不一致，可能发生变化"
         : props.historyCheckState === "failed"
           ? "版本检查失败，请重试"
           : props.historyCheckState === "cancelled"
@@ -1412,7 +1407,7 @@ function PrepareScreen(props: {
     {props.historyLoading && <div className="history-preview loading"><LoaderCircle size={16} className="spin" /><span>正在查找当前网页的历史分析</span></div>}
     {!props.historyLoading && props.currentHistory && <button className="history-preview" type="button" onClick={props.onOpenHistoryEntry}>
       <span className="history-preview-icon"><History size={17} /></span>
-      <span className="history-preview-main"><strong>已有历史分析</strong><small>{formatHistoryDate(props.currentHistory.updatedAt || props.currentHistory.createdAt)} · {props.currentHistory.sourceCount} 份材料 · {props.currentHistory.findingCount} 项告警 · {props.currentHistory.versionInfoAvailable ? `${props.currentHistory.versionCount} 个正文版本` : "正文版本信息暂不可用"}</small><em><span>{historyVersionSummary}</span><span>{currentVersionSummary}</span></em></span>
+      <span className="history-preview-main"><strong>已有历史分析</strong><small>{formatHistoryDate(props.currentHistory.updatedAt || props.currentHistory.createdAt)} · {props.currentHistory.sourceCount} 份材料 · {props.currentHistory.findingCount} 项告警</small><em><span>{currentVersionSummary}</span></em></span>
       <ChevronRight size={17} />
     </button>}
     {props.historyCheckState === "checking" && props.onCancel && <button className="text-button history-check-cancel" onClick={props.onCancel}><X size={14} />中断版本检查</button>}
