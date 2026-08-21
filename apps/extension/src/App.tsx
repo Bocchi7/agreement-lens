@@ -614,32 +614,42 @@ export function App() {
       setError("");
       setPhase("preparing");
       const selectedUrlSources = sources.filter((source) => source.selected && source.url && (source.kind === "url" || source.kind === "pdf"));
+      let browserReaderAvailable = chromeAvailable();
       if (chromeAvailable() && selectedUrlSources.length > 0) {
-        const granted = await chrome.permissions.request({ origins: ["http://*/*", "https://*/*"] });
-        if (!granted) {
-          setError("需要允许读取协议链接及其引用的补充条款，才能完成浏览器渲染和正文提取");
-          setPhase("error");
-          return;
+        try {
+          browserReaderAvailable = await withTimeout(
+            chrome.permissions.request({ origins: ["http://*/*", "https://*/*"] }),
+            10_000,
+            "浏览器来源读取权限请求超时"
+          );
+        } catch (cause) {
+          browserReaderAvailable = false;
+          console.warn("[agreement-lens] browser source permission unavailable; using server URL loader", cause);
         }
       }
       await api.health();
       let preparedSources = sources;
-      if (chromeAvailable()) {
-        const browserSources = await withTimeout(
-          chrome.runtime.sendMessage({
-            type: "FETCH_AGREEMENT_SOURCES",
-            tabId: snapshot.tabId,
-            sources: selectedUrlSources.map((source) => ({
-              id: source.id,
-              title: source.title,
-              url: source.url!,
-              kind: source.kind as "url" | "pdf",
-              relation: source.relation
-            }))
-          }),
-          180_000,
-          "读取协议页面超时，请检查网络或减少本次分析来源"
-        );
+      if (browserReaderAvailable && selectedUrlSources.length > 0) {
+        let browserSources: { sources?: unknown[] } | undefined;
+        try {
+          browserSources = await withTimeout(
+            chrome.runtime.sendMessage({
+              type: "FETCH_AGREEMENT_SOURCES",
+              tabId: snapshot.tabId,
+              sources: selectedUrlSources.map((source) => ({
+                id: source.id,
+                title: source.title,
+                url: source.url!,
+                kind: source.kind as "url" | "pdf",
+                relation: source.relation
+              }))
+            }),
+            75_000,
+            "浏览器读取协议来源超时，改由服务端读取原始 URL"
+          ) as { sources?: unknown[] };
+        } catch (cause) {
+          console.warn("[agreement-lens] browser source acquisition unavailable; using server URL loader", cause);
+        }
         type BrowserPreparedSource = {
           id: string;
           title?: string;
@@ -649,25 +659,18 @@ export function App() {
           renderedHtml?: string;
           dataBase64?: string;
           error?: string;
+          deferToServer?: boolean;
         };
         const acquiredSources = (browserSources?.sources ?? []) as BrowserPreparedSource[];
         const fetched = new Map<string, BrowserPreparedSource>(
           acquiredSources.map((source) => [source.id, source])
         );
-        const failedRoots = selectedUrlSources.flatMap((source) => {
-          const acquired = fetched.get(source.id);
-          if (acquired?.renderedHtml || acquired?.dataBase64) return [];
-          return [`${source.title}：${acquired?.error ?? "浏览器未返回读取结果"}`];
-        });
-        if (failedRoots.length > 0) {
-          setError(`以下协议未能取得正文，已停止本次分析：${failedRoots.join("；")}`);
-          setPhase("error");
-          return;
-        }
         const existingIds = new Set(sources.map((source) => source.id));
         const enrichedRoots = sources.map((source) => {
           const acquired = fetched.get(source.id);
-          return acquired ? { ...source, renderedHtml: acquired.renderedHtml, dataBase64: acquired.dataBase64 } : source;
+          return acquired?.renderedHtml || acquired?.dataBase64
+            ? { ...source, renderedHtml: acquired.renderedHtml, dataBase64: acquired.dataBase64 }
+            : source;
         });
         const browserDiscovered = acquiredSources
           .filter((source) => !existingIds.has(source.id) && source.url && source.title && (source.renderedHtml || source.dataBase64))
@@ -854,23 +857,38 @@ export function App() {
 
       let preparedSources = requestedSources;
       if (chromeAvailable()) {
-        const granted = await chrome.permissions.request({ origins: ["http://*/*", "https://*/*"] });
-        if (!granted) throw new Error("需要允许读取补充协议及其引用页面");
-        const browserSources = await withTimeout(
-          chrome.runtime.sendMessage({
-            type: "FETCH_AGREEMENT_SOURCES",
-            tabId: snapshot?.tabId,
-            sources: requestedSources.map((source) => ({
-              id: source.id,
-              title: source.title,
-              url: source.url!,
-              kind: source.kind as "url" | "pdf",
-              relation: source.relation
-            }))
-          }),
-          180_000,
-          "读取补充协议页面超时"
-        );
+        let browserReaderAvailable = false;
+        try {
+          browserReaderAvailable = await withTimeout(
+            chrome.permissions.request({ origins: ["http://*/*", "https://*/*"] }),
+            10_000,
+            "浏览器来源读取权限请求超时"
+          );
+        } catch (cause) {
+          console.warn("[agreement-lens] supplemental browser permission unavailable; using server URL loader", cause);
+        }
+        let browserSources: { sources?: unknown[] } | undefined;
+        if (browserReaderAvailable) {
+          try {
+            browserSources = await withTimeout(
+              chrome.runtime.sendMessage({
+                type: "FETCH_AGREEMENT_SOURCES",
+                tabId: snapshot?.tabId,
+                sources: requestedSources.map((source) => ({
+                  id: source.id,
+                  title: source.title,
+                  url: source.url!,
+                  kind: source.kind as "url" | "pdf",
+                  relation: source.relation
+                }))
+              }),
+              75_000,
+              "浏览器读取补充协议超时，改由服务端读取原始 URL"
+            ) as { sources?: unknown[] };
+          } catch (cause) {
+            console.warn("[agreement-lens] supplemental browser acquisition unavailable; using server URL loader", cause);
+          }
+        }
         type BrowserPreparedSource = {
           id: string;
           title?: string;
@@ -880,29 +898,23 @@ export function App() {
           renderedHtml?: string;
           dataBase64?: string;
           error?: string;
+          deferToServer?: boolean;
         };
         const acquired = (browserSources?.sources ?? []) as BrowserPreparedSource[];
         const acquiredById = new Map(acquired.map((source) => [source.id, source]));
-        const failedRoots = requestedSources.flatMap((source) => {
-          const fetched = acquiredById.get(source.id);
-          if (fetched?.renderedHtml || fetched?.dataBase64) return [];
-          return [`${source.title}：${fetched?.error ?? "浏览器未返回读取结果"}`];
-        });
-        if (failedRoots.length) throw new Error(`以下补充材料未能取得正文：${failedRoots.join("；")}`);
-
         const includedUrls = new Set(result.sources.map((source) => source.url).filter((url): url is string => Boolean(url)));
-        preparedSources = acquired
-          .filter((source) => source.url && source.title && (source.renderedHtml || source.dataBase64) && !includedUrls.has(source.url))
-          .map((source) => ({
-            id: source.id,
-            kind: source.kind ?? "url",
-            title: source.title!,
-            url: source.url!,
-            renderedHtml: source.renderedHtml,
-            dataBase64: source.dataBase64,
-            selected: true,
-            relation: source.relation ?? "direct"
-          } satisfies DiscoveredSource))
+        preparedSources = requestedSources
+          .filter((source) => source.url && !includedUrls.has(source.url))
+          .map((source) => {
+            const fetched = acquiredById.get(source.id);
+            return fetched?.renderedHtml || fetched?.dataBase64
+              ? {
+                ...source,
+                renderedHtml: fetched.renderedHtml,
+                dataBase64: fetched.dataBase64
+              }
+              : source;
+          })
           .slice(0, remaining);
       }
       if (!preparedSources.length) throw new Error("所选补充材料已包含在当前分析中");

@@ -9,7 +9,8 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => 
 const MAX_HTML_BYTES = 2_000_000;
 const MAX_PDF_BYTES = 8_000_000;
 const MAX_BROWSER_SOURCES = 8;
-const DIRECT_HTML_TIMEOUT_MS = 20_000;
+const DIRECT_HTML_TIMEOUT_MS = 8_000;
+const BROWSER_SOURCE_TIMEOUT_MS = 15_000;
 
 interface BrowserSourceRequest {
   id: string;
@@ -37,6 +38,7 @@ interface BrowserFetchedSource extends BrowserSourceRequest {
   dataBase64?: string;
   textLength?: number;
   error?: string;
+  deferToServer?: boolean;
   linkedSources: CapturedAgreementLink[];
 }
 
@@ -263,6 +265,18 @@ async function currentTabId(preferredTabId?: number): Promise<number | undefined
   return tab?.id;
 }
 
+async function hasSourceHostPermission(sourceUrl: string): Promise<boolean> {
+  try {
+    const url = new URL(sourceUrl);
+    if (!["http:", "https:"].includes(url.protocol)) return false;
+    return await chrome.permissions.contains({
+      origins: [`${url.protocol}//${url.host}/*`]
+    });
+  } catch {
+    return false;
+  }
+}
+
 async function fetchCurrentTabSource(
   source: BrowserSourceRequest,
   preferredTabId?: number
@@ -390,9 +404,28 @@ async function fetchRenderedSource(
       return {
         ...source,
         error: error instanceof Error ? error.message : "浏览器无法读取 PDF",
+        deferToServer: true,
         linkedSources: [] as CapturedAgreementLink[]
       };
     }
+  }
+
+  // Optional host permissions are not guaranteed to be present when a source
+  // is discovered from a page. In that case a hidden tab cannot be scripted
+  // either, so skip the doomed browser round-trip and let the server read the
+  // original URL with its own bounded loader.
+  if (!(await hasSourceHostPermission(source.url))) {
+    console.info("[agreement-lens] source host permission unavailable; deferring to server", {
+      sourceId: source.id,
+      sourceUrl: source.url,
+      elapsedMs: Date.now() - startedAt
+    });
+    return {
+      ...source,
+      error: "未获得来源页面权限，改由服务端读取原始 URL",
+      deferToServer: true,
+      linkedSources: []
+    };
   }
 
   const directlyFetchedSource = await fetchStaticHtmlSource(source, startedAt);
@@ -443,6 +476,11 @@ async function fetchRenderedSource(
     const result = {
       ...source,
       error: error instanceof Error ? error.message : "浏览器无法读取来源",
+      // Browser rendering is an optimization for dynamic pages, not the only
+      // way to read a source. The server has its own bounded URL/PDF loader.
+      // Do not turn a browser-only failure into a misleading whole-analysis
+      // timeout when the server can still fetch the original URL.
+      deferToServer: true,
       linkedSources: [] as CapturedAgreementLink[]
     };
     console.warn("[agreement-lens] browser source failed", {
@@ -462,17 +500,35 @@ async function fetchSourceGraphInBrowser(
   preferredTabId?: number
 ) {
   const queued = roots.slice(0, MAX_BROWSER_SOURCES);
-  const results: BrowserFetchedSource[] = [];
-  while (queued.length && results.length < MAX_BROWSER_SOURCES) {
-    // Some agreement pages use global singleton scripts and behave badly when
-    // several hidden tabs render the same document at once. Read sources
-    // serially so one page cannot stall the whole analysis batch.
-    const source = queued.shift();
-    if (!source) continue;
-    const acquired = await fetchRenderedSource(source, preferredTabId);
-    results.push(acquired);
-  }
-  return results;
+  const results: Array<BrowserFetchedSource | undefined> = Array.from({ length: queued.length });
+  let nextIndex = 0;
+  const acquireOne = async (index: number, source: BrowserSourceRequest) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    results[index] = await Promise.race([
+      fetchRenderedSource(source, preferredTabId),
+      new Promise<BrowserFetchedSource>((resolve) => {
+        timer = setTimeout(() => resolve({
+          ...source,
+          error: "浏览器读取来源超时，改由服务端读取原始 URL",
+          deferToServer: true,
+          linkedSources: []
+        }), BROWSER_SOURCE_TIMEOUT_MS);
+      })
+    ]).finally(() => {
+      if (timer !== undefined) clearTimeout(timer);
+    });
+  };
+  const worker = async () => {
+    while (nextIndex < queued.length) {
+      const index = nextIndex++;
+      const source = queued[index];
+      if (source) await acquireOne(index, source);
+    }
+  };
+  // Two hidden tabs are enough to avoid serially multiplying slow pages while
+  // avoiding the global-script collisions seen when many agreement tabs open.
+  await Promise.all(Array.from({ length: Math.min(2, queued.length) }, () => worker()));
+  return results.filter((source): source is BrowserFetchedSource => Boolean(source));
 }
 
 async function maybeRecheck(payload: PageSnapshot) {
