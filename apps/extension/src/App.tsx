@@ -318,7 +318,6 @@ export function App() {
         return setPhase("offline");
       }
       if (!page) return setPhase("permission");
-      void refreshCurrentHistory(page.pageUrl);
       const persisted = await readAnalysisState(page.tabId);
       if (persisted) {
         try {
@@ -440,7 +439,14 @@ export function App() {
         }
         if (next.state === "complete") {
           if (phase === "checking" || next.kind === "version-check") {
-            setHistoryCheckState(/未变化/.test(next.message) ? "unchanged" : "changed");
+            const currentSignature = sources.map((source) => `${source.id}:${source.url ?? ""}:${source.title}:${source.selected}`).join("|");
+            if (versionCheckSourceSignatureRef.current && currentSignature !== versionCheckSourceSignatureRef.current) {
+              versionCheckKeyRef.current = "";
+              versionCheckSourceSignatureRef.current = "";
+              setHistoryCheckState("idle");
+            } else {
+              setHistoryCheckState(/未变化/.test(next.message) ? "unchanged" : "changed");
+            }
             if (snapshot?.tabId !== undefined) await clearAnalysisState(snapshot.tabId);
             setJob(null);
             setPhase("prepare");
@@ -930,6 +936,17 @@ export function App() {
         setPhase("history");
       }
       await refreshHistory();
+      if (chromeAvailable()) {
+        const remaining = (await api.history(100)).analyses;
+        if (!remaining.some((item) => item.serviceId === entry.serviceId)) {
+          const stored = await chrome.storage.local.get("savedServices");
+          const savedServices = { ...(stored.savedServices ?? {}) } as Record<string, string>;
+          for (const [host, serviceId] of Object.entries(savedServices)) {
+            if (serviceId === entry.serviceId) delete savedServices[host];
+          }
+          await chrome.storage.local.set({ savedServices });
+        }
+      }
     } catch (cause) {
       setHistoryError(cause instanceof Error ? cause.message : "无法删除这条历史分析");
     } finally {
@@ -1235,7 +1252,7 @@ export function App() {
   if (phase === "history") return <Shell onOpenHistory={historyLauncher}><HistoryScreen entries={historyEntries} loading={historyLoading} error={historyError} loadingId={historyLoadingId} deletingId={historyDeletingId} onRetry={() => void refreshHistory()} onOpen={openHistoryEntry} onDelete={deleteHistoryEntry} onBack={returnFromHistory} hasReturn={Boolean(historyReturn)} /></Shell>;
   if ((phase === "result" || (phase === "running" && preserveResultWhileRunning)) && result) {
     return <Shell onOpenHistory={historyLauncher}>
-      <ResultHeader result={result} saving={saving} historyMode={historyMode} onHistory={() => void openHistory()} onSave={() => void saveAnalysis()} onDelete={() => void removeAnalysis()} />
+      <ResultHeader result={result} saving={saving} historyMode={historyMode} onHistory={() => historyMode ? returnFromHistory() : void openHistory()} onSave={() => void saveAnalysis()} onDelete={() => void removeAnalysis()} />
       {(supplementing || (phase === "running" && job)) && <section className="supplement-progress"><LoaderCircle className="spin" size={16} /><div><strong>{supplementing ? "正在读取补充材料" : job?.message ?? "正在深入分析"}</strong><p>{supplementing ? "原分析结果会保留，读取完成后再启动分析。" : `当前进度 ${job?.progress ?? 0}%`}</p></div>{job && <button className="icon-button compact-icon" title="中断当前任务" onClick={() => void cancelRunningJob()}><X size={15} /></button>}</section>}
       {error && <p className="inline-error result-error">{error}</p>}
       <nav className="tabs">
