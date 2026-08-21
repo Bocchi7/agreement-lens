@@ -20,6 +20,14 @@ export interface HistoryEntry {
   findingCount: number;
 }
 
+export interface RecheckInput {
+  pageUrl?: string;
+  serviceName?: string;
+  sources?: CreateAnalysisInput["sources"];
+  context?: CreateAnalysisInput["context"];
+  renderedHtml?: string;
+}
+
 const baseUrl = "http://127.0.0.1:4317";
 
 export class ApiError extends Error {
@@ -82,5 +90,8 @@ export const api = {
   save: (id: string) => request<{ ok: boolean }>(`/v1/analyses/${id}/save`, { method: "POST" }),
   delete: (id: string) => request<{ ok: boolean }>(`/v1/analyses/${id}`, { method: "DELETE" }),
   versions: (serviceId: string) => request<VersionsResponse>(`/v1/services/${serviceId}/versions`),
-  recheck: (serviceId: string) => request<{ analysisId: string; jobId: string }>(`/v1/services/${serviceId}/recheck`, { method: "POST" })
+  recheck: (serviceId: string, input?: RecheckInput) => request<{ analysisId: string; jobId: string }>(
+    `/v1/services/${serviceId}/recheck`,
+    input ? { method: "POST", body: JSON.stringify(input) } : { method: "POST" }
+  )
 };

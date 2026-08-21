@@ -542,7 +542,8 @@ async function maybeRecheck(payload: PageSnapshot) {
   try {
     const response = await fetch(`http://127.0.0.1:4317/v1/services/${encodeURIComponent(serviceId)}/recheck`, {
       method: "POST",
-      headers: { authorization: `Bearer ${local.pairToken}`, "content-type": "application/json" }
+      headers: { authorization: `Bearer ${local.pairToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ pageUrl: payload.pageUrl, sources: payload.sources })
     });
     if (!response.ok) return payload;
     const pendingRecheck = await response.json() as { analysisId: string; jobId: string };

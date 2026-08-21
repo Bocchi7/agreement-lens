@@ -24,6 +24,7 @@ type HistoryReturnState = {
   result: AnalysisResult | null;
   view: View;
 };
+type HistoryCheckState = "idle" | "loading" | "checking" | "unchanged" | "changed" | "failed";
 
 const actionOptions: Array<{ value: UserContext["action"]; label: string }> = [
   { value: "register", label: "注册 / 重新同意" },
@@ -99,6 +100,14 @@ type PersistedAnalysisState = {
 
 function analysisStateKey(tabId: number) {
   return `analysis-state:${tabId}`;
+}
+
+function pageServiceId(pageUrl: string): string {
+  try {
+    return new URL(pageUrl).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
 }
 
 async function readAnalysisState(tabId: number): Promise<PersistedAnalysisState | null> {
@@ -234,8 +243,12 @@ export function App() {
   const [historyReturn, setHistoryReturn] = useState<HistoryReturnState | null>(null);
   const [historyMode, setHistoryMode] = useState(false);
   const [historyPageUrl, setHistoryPageUrl] = useState<string | null>(null);
+  const [currentHistory, setCurrentHistory] = useState<HistoryEntry | null>(null);
+  const [historyCheckState, setHistoryCheckState] = useState<HistoryCheckState>("idle");
+  const [historyLookupLoading, setHistoryLookupLoading] = useState(false);
   const discoveryLockedRef = useRef(false);
   const scanInProgressRef = useRef(false);
+  const historyLookupUrlRef = useRef("");
 
   useEffect(() => {
     void (async () => {
@@ -244,6 +257,7 @@ export function App() {
       setSnapshot(page);
       setSources(page?.sources ?? []);
       setContext((current) => ({ ...current, action: inferAction(page) }));
+      if (page) void refreshCurrentHistory(page.pageUrl);
       try {
         await api.health();
       } catch {
@@ -298,6 +312,7 @@ export function App() {
         return setPhase("offline");
       }
       if (!page) return setPhase("permission");
+      void refreshCurrentHistory(page.pageUrl);
       const persisted = await readAnalysisState(page.tabId);
       if (persisted) {
         try {
@@ -399,6 +414,10 @@ export function App() {
         if (next.state === "complete") {
           const analysis = await api.getAnalysis(next.analysisId);
           setResult(analysis);
+          if (currentHistory) {
+            if (/正文未变化|跳过模型分析/.test(next.message)) setHistoryCheckState("unchanged");
+            else if (/版本变化|重新核验/.test(next.message)) setHistoryCheckState("changed");
+          }
           setPreserveResultWhileRunning(false);
           if (snapshot?.tabId !== undefined) {
             await writeAnalysisState(snapshot.tabId, {
@@ -412,6 +431,7 @@ export function App() {
           setPhase("result");
           window.clearInterval(timer);
         } else if (next.state === "failed") {
+          if (currentHistory) setHistoryCheckState("failed");
           setError(next.error ?? "分析失败");
           setPreserveResultWhileRunning(false);
           setPhase(preserveResultWhileRunning && result ? "result" : "error");
@@ -425,7 +445,7 @@ export function App() {
       }
     }, 700);
     return () => window.clearInterval(timer);
-  }, [phase, job?.id, preserveResultWhileRunning, result?.id]);
+  }, [phase, job?.id, preserveResultWhileRunning, result?.id, currentHistory]);
 
   async function pair() {
     try {
@@ -436,6 +456,7 @@ export function App() {
       setSnapshot(page);
       setSources(page?.sources ?? []);
       setContext((current) => ({ ...current, action: inferAction(page) }));
+      if (page) void refreshCurrentHistory(page.pageUrl);
       setPhase(page ? "prepare" : "permission");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "配对失败");
@@ -478,6 +499,7 @@ export function App() {
       setSnapshot(page);
       setSources(page.sources);
       setContext((current) => ({ ...current, action: inferAction(page) }));
+      void refreshCurrentHistory(page.pageUrl);
       setPhase("prepare");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法扫描当前站点");
@@ -686,6 +708,41 @@ export function App() {
           } satisfies DiscoveredSource));
         preparedSources = [...enrichedRoots, ...browserDiscovered].slice(0, 8);
       }
+      if (currentHistory && historyCheckState !== "unchanged") {
+        const previous = await api.getAnalysis(currentHistory.analysisId).catch(() => undefined);
+        const created = await api.recheck(currentHistory.serviceId, {
+          serviceName: snapshot.pageTitle,
+          pageUrl: snapshot.pageUrl,
+          sources: preparedSources,
+          context
+        });
+        const pendingJob = {
+          id: created.jobId, analysisId: created.analysisId, state: "queued",
+          progress: 0, message: "正在验证历史版本是否变化",
+          createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+        } satisfies JobStatus;
+        setHistoryCheckState("checking");
+        if (previous) setResult(previous);
+        await writeAnalysisState(snapshot.tabId, {
+          job: pendingJob,
+          jobId: pendingJob.id,
+          analysisId: pendingJob.analysisId,
+          previousAnalysisId: previous?.id,
+          pageUrl: snapshot.pageUrl,
+          sourceCount: preparedSources.filter((source) => source.selected).length
+        });
+        setJob(pendingJob);
+        setPreserveResultWhileRunning(Boolean(previous));
+        setPhase("running");
+        return;
+      }
+      if (currentHistory && historyCheckState === "unchanged") {
+        const previous = await api.getAnalysis(currentHistory.analysisId);
+        setResult(previous);
+        setError("");
+        setPhase("result");
+        return;
+      }
       const created = await api.createAnalysis({
         serviceName: snapshot.pageTitle, pageUrl: snapshot.pageUrl,
         sources: preparedSources, context
@@ -756,6 +813,26 @@ export function App() {
     try { setVersions(await api.versions(result.serviceId)); } catch { setVersions({ analyses: [], comparisons: [] }); }
   }
 
+  async function refreshCurrentHistory(pageUrl: string) {
+    const serviceId = pageServiceId(pageUrl);
+    if (!serviceId) return;
+    historyLookupUrlRef.current = pageUrl;
+    setHistoryLookupLoading(true);
+    try {
+      const entries = (await api.history(100)).analyses;
+      if (historyLookupUrlRef.current !== pageUrl) return;
+      const entry = entries.find((candidate) => candidate.serviceId === serviceId) ?? null;
+      setCurrentHistory(entry);
+      setHistoryCheckState("idle");
+    } catch {
+      if (historyLookupUrlRef.current !== pageUrl) return;
+      setCurrentHistory(null);
+      setHistoryCheckState("idle");
+    } finally {
+      if (historyLookupUrlRef.current === pageUrl) setHistoryLookupLoading(false);
+    }
+  }
+
   async function refreshHistory() {
     setHistoryLoading(true);
     setHistoryError("");
@@ -814,7 +891,19 @@ export function App() {
   async function recheck() {
     if (!result || phase === "running" || historyMode) return;
     try {
-      const created = await api.recheck(result.serviceId);
+      const created = await api.recheck(result.serviceId, {
+        serviceName: snapshot?.pageTitle ?? result.serviceName,
+        pageUrl: snapshot?.pageUrl ?? result.sources[0]?.url ?? `https://${result.serviceId}`,
+        sources: result.sources.map((source) => ({
+          id: source.id,
+          kind: source.mediaType === "pdf" ? "pdf" : source.mediaType === "text" ? "text" : "url",
+          title: source.title,
+          url: source.url,
+          text: source.mediaType === "text" ? source.normalizedText : undefined,
+          selected: true,
+          relation: "primary"
+        }))
+      });
       const pendingJob = {
         id: created.jobId, analysisId: created.analysisId, state: "queued",
         progress: 0, message: "版本复核已进入队列",
@@ -831,6 +920,19 @@ export function App() {
         });
       }
       setJob(pendingJob);
+      setCurrentHistory({
+        analysisId: result.id,
+        serviceId: result.serviceId,
+        serviceName: result.serviceName,
+        pageUrl: snapshot?.pageUrl ?? result.sources[0]?.url ?? `https://${result.serviceId}`,
+        createdAt: result.createdAt,
+        updatedAt: result.updatedAt,
+        recommendation: result.recommendation,
+        saved: result.saved,
+        sourceCount: result.sources.length,
+        findingCount: result.findings.length
+      });
+      setHistoryCheckState("checking");
       setPreserveResultWhileRunning(true);
       setPhase("running");
     } catch (cause) {
@@ -1004,7 +1106,7 @@ export function App() {
   if (phase === "permission") return <Shell onOpenHistory={historyLauncher}><PermissionScreen onGrant={grantAndScan} /></Shell>;
   if (phase === "scanning") return <Shell onOpenHistory={historyLauncher}><Centered><LoaderCircle className="spin" /><p className="eyebrow">正在读取当前站点</p><h2>扫描协议入口</h2></Centered></Shell>;
   if (phase === "preparing") return <Shell onOpenHistory={historyLauncher}><Centered><LoaderCircle className="spin" /><p className="eyebrow">正在准备分析</p><h2>读取协议原文</h2><p>正在获取所选页面并整理分析材料。</p></Centered></Shell>;
-  if (phase === "running" && job && !(preserveResultWhileRunning && result)) return <Shell onOpenHistory={historyLauncher}><RunningScreen job={job} sources={sources} /></Shell>;
+  if (phase === "running" && job && !(preserveResultWhileRunning && result)) return <Shell onOpenHistory={historyLauncher}><RunningScreen job={job} sources={sources} currentHistory={currentHistory} historyCheckState={historyCheckState} /></Shell>;
   if (phase === "offline") return <Shell offline><OfflineScreen detail={error} /></Shell>;
   if (phase === "error") return <Shell onOpenHistory={historyLauncher}><Centered><AlertTriangle size={30} /><h2>操作失败</h2><p>{error}</p><button className="primary" onClick={() => { setError(""); setPhase(snapshot ? "prepare" : "permission"); }}><RefreshCw size={16} />返回并重试</button></Centered></Shell>;
   if (phase === "history") return <Shell onOpenHistory={historyLauncher}><HistoryScreen entries={historyEntries} loading={historyLoading} error={historyError} loadingId={historyLoadingId} onRetry={() => void refreshHistory()} onOpen={openHistoryEntry} onBack={returnFromHistory} hasReturn={Boolean(historyReturn)} /></Shell>;
@@ -1047,6 +1149,8 @@ export function App() {
       onBeginManualAdd={beginManualAdd}
       onCancelManualEdit={cancelManualEdit}
       addManualText={addManualText} addPdfFiles={addPdfFiles}
+      currentHistory={currentHistory} historyCheckState={historyCheckState}
+      historyLoading={historyLookupLoading} onOpenHistoryEntry={openHistoryEntry}
     />
   </Shell>;
 }
@@ -1136,10 +1240,18 @@ function PrepareScreen(props: {
   manualUrl: string; setManualUrl: (v: string) => void; addPdfFiles: (files: FileList | null) => void;
   editingSourceId: string | null; onEditManual: (source: DiscoveredSource) => void; onRemoveManual: (sourceId: string) => void;
   onBeginManualAdd: () => void; onCancelManualEdit: () => void; manualFormValid: boolean;
+  currentHistory: HistoryEntry | null; historyCheckState: HistoryCheckState; historyLoading: boolean;
+  onOpenHistoryEntry: (entry: HistoryEntry) => void;
 }) {
   const { snapshot, sources, setSources, context, setContext } = props;
   return <main className="prepare">
     <section className="page-intro"><p className="eyebrow">当前页面</p><h1>{snapshot?.pageTitle ?? "未识别页面"}</h1><p className="page-url">{snapshot?.pageUrl}</p><div className="scan-summary"><CheckCircle2 size={17} /><span>发现 {sources.length} 份可能相关的规则</span></div></section>
+    {props.historyLoading && <div className="history-preview loading"><LoaderCircle size={16} className="spin" /><span>正在查找当前网页的历史分析</span></div>}
+    {!props.historyLoading && props.currentHistory && <button className="history-preview" type="button" onClick={() => props.onOpenHistoryEntry(props.currentHistory!)}>
+      <span className="history-preview-icon"><History size={17} /></span>
+      <span className="history-preview-main"><strong>已有历史分析</strong><small>{formatHistoryDate(props.currentHistory.updatedAt || props.currentHistory.createdAt)} · {props.currentHistory.sourceCount} 份材料 · {props.currentHistory.findingCount} 项告警</small><em>{props.historyCheckState === "checking" ? "正在验证协议是否变化，尚未开始新的模型分析" : props.historyCheckState === "unchanged" ? "协议未变化，将直接复用这份结果" : props.historyCheckState === "changed" ? "检测到协议变化，将重新分析" : props.historyCheckState === "failed" ? "版本检查失败，请重试；不会把旧结果伪装成新结论" : "开始分析前会先验证协议是否变化"}</em></span>
+      <ChevronRight size={17} />
+    </button>}
     <section className="section"><div className="section-heading"><div><span className="step">1</span><h2>确认分析材料</h2></div><button className="icon-button" title="重新扫描" onClick={props.rescan}><RefreshCw size={16} /></button></div>
       <div className="source-list">{sources.map((source) =>
         <div className="source-row" key={source.id}>
@@ -1174,11 +1286,11 @@ function PrepareScreen(props: {
       <div className="redline-list">{redlineOptions.map((redline) => <label key={redline}><input type="checkbox" checked={context.redlines.includes(redline)} onChange={(event) => setContext({ ...context, redlines: event.target.checked ? [...context.redlines, redline] : context.redlines.filter((item) => item !== redline) })} /><span className="checkbox-ui"><Check size={13} /></span>{redline}</label>)}</div>
       <label className="field compact"><span>个人底线或补充情况（可选）</span><textarea placeholder="例如：内容不能用于训练模型" value={context.notes} onChange={(e) => setContext({ ...context, notes: e.target.value, redlines: [...context.redlines.filter((item) => redlineOptions.includes(item)), ...(e.target.value ? [e.target.value] : [])] })} /></label>
     </section>
-    <div className="sticky-action"><div><strong>{sources.filter((source) => source.selected).length}</strong><span>份材料</span></div><button className="primary" disabled={!sources.some((source) => source.selected)} onClick={props.start}><Sparkles size={17} />开始分析</button></div>
+    <div className="sticky-action"><div><strong>{sources.filter((source) => source.selected).length}</strong><span>份材料</span></div><button className="primary" disabled={props.historyLoading || !sources.some((source) => source.selected)} onClick={props.start}>{props.historyLoading ? <LoaderCircle size={17} className="spin" /> : <Sparkles size={17} />}{props.historyLoading ? "正在查找历史" : props.currentHistory ? "检查版本并分析" : "开始分析"}</button></div>
   </main>;
 }
 
-function RunningScreen({ job, sources }: { job: JobStatus; sources: DiscoveredSource[] }) {
+function RunningScreen({ job, sources, currentHistory, historyCheckState }: { job: JobStatus; sources: DiscoveredSource[]; currentHistory: HistoryEntry | null; historyCheckState: HistoryCheckState }) {
   const agentDefinitions = [
     ["fees", "费用"],
     ["privacy", "隐私与数据"],
@@ -1188,7 +1300,7 @@ function RunningScreen({ job, sources }: { job: JobStatus; sources: DiscoveredSo
     ["main", "结论整合"],
     ["router", "版本路由"]
   ] as const;
-  return <main className="running"><div className="radar"><span /><Search size={28} /></div><p className="eyebrow">正在分析 {sources.length} 份材料</p><h1>{job.message}</h1><div className="progress-track"><i style={{ width: `${job.progress}%` }} /></div><span className="progress-number">{job.progress}%</span><div className="agent-grid">{agentDefinitions.map(([key, name]) => {
+  return <main className="running"><div className="radar"><span /><Search size={28} /></div><p className="eyebrow">{currentHistory && historyCheckState !== "changed" ? "正在核验历史版本" : `正在分析 ${sources.length} 份材料`}</p><h1>{job.message}</h1>{currentHistory && historyCheckState !== "changed" && <div className="running-history"><History size={15} /><span>已找到历史分析，先比较协议正文；未变化时直接复用，不会重复调用模型。</span></div>}<div className="progress-track"><i style={{ width: `${job.progress}%` }} /></div><span className="progress-number">{job.progress}%</span><div className="agent-grid">{agentDefinitions.map(([key, name]) => {
     const progress = job.agents?.[key];
     const status = progress?.status ?? "idle";
     const Icon = status === "completed" ? Check : status === "failed" ? AlertTriangle : status === "running" ? LoaderCircle : Circle;

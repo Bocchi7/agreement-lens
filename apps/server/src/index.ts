@@ -205,7 +205,23 @@ app.post("/v1/services/:id/recheck", async (request, reply) => {
   const previous = getAnalysisRequest(service.latest_analysis_id);
   const previousResult = getAnalysis(service.latest_analysis_id);
   if (!previous || !previousResult) return reply.code(404).send({ error: "历史分析不存在" });
-  const input = previous.request as CreateAnalysisInput;
+  const body = request.body && typeof request.body === "object"
+    ? request.body as Partial<CreateAnalysisInput>
+    : {};
+  const inputCandidate = {
+    ...(previous.request as CreateAnalysisInput),
+    ...(typeof body.pageUrl === "string" ? { pageUrl: body.pageUrl } : {}),
+    ...(typeof body.serviceName === "string" ? { serviceName: body.serviceName } : {}),
+    ...(Array.isArray(body.sources) ? { sources: body.sources } : {}),
+    ...(body.context && typeof body.context === "object" ? { context: body.context } : {}),
+    ...(typeof body.renderedHtml === "string" ? { renderedHtml: body.renderedHtml } : {})
+  };
+  const parsedInput = createAnalysisSchema.safeParse(inputCandidate);
+  if (!parsedInput.success) {
+    request.log.warn({ serviceId, details: parsedInput.error.flatten() }, "version recheck input invalid");
+    return reply.code(400).send({ error: "版本复核材料格式不正确", details: parsedInput.error.flatten() });
+  }
+  const input = parsedInput.data;
   const analysisId = randomUUID();
   const job = newJob(analysisId);
   createAnalysisRecord({
