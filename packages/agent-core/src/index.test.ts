@@ -66,4 +66,34 @@ describe("workflow", () => {
       changed: false, domains: [], confidence: 1, structural: false, changedSections: []
     });
   });
+
+  it("ignores transient session ids when comparing agreement URLs", () => {
+    const text = "同一份用户协议。";
+    const before = {
+      id: "src1", title: "隐私政策", url: "https://kyfw.12306.cn/otn/gonggao/privacyPolicy_web.html;jsessionid=ABC123",
+      mediaType: "text" as const, normalizedText: text, fingerprint: contentFingerprint(text),
+      fetchedAt: new Date().toISOString(), status: "ready" as const,
+      sections: [{ id: "sec1", heading: "正文", content: text }]
+    };
+    const after = { ...before, id: "src2", url: "https://kyfw.12306.cn/otn/gonggao/privacyPolicy_web.html" };
+    expect(routeChangedContent([before], [after]).changed).toBe(false);
+  });
+
+  it("does not treat a previously linked but not yet fetched document as a version change", () => {
+    const text = "隐私政策正文。";
+    const child = "https://example.com/child-policy";
+    const before = {
+      id: "privacy", title: "隐私政策", url: "https://example.com/privacy", mediaType: "text" as const,
+      normalizedText: text, fingerprint: contentFingerprint(text), fetchedAt: new Date().toISOString(),
+      status: "ready" as const, sections: [{ id: "privacy-section", heading: "正文", content: text }],
+      linkedSources: [{ title: "儿童隐私规则", url: child }]
+    };
+    const childSource = {
+      id: "child", title: "儿童隐私规则", url: child, mediaType: "text" as const,
+      normalizedText: "儿童信息规则正文。", fingerprint: contentFingerprint("儿童信息规则正文。"),
+      fetchedAt: new Date().toISOString(), status: "ready" as const,
+      sections: [{ id: "child-section", heading: "正文", content: "儿童信息规则正文。" }]
+    };
+    expect(routeChangedContent([before], [before, childSource]).changed).toBe(false);
+  });
 });

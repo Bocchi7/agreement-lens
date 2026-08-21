@@ -534,15 +534,36 @@ function changedSpanLength(before: string, after: string): number {
   return Math.max(before.length - prefix - suffix, after.length - prefix - suffix);
 }
 
+function sourceComparisonKey(source: Pick<SourceDocument, "url" | "title">): string {
+  if (!source.url) return `title:${source.title}`;
+  try {
+    const url = new URL(source.url);
+    url.hash = "";
+    // Some 12306 responses put a transient JSESSIONID in the path. It is
+    // a session marker, not a different agreement document.
+    url.pathname = url.pathname.replace(/;jsessionid=[^/?;]+/ig, "");
+    url.pathname = url.pathname.replace(/\/+$/, "") || "/";
+    return `url:${url.protocol}//${url.hostname.toLocaleLowerCase()}${url.port ? `:${url.port}` : ""}${url.pathname}${url.search}`;
+  } catch {
+    return `url:${source.url}`;
+  }
+}
+
+function wasPreviouslyLinked(previous: SourceDocument[], current: SourceDocument): boolean {
+  const currentKey = sourceComparisonKey(current);
+  return previous.some((source) => (source.linkedSources ?? []).some((link) => sourceComparisonKey(link) === currentKey));
+}
+
 export function routeChangedContent(previous: SourceDocument[], current: SourceDocument[]): ChangeRoute {
-  const previousMap = new Map(previous.map((source) => [source.url ?? source.title, source]));
+  const previousMap = new Map(previous.map((source) => [sourceComparisonKey(source), source]));
   const changedSections: string[] = [];
   let previousLength = 0;
   let deltaLength = 0;
   let combined = "";
   for (const source of current) {
-    const old = previousMap.get(source.url ?? source.title);
+    const old = previousMap.get(sourceComparisonKey(source));
     previousLength += old?.normalizedText.length ?? 0;
+    if (!old && wasPreviouslyLinked(previous, source)) continue;
     if (old?.fingerprint === source.fingerprint) continue;
     const oldSections = new Map(old?.sections.map((section) => [section.heading, section.content]) ?? []);
     for (const section of source.sections) {
@@ -553,7 +574,7 @@ export function routeChangedContent(previous: SourceDocument[], current: SourceD
     }
   }
   for (const source of previous) {
-    if (current.some((item) => (item.url ?? item.title) === (source.url ?? source.title))) continue;
+    if (current.some((item) => sourceComparisonKey(item) === sourceComparisonKey(source))) continue;
     changedSections.push(`${source.title} / 已移除`);
     combined += `\n${source.normalizedText}`;
     deltaLength += source.normalizedText.length;
