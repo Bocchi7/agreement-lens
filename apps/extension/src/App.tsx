@@ -936,6 +936,7 @@ export function App() {
         setPhase("history");
       }
       await refreshHistory();
+      if (snapshot?.pageUrl) void refreshCurrentHistory(snapshot.pageUrl);
       if (chromeAvailable()) {
         const remaining = (await api.history(100)).analyses;
         if (!remaining.some((item) => item.serviceId === entry.serviceId)) {
