@@ -78,38 +78,6 @@ async function waitForTab(tabId: number, timeoutMs = 8_000): Promise<boolean> {
   });
 }
 
-async function waitForOpenedTabUrl(tabId: number, timeoutMs = 5_000): Promise<string | undefined> {
-  const readUrl = async (): Promise<string | undefined> => {
-    const tab = await chrome.tabs.get(tabId).catch(() => undefined);
-    return tab?.url?.startsWith("http") ? tab.url : undefined;
-  };
-  const initialUrl = await readUrl();
-  if (initialUrl) return initialUrl;
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (url?: string) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve(url);
-    };
-    const timeout = setTimeout(() => {
-      void readUrl().then((url) => finish(url));
-    }, timeoutMs);
-    const listener = (updatedTabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
-      if (updatedTabId !== tabId || !changeInfo.url) return;
-      void readUrl().then((url) => {
-        if (url) finish(url);
-      });
-    };
-    chrome.tabs.onUpdated.addListener(listener);
-    void readUrl().then((url) => {
-      if (url) finish(url);
-    });
-  });
-}
-
 async function captureRenderedTab(tabId: number): Promise<CapturedRenderedPage> {
   type CaptureTarget = { tabId: number; allFrames?: boolean; frameIds?: number[] };
   type RenderedFrameResult = {
@@ -756,48 +724,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     const tabId = sender.tab.id;
     const frameId = sender.frameId ?? 0;
-    const openedTabs = new Map<number, string | undefined>();
-    const onCreated = (tab: chrome.tabs.Tab) => {
-      if (tab.id !== undefined && tab.openerTabId === tabId) openedTabs.set(tab.id, tab.url);
-    };
-    chrome.tabs.onCreated.addListener(onCreated);
     void chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
       world: "MAIN",
       func: resolveDynamicAgreementLinks
     }).then(async ([result]) => {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-      chrome.tabs.onCreated.removeListener(onCreated);
-      const recordsResult = await chrome.scripting.executeScript({
+      const labelsResult = await chrome.scripting.executeScript({
         target: { tabId, frameIds: [frameId] },
         world: "MAIN",
         func: () => {
           const runtimeWindow = window as Window & {
-            __agreementLensDynamicClickRecords?: Array<{ title: string; captured: string[] }>;
+            __agreementLensDynamicLabels?: string[];
           };
-          const records = runtimeWindow.__agreementLensDynamicClickRecords ?? [];
-          delete runtimeWindow.__agreementLensDynamicClickRecords;
-          return records;
+          const labels = runtimeWindow.__agreementLensDynamicLabels ?? [];
+          delete runtimeWindow.__agreementLensDynamicLabels;
+          return labels;
         }
-      }).catch(() => [{ result: [] as Array<{ title: string; captured: string[] }> }]);
-      const records = recordsResult[0]?.result ?? [];
-      const openedTabIds = [...openedTabs.keys()];
-      const openedUrls = await Promise.all(openedTabIds.map(async (openedTabId) =>
-        (await waitForOpenedTabUrl(openedTabId)) ?? openedTabs.get(openedTabId)
-      ));
-      await Promise.all(openedTabIds.map((openedTabId) => chrome.tabs.remove(openedTabId).catch(() => undefined)));
-      const fallbackLinks = records
-        .filter((record) => record.title && record.captured.length === 0)
-        .map((record, index) => {
-          const url = openedUrls[index];
-          if (!url) return undefined;
-          return { title: record.title, url };
-        })
-        .filter((item): item is { title: string; url: string } => Boolean(item));
-      const resolvedLinks = [...((result?.result ?? []) as Array<{ title: string; url: string }>), ...fallbackLinks];
-      const unresolvedLabels = records
-        .map((record) => record.title)
-        .filter((title) => title && !resolvedLinks.some((link) => link.title === title));
+      }).catch(() => [{ result: [] as string[] }]);
+      const labels = labelsResult[0]?.result ?? [];
+      const resolvedLinks = [...((result?.result ?? []) as Array<{ title: string; url: string }>)];
+      const unresolvedLabels = labels.filter((title) => !resolvedLinks.some((link) => link.title === title));
       const scriptLinks = unresolvedLabels.length
         ? await chrome.scripting.executeScript({
             target: { tabId, frameIds: [frameId] },
@@ -812,13 +758,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         tabId,
         frameId,
         links,
-        openedTabCount: openedTabIds.length,
-        clickRecords: records
+        labels
       });
       sendResponse({ links });
     }).catch((error) => {
-      chrome.tabs.onCreated.removeListener(onCreated);
-      for (const openedTabId of openedTabs.keys()) void chrome.tabs.remove(openedTabId).catch(() => undefined);
       console.warn("[agreement-lens] dynamic discovery failed", {
         tabId,
         frameId,

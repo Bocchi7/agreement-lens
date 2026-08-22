@@ -200,49 +200,6 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
     return undefined;
   };
 
-  const urlsFromClick = (element: Element): string[] => {
-    if (typeof window === "undefined") return [];
-    const directTarget = element.getAttribute("href")
-      || element.getAttribute("data-href")
-      || element.getAttribute("data-url");
-    const looksClickable = element.matches(
-      "a,area,[role='link'],button,[onclick],[class*='link'],[class*='Link']"
-    );
-    if (directTarget || !looksClickable) return [];
-    const captured: string[] = [];
-    const originalOpen = window.open;
-    const capture = (value: unknown) => {
-      if (typeof value !== "string" && !(value instanceof URL)) return;
-      try {
-        const url = new URL(String(value), location.href);
-        if (["http:", "https:"].includes(url.protocol)) captured.push(url.href);
-      } catch {
-        // Ignore non-URL navigation values.
-      }
-    };
-    try {
-      window.open = ((url?: string | URL) => {
-        capture(url);
-        return null;
-      }) as typeof window.open;
-      const EventConstructor = element.ownerDocument.defaultView?.MouseEvent ?? MouseEvent;
-      element.dispatchEvent(new EventConstructor("click", {
-        bubbles: true,
-        cancelable: true,
-        view: element.ownerDocument.defaultView
-      }));
-      runtimeWindow?.__agreementLensDynamicClickRecords?.push({
-        title: agreementLabel(element.textContent || "") ?? "",
-        captured: [...captured]
-      });
-    } catch {
-      // Some controls require trusted pointer events; framework metadata is
-      // still inspected as a fallback.
-    } finally {
-      window.open = originalOpen;
-    }
-    return captured;
-  };
   const canonicalUrl = (value: string): string => {
     const url = new URL(value, location.href);
     url.hostname = url.hostname.toLocaleLowerCase();
@@ -259,9 +216,9 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
   };
 
   const runtimeWindow = typeof window === "undefined" ? undefined : window as Window & {
-    __agreementLensDynamicClickRecords?: Array<{ title: string; captured: string[] }>;
+    __agreementLensDynamicLabels?: string[];
   };
-  if (runtimeWindow) runtimeWindow.__agreementLensDynamicClickRecords = [];
+  if (runtimeWindow) runtimeWindow.__agreementLensDynamicLabels = [];
   const results: DynamicAgreementLink[] = [];
   const seen = new Set<string>();
   for (const element of elementsIn(document)) {
@@ -273,6 +230,10 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
       || ""
     );
     if (!text || text.length > 100 || !matches(text)) continue;
+    const label = agreementLabel(text);
+    if (label && runtimeWindow && !runtimeWindow.__agreementLensDynamicLabels?.includes(label)) {
+      runtimeWindow.__agreementLensDynamicLabels?.push(label);
+    }
     const candidates = urlsFromFramework(element)
       .map((candidate) => ({
         ...candidate,
@@ -281,9 +242,6 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
       .sort((left, right) => right.score - left.score);
     const handlerUrl = urlFromReactEventHandler(element);
     if (handlerUrl) candidates.unshift({ title: agreementLabel(text), url: handlerUrl, score: 3 });
-    for (const clickUrl of urlsFromClick(element)) {
-      candidates.unshift({ title: agreementLabel(text), url: clickUrl, score: 4 });
-    }
     for (const candidate of candidates) {
       // A URL without the matching component label is too ambiguous: Vue/React
       // instances often contain unrelated navigation URLs as well.

@@ -72,7 +72,7 @@ describe("dynamic agreement discovery", () => {
     ]);
   });
 
-  it("captures URLs opened by native listeners on href-less agreement links", () => {
+  it("does not invoke native listeners during discovery", () => {
     const dom = new JSDOM(`
       <p>
         <a id="user">《百度用户协议》</a>
@@ -96,14 +96,10 @@ describe("dynamic agreement discovery", () => {
     vi.stubGlobal("URL", dom.window.URL);
 
     const injectedResolver = new Function(`return (${resolveDynamicAgreementLinks.toString()})`)() as typeof resolveDynamicAgreementLinks;
-    expect(injectedResolver()).toEqual([
-      { title: "百度用户协议", url: "http://passport.baidu.com/static/passpc-account/html/protocal.html" },
-      { title: "儿童个人信息保护声明", url: "https://privacy.baidu.com/policy/children-privacy-policy/index.html" },
-      { title: "百度隐私权保护声明", url: "http://privacy.baidu.com/detail?id=288" }
-    ]);
+    expect(injectedResolver()).toEqual([]);
   });
 
-  it("captures URLs opened by delegated listeners on clickable spans", () => {
+  it("does not invoke delegated listeners on clickable spans during discovery", () => {
     const dom = new JSDOM(`
       <div class="agreement-text">
         <span class="xylink yszc">《隐私政策》</span>
@@ -124,10 +120,7 @@ describe("dynamic agreement discovery", () => {
     vi.stubGlobal("URL", dom.window.URL);
 
     const injectedResolver = new Function(`return (${resolveDynamicAgreementLinks.toString()})`)() as typeof resolveDynamicAgreementLinks;
-    expect(injectedResolver()).toEqual([
-      { title: "隐私政策", url: "https://about.eastmoney.com/home/conceal" },
-      { title: "服务协议", url: "https://about.eastmoney.com/home/protocol" }
-    ]);
+    expect(injectedResolver()).toEqual([]);
   });
 
   it("finds URLs in an ancestor React fiber reached through the return chain", () => {
