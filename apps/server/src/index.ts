@@ -5,6 +5,7 @@ import {
   createAnalysisSchema,
   followUpSchema,
   maxSourceDocuments,
+  type AgentProgress,
   type CreateAnalysisInput,
   type PairResponse,
   userContextSchema
@@ -23,6 +24,10 @@ import { compactVersionHistory } from "./version-history.js";
 import path from "node:path";
 
 const app = Fastify({ logger: true, bodyLimit: 80_000_000 });
+const followUpProgress = new Map<string, {
+  progress: AgentProgress;
+  startedAt: string;
+}>();
 
 await app.register(cors, {
   origin(origin, callback) {
@@ -111,6 +116,15 @@ app.get("/v1/analyses/:id", async (request, reply) => {
   return result ?? reply.code(404).send({ error: "分析尚未完成或不存在" });
 });
 
+app.get("/v1/analyses/:id/follow-up/progress", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  if (!getAnalysis(id)) return reply.code(404).send({ error: "分析不存在" });
+  return followUpProgress.get(id) ?? {
+    progress: { status: "idle", rounds: 0, retries: 0, message: "尚未开始追问" },
+    startedAt: new Date().toISOString()
+  };
+});
+
 app.post("/v1/analyses/:id/follow-up", async (request, reply) => {
   const id = (request.params as { id: string }).id;
   const result = getAnalysis(id);
@@ -142,17 +156,57 @@ app.post("/v1/analyses/:id/follow-up", async (request, reply) => {
     });
   }
   try {
+    const startedAt = new Date().toISOString();
+    followUpProgress.set(id, {
+      startedAt,
+      progress: { status: "running", rounds: 0, retries: 0, message: "正在连接主Agent" }
+    });
     const response = await answerFollowUp(
       result,
       parsed.data.message,
       getAgentSession(id),
       openKnowledge(),
-      path.join(repoRoot, "prompts")
+      path.join(repoRoot, "prompts"),
+      (progress) => {
+        const current = followUpProgress.get(id);
+        followUpProgress.set(id, {
+          startedAt: current?.startedAt ?? startedAt,
+          progress: {
+            status: "running",
+            rounds: progress.rounds ?? current?.progress.rounds ?? 0,
+            retries: progress.retries ?? current?.progress.retries ?? 0,
+            message: progress.message ?? current?.progress.message
+          }
+        });
+      }
     );
     if (response.session) saveAgentSession(id, response.session);
+    const current = followUpProgress.get(id);
+    followUpProgress.set(id, {
+      startedAt: current?.startedAt ?? startedAt,
+      progress: {
+        status: "completed",
+        rounds: current?.progress.rounds ?? 0,
+        retries: current?.progress.retries ?? 0,
+        message: "回答生成完成"
+      }
+    });
+    setTimeout(() => followUpProgress.delete(id), 10 * 60_000).unref();
     return { answer: response.answer, analysis: result };
   } catch (error) {
     const message = error instanceof Error ? error.message : "追问模型调用失败";
+    const current = followUpProgress.get(id);
+    followUpProgress.set(id, {
+      startedAt: current?.startedAt ?? new Date().toISOString(),
+      progress: {
+        status: "failed",
+        rounds: current?.progress.rounds ?? 0,
+        retries: current?.progress.retries ?? 0,
+        message: "追问失败",
+        error: /abort|timeout/i.test(message) ? "模型响应超时" : message
+      }
+    });
+    setTimeout(() => followUpProgress.delete(id), 10 * 60_000).unref();
     return reply.code(502).send({
       error: /abort|timeout/i.test(message) ? "追问模型响应超时，请稍后重试。" : `追问模型调用失败：${message}`
     });

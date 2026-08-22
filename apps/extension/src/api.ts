@@ -1,6 +1,7 @@
 import type {
   AnalysisResult, CreateAnalysisInput, FollowUpResponse, JobStatus, PairResponse, VersionComparison
 } from "@agreement-lens/shared";
+import type { AgentProgress } from "@agreement-lens/shared";
 
 export interface VersionsResponse {
   analyses: Array<{ analysisId: string; createdAt: string; recommendation: string; fingerprints: string[] }>;
@@ -30,6 +31,7 @@ export interface RecheckInput {
 }
 
 const baseUrl = "http://127.0.0.1:4317";
+const LOCAL_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 
 export class ApiError extends Error {
   constructor(message: string, readonly status?: number) {
@@ -45,7 +47,7 @@ async function token() {
   return localStorage.getItem("pairToken") ?? undefined;
 }
 
-async function request<T>(path: string, init?: RequestInit, timeoutMs = 8_000): Promise<T> {
+async function request<T>(path: string, init?: RequestInit, timeoutMs = LOCAL_REQUEST_TIMEOUT_MS): Promise<T> {
   const auth = await token();
   let response: Response;
   try {
@@ -86,8 +88,12 @@ export const api = {
   followUp: (id: string, message: string, history: Array<{ role: "user" | "assistant"; text: string }>) => request<FollowUpResponse>(
     `/v1/analyses/${id}/follow-up`,
     { method: "POST", body: JSON.stringify({ message, history: history.slice(-12) }) },
-    190_000
+    LOCAL_REQUEST_TIMEOUT_MS
   ),
+  followUpProgress: (id: string) => request<{
+    progress: AgentProgress;
+    startedAt: string;
+  }>(`/v1/analyses/${id}/follow-up/progress`, undefined, 30_000),
   addSources: (id: string, sources: CreateAnalysisInput["sources"]) => request<{ analysisId: string; jobId: string }>(`/v1/analyses/${id}/sources`, { method: "POST", body: JSON.stringify({ sources }) }),
   save: (id: string) => request<{ ok: boolean }>(`/v1/analyses/${id}/save`, { method: "POST" }),
   delete: (id: string) => request<{ ok: boolean }>(`/v1/analyses/${id}`, { method: "DELETE" }),

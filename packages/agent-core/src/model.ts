@@ -168,6 +168,8 @@ export interface ModelConfig {
   }) => void;
 }
 
+const DEFAULT_MODEL_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+
 interface ToolsContext {
   sources: SourceDocument[];
   knowledge: KnowledgeTool;
@@ -506,24 +508,50 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
       allowTools,
       messageCount: requestMessages.length
     }));
-    const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-      method: "POST",
-      signal: AbortSignal.timeout(config.timeoutMs),
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${config.apiKey}`
-      },
-      body: JSON.stringify({
-        model: config.model,
-        reasoning_effort: config.reasoningEffort,
-        ...outputBudget,
-        temperature: 0.1,
-        stream: true,
-        messages: requestMessages,
-        ...(allowTools ? { tools, tool_choice: "auto" } : {})
-      })
+    const requestBody = JSON.stringify({
+      model: config.model,
+      reasoning_effort: config.reasoningEffort,
+      ...outputBudget,
+      temperature: 0.1,
+      stream: true,
+      messages: requestMessages,
+      ...(allowTools ? { tools, tool_choice: "auto" } : {})
     });
-    const message = await readCompletionResponse(response);
+    const maxRetries = config.maxRetries ?? 2;
+    let message: ChatMessage | undefined;
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+          method: "POST",
+          signal: AbortSignal.timeout(config.timeoutMs),
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${config.apiKey}`
+          },
+          body: requestBody
+        });
+        message = await readCompletionResponse(response);
+        break;
+      } catch (error) {
+        lastError = error;
+        if (attempt >= maxRetries) throw error;
+        reportModelProgress(config, {
+          status: "running",
+          retries: attempt + 1,
+          message: `模型请求失败，准备第 ${attempt + 1} 次重试`
+        });
+        console.warn("[agent-core] model request failed; retrying", JSON.stringify({
+          agent: config.agentName ?? "unknown",
+          round,
+          attempt: attempt + 1,
+          retriesRemaining: maxRetries - attempt,
+          error: error instanceof Error ? error.message : String(error)
+        }));
+        await new Promise((resolve) => setTimeout(resolve, Math.min(5_000, 400 * (attempt + 1))));
+      }
+    }
+    if (!message) throw lastError instanceof Error ? lastError : new Error("Model request failed");
     if (!message.tool_calls?.length) return message.content ?? "";
     console.info("[agent-core] model requested tools", JSON.stringify({
       round,
@@ -797,6 +825,7 @@ export async function runModelFollowUp(input: {
   knowledge: KnowledgeTool;
   promptDir?: string;
   config: ModelConfig;
+  onProgress?: (progress: Partial<AgentProgress>) => void;
 }): Promise<{ answer: string; session: MainAgentSession }> {
   const baseMessages: ChatMessage[] = input.session?.messages?.length
     ? input.session.messages
@@ -820,7 +849,14 @@ export async function runModelFollowUp(input: {
     ? baseMessages
     : [...baseMessages, { role: "system" as const, content: followUpConversationInstruction }];
   const answer = await completion(
-    { ...input.config, model: input.session?.model ?? input.config.model },
+    {
+      ...input.config,
+      model: input.session?.model ?? input.config.model,
+      agentName: input.config.agentName ?? "main",
+      onProgress: input.onProgress
+        ? ({ progress }) => input.onProgress?.(progress)
+        : input.config.onProgress
+    },
     [...conversationMessages, { role: "user", content: input.message }],
     { sources: input.sources, knowledge: input.knowledge }
   );
@@ -887,7 +923,7 @@ export function modelConfigFromEnv(): ModelConfig | undefined {
     baseUrl: resolveEnvReference(process.env.OPENAI_BASE_URL) ?? "https://api.openai.com/v1",
     model: resolveEnvReference(process.env.MODEL_NAME) ?? "gpt-4.1-mini",
     reasoningEffort,
-    timeoutMs: Number.isFinite(configuredTimeout) && configuredTimeout >= 10_000 ? configuredTimeout : 180_000,
+    timeoutMs: Number.isFinite(configuredTimeout) && configuredTimeout >= 10_000 ? configuredTimeout : DEFAULT_MODEL_TIMEOUT_MS,
     maxToolRounds: Number.isInteger(configuredRounds) && configuredRounds >= 0 && configuredRounds <= 100 ? configuredRounds : 100,
     maxRetries: Number.isInteger(configuredRetries) && configuredRetries >= 0 && configuredRetries <= 100 ? configuredRetries : 100,
     maxCompletionTokens: Number.isInteger(configuredOutputTokens)

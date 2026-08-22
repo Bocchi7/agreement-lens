@@ -8,7 +8,7 @@ import {
   Sparkles, Trash2, Upload, UserRoundX, X
 } from "lucide-react";
 import type {
-  AnalysisResult, DiscoveredSource, Finding, JobStatus, UserContext, VersionComparison
+  AgentProgress, AnalysisResult, DiscoveredSource, Finding, JobStatus, UserContext, VersionComparison
 } from "@agreement-lens/shared";
 import { maxSourceDocuments } from "@agreement-lens/shared";
 import { api, ApiError } from "./api";
@@ -88,6 +88,13 @@ function isHttpUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+function formatElapsed(milliseconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1_000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}分${String(seconds).padStart(2, "0")}秒` : `${seconds}秒`;
 }
 
 type PersistedAnalysisState = {
@@ -235,6 +242,9 @@ export function App() {
   const [permissionTarget, setPermissionTarget] = useState<{ id: number; url: string } | null>(null);
   const [saving, setSaving] = useState(false);
   const [asking, setAsking] = useState(false);
+  const [followUpProgress, setFollowUpProgress] = useState<AgentProgress | null>(null);
+  const [askingSince, setAskingSince] = useState<number | null>(null);
+  const [clock, setClock] = useState(Date.now());
   const [supplementing, setSupplementing] = useState(false);
   const [preserveResultWhileRunning, setPreserveResultWhileRunning] = useState(false);
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
@@ -487,6 +497,23 @@ export function App() {
     }, 700);
     return () => window.clearInterval(timer);
   }, [phase, job?.id, preserveResultWhileRunning, result?.id, currentHistory]);
+
+  useEffect(() => {
+    if (!asking || !result) return;
+    const timer = window.setInterval(() => setClock(Date.now()), 1_000);
+    const poll = window.setInterval(() => {
+      void api.followUpProgress(result.id)
+        .then((response) => setFollowUpProgress(response.progress))
+        .catch(() => undefined);
+    }, 1_000);
+    void api.followUpProgress(result.id)
+      .then((response) => setFollowUpProgress(response.progress))
+      .catch(() => undefined);
+    return () => {
+      window.clearInterval(timer);
+      window.clearInterval(poll);
+    };
+  }, [asking, result?.id]);
 
   async function pair() {
     try {
@@ -781,6 +808,8 @@ export function App() {
     setChatInput("");
     setMessages((current) => [...current, { role: "user", text: message }]);
     setAsking(true);
+    setAskingSince(Date.now());
+    setFollowUpProgress({ status: "running", rounds: 0, retries: 0, message: "正在连接主Agent" });
     try {
       const response = await api.followUp(result.id, message, messages);
       setMessages((current) => [...current, { role: "assistant", text: response.answer }]);
@@ -788,6 +817,7 @@ export function App() {
       setMessages((current) => [...current, { role: "assistant", text: cause instanceof Error ? cause.message : "追问失败" }]);
     } finally {
       setAsking(false);
+      setAskingSince(null);
     }
   }
 
@@ -1243,7 +1273,7 @@ export function App() {
         {view === "overview" && <Overview result={result} topFindings={topFindings} openEvidence={openEvidence} setView={setView} />}
         {view === "risks" && <RiskList findings={result.findings} openEvidence={openEvidence} />}
         {view === "sources" && <SourcesView result={result} supplementing={supplementing || (phase === "running" && preserveResultWhileRunning)} readOnly={historyMode} onAddRelated={addRelatedSources} />}
-        {view === "chat" && <ChatView messages={messages} suggestions={result.followUpSuggestions ?? []} input={chatInput} setInput={setChatInput} ask={ask} asking={asking} />}
+        {view === "chat" && <ChatView messages={messages} suggestions={result.followUpSuggestions ?? []} input={chatInput} setInput={setChatInput} ask={ask} asking={asking} progress={followUpProgress} elapsedMs={askingSince ? clock - askingSince : 0} />}
         {view === "versions" && <VersionsView versions={versions} onRecheck={recheck} busy={phase === "running" || historyMode} />}
       </main>
       {selectedFinding && <EvidenceDrawer result={result} finding={selectedFinding} onClose={() => setSelectedFinding(null)} onOpenSource={() => void openSourceEvidence(selectedFinding)} />}
@@ -1423,6 +1453,11 @@ function PrepareScreen(props: {
 }
 
 function RunningScreen({ job, sources, currentHistory, historyCheckState, onCancel }: { job: JobStatus; sources: DiscoveredSource[]; currentHistory: HistoryEntry | null; historyCheckState: HistoryCheckState; onCancel: () => void }) {
+  const [clock, setClock] = useState(Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
   const agentDefinitions = [
     ["fees", "费用"],
     ["privacy", "隐私与数据"],
@@ -1432,7 +1467,7 @@ function RunningScreen({ job, sources, currentHistory, historyCheckState, onCanc
     ["main", "结论整合"],
     ["router", "版本路由"]
   ] as const;
-  return <main className="running"><div className="radar"><span /><Search size={28} /></div><p className="eyebrow">{currentHistory && historyCheckState !== "changed" ? "正在核验历史版本" : `正在分析 ${sources.length} 份材料`}</p><h1>{job.message}</h1>{currentHistory && historyCheckState !== "changed" && <div className="running-history"><History size={15} /><span>已找到历史分析，先比较协议正文；未变化时直接复用，不会重复调用模型。</span></div>}<div className="progress-track"><i style={{ width: `${job.progress}%` }} /></div><span className="progress-number">{job.progress}%</span><div className="agent-grid">{agentDefinitions.map(([key, name]) => {
+  return <main className="running"><div className="radar"><span /><Search size={28} /></div><p className="eyebrow">{currentHistory && historyCheckState !== "changed" ? "正在核验历史版本" : `正在分析 ${sources.length} 份材料`}</p><h1>{job.message}</h1><p className="running-elapsed">已等待 {formatElapsed(clock - new Date(job.createdAt).getTime())}</p>{currentHistory && historyCheckState !== "changed" && <div className="running-history"><History size={15} /><span>已找到历史分析，先比较协议正文；未变化时直接复用，不会重复调用模型。</span></div>}<div className="progress-track"><i style={{ width: `${job.progress}%` }} /></div><span className="progress-number">{job.progress}%</span><div className="agent-grid">{agentDefinitions.map(([key, name]) => {
     const progress = job.agents?.[key];
     const status = progress?.status ?? "idle";
     const Icon = status === "completed" ? Check : status === "failed" ? AlertTriangle : status === "running" ? LoaderCircle : Circle;
@@ -1494,12 +1529,12 @@ function SourcesView({ result, supplementing, readOnly, onAddRelated }: { result
   return <section className="result-section no-top"><div className="view-heading"><h2>分析来源</h2><span>{sources.length} 份</span></div>{sources.map((source) => <div className="source-detail" key={source.id}><div className={`source-status ${source.status}`}><FileText size={17} /></div><div><strong>{source.title}</strong>{source.url && <small className="source-detail-url" title={source.url}>{source.url}</small>}<p>{source.normalizedText.length > 0 ? `${source.sections.length} 个章节 · ${source.normalizedText.length.toLocaleString()} 字` : source.status === "failed" ? "读取失败" : "未取得有效正文"}</p><small>{source.status === "ready" ? "已完整读取并生成内容指纹" : source.error}</small></div>{source.url && <button title="打开来源" onClick={() => chromeAvailable() && chrome.tabs.create({ url: source.url })}><ExternalLink size={15} /></button>}</div>)}{related.length > 0 && <div className="related-box"><div><strong>发现 {related.length} 份更深层关联材料</strong><p>{related.map((item) => item.title).join("、")}</p></div>{readOnly ? <small className="read-only-note">历史分析仅供查看，返回当前页面后可补充材料。</small> : <button disabled={supplementing} onClick={() => onAddRelated(related)}>{supplementing ? <><LoaderCircle className="spin" size={13} />正在处理</> : "确认并继续读取"}</button>}</div>}</section>;
 }
 
-function ChatView({ messages, suggestions, input, setInput, ask, asking }: { messages: Array<{ role: "user" | "assistant"; text: string }>; suggestions: string[]; input: string; setInput: (v: string) => void; ask: () => void; asking: boolean }) {
+function ChatView({ messages, suggestions, input, setInput, ask, asking, progress, elapsedMs }: { messages: Array<{ role: "user" | "assistant"; text: string }>; suggestions: string[]; input: string; setInput: (v: string) => void; ask: () => void; asking: boolean; progress: AgentProgress | null; elapsedMs: number }) {
   const endRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, asking]);
-  return <section className="chat-view"><div className="chat-stream">{messages.length === 0 && <div className="chat-empty"><MessageCircle size={25} /><strong>继续追问这份协议</strong><p>可以问某项条款对你的具体影响，回答会附上当前来源中的依据。</p>{suggestions.length > 0 && <div className="suggestions">{suggestions.map((text) => <button key={text} onClick={() => setInput(text)}>{text}</button>)}</div>}</div>}{messages.map((message, index) => <div className={`message ${message.role}`} key={index}>{message.role === "assistant" ? <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a> }}>{message.text}</ReactMarkdown> : message.text}</div>)}{asking && <div className="message assistant thinking" aria-label="Agent 正在回答"><span /><span /><span /></div>}<div ref={endRef} /></div><div className="chat-composer"><textarea rows={1} value={input} disabled={asking} placeholder={asking ? "Agent 正在回答" : "追问条款或补充你的情况"} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); } }} /><button title={asking ? "正在回答" : "发送"} disabled={asking || !input.trim()} onClick={ask}>{asking ? <LoaderCircle size={17} className="spin" /> : <Send size={17} />}</button></div></section>;
+  return <section className="chat-view"><div className="chat-stream">{messages.length === 0 && <div className="chat-empty"><MessageCircle size={25} /><strong>继续追问这份协议</strong><p>可以问某项条款对你的具体影响，回答会附上当前来源中的依据。</p>{suggestions.length > 0 && <div className="suggestions">{suggestions.map((text) => <button key={text} onClick={() => setInput(text)}>{text}</button>)}</div>}</div>}{messages.map((message, index) => <div className={`message ${message.role}`} key={index}>{message.role === "assistant" ? <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a> }}>{message.text}</ReactMarkdown> : message.text}</div>)}{asking && <div className="follow-up-status"><LoaderCircle size={15} className="spin" /><span>已等待 {formatElapsed(elapsedMs)} · 交互 {progress?.rounds ?? 0} 轮 · 重试 {progress?.retries ?? 0} 次</span><small>{progress?.message ?? "正在等待模型响应"}</small></div>}{asking && <div className="message assistant thinking" aria-label="Agent 正在回答"><span /><span /><span /></div>}<div ref={endRef} /></div><div className="chat-composer"><textarea rows={1} value={input} disabled={asking} placeholder={asking ? "Agent 正在回答" : "追问条款或补充你的情况"} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); } }} /><button title={asking ? "正在回答" : "发送"} disabled={asking || !input.trim()} onClick={ask}>{asking ? <LoaderCircle size={17} className="spin" /> : <Send size={17} />}</button></div></section>;
 }
 
 function VersionsView({ versions, onRecheck, busy }: { versions: { analyses: Array<{ analysisId: string; createdAt: string; recommendation: string; fingerprints: string[] }>; comparisons: VersionComparison[] }; onRecheck: () => void; busy: boolean }) {

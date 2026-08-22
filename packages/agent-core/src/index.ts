@@ -652,7 +652,8 @@ export async function answerFollowUp(
   message: string,
   session: MainAgentSession | undefined,
   knowledge?: KnowledgeTool,
-  promptDir?: string
+  promptDir?: string,
+  onProgress?: (progress: Partial<AgentProgress>) => void
 ): Promise<{ answer: string; session?: MainAgentSession }> {
   const modelConfig = modelConfigFromEnv();
   if (modelConfig && knowledge) {
@@ -663,7 +664,12 @@ export async function answerFollowUp(
       sources: result.sources,
       knowledge,
       promptDir,
-      config: { ...modelConfig, model: process.env.MODEL_MAIN ?? modelConfig.model }
+      config: {
+        ...modelConfig,
+        model: process.env.MODEL_MAIN ?? modelConfig.model,
+        agentName: "main"
+      },
+      onProgress
     });
   }
   const normalized = message.toLowerCase();

@@ -16,7 +16,7 @@ describe("OpenAI-compatible model adapter", () => {
       process.env.TEST_MODEL_API_KEY = "resolved-secret";
       expect(modelConfigFromEnv()?.apiKey).toBe("resolved-secret");
       expect(modelConfigFromEnv()?.reasoningEffort).toBe("low");
-      expect(modelConfigFromEnv()?.timeoutMs).toBe(180_000);
+      expect(modelConfigFromEnv()?.timeoutMs).toBe(86_400_000);
       expect(modelConfigFromEnv()?.maxToolRounds).toBe(100);
       expect(modelConfigFromEnv()?.maxRetries).toBe(100);
       expect(modelConfigFromEnv()?.maxCompletionTokens).toBeUndefined();
