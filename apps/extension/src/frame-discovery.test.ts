@@ -27,6 +27,15 @@ describe("frame discovery helpers", () => {
     )).toBe("https://privacy.baidu.com/policy/children-privacy-policy/index.html");
   });
 
+  it("removes common tracking parameters while preserving meaningful query parameters", () => {
+    expect(canonicalDiscoveredSourceUrl(
+      "https://www.sohu.com/xchannel/TURBd01EQXdNekky?spm=smpc.home.loginpop.5.1787366611540Fr5I1vK_1467"
+    )).toBe("https://www.sohu.com/xchannel/TURBd01EQXdNekky");
+    expect(canonicalDiscoveredSourceUrl(
+      "https://example.com/terms?type=privacy&utm_source=homepage"
+    )).toBe("https://example.com/terms?type=privacy");
+  });
+
   it("requests the current host and its same-site subdomains", () => {
     expect(permissionPatternsForSite("https://www.4399.com/")).toEqual([
       "https://www.4399.com/*",

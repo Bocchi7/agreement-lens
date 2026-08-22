@@ -29,6 +29,28 @@ export function decodeHtmlBytes(bytes: Uint8Array, contentType = ""): string {
   }
 }
 
+const trackingQueryParameter = /^(?:utm_[^=]*|spm|from|source|src|ref|referer|referrer|campaign|campaignid|clickid|click_id|adid|ad_id|fbclid|gclid|msclkid|yclid|igshid|share_token)$/i;
+
+export function canonicalSourceUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.hostname = url.hostname.toLocaleLowerCase();
+    if ((url.protocol === "http:" && url.port === "80") || (url.protocol === "https:" && url.port === "443")) url.port = "";
+    if (url.hash && !/^#(?:!\/|\/)/.test(url.hash)) url.hash = "";
+    for (const key of [...url.searchParams.keys()]) {
+      if (trackingQueryParameter.test(key) || (/^_\d{10,}$/.test(key) && !url.searchParams.get(key))) {
+        url.searchParams.delete(key);
+      }
+    }
+    url.searchParams.sort();
+    url.pathname = url.pathname.replace(/\/{2,}/g, "/");
+    if (url.pathname.length > 1) url.pathname = url.pathname.replace(/\/+$/, "");
+    return url.href;
+  } catch {
+    return value;
+  }
+}
+
 export const actionTypes = ["register", "pay", "upload", "authorize", "other"] as const;
 export const riskCategories = ["money", "data", "content", "account", "remedies"] as const;
 export const severities = ["low", "medium", "high", "critical"] as const;

@@ -43,13 +43,22 @@ function normalize(text: string): string {
 
 function canonicalAgreementUrl(url: URL): string {
   const normalized = new URL(url.href);
+  normalized.hostname = normalized.hostname.toLocaleLowerCase();
+  if ((normalized.protocol === "http:" && normalized.port === "80") || (normalized.protocol === "https:" && normalized.port === "443")) normalized.port = "";
   if (normalized.hash && !/^#(?:!\/|\/)/.test(normalized.hash)) normalized.hash = "";
+  for (const key of [...normalized.searchParams.keys()]) {
+    if (/^(?:utm_[^=]*|spm|from|source|src|ref|referer|referrer|campaign|campaignid|clickid|click_id|adid|ad_id|fbclid|gclid|msclkid|yclid|igshid|share_token)$/i.test(key)
+      || (/^_\d{10,}$/.test(key) && !normalized.searchParams.get(key))) normalized.searchParams.delete(key);
+  }
+  normalized.searchParams.sort();
+  normalized.pathname = normalized.pathname.replace(/\/{2,}/g, "/");
+  if (normalized.pathname.length > 1) normalized.pathname = normalized.pathname.replace(/\/+$/, "");
   return normalized.href;
 }
 
 function sourceUrlIdentity(value: string): string {
   try {
-    const url = new URL(value);
+    const url = new URL(canonicalAgreementUrl(new URL(value)));
     // HTTP and HTTPS copies of the same agreement are commonly exposed
     // together. Treat them as one source while preferring HTTPS below.
     const protocolIndependent = `${url.hostname.toLocaleLowerCase()}${url.port ? `:${url.port}` : ""}${url.pathname}${url.search}${url.hash}`;

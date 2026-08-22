@@ -242,9 +242,16 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
   };
   const canonicalUrl = (value: string): string => {
     const url = new URL(value, location.href);
+    url.hostname = url.hostname.toLocaleLowerCase();
+    if ((url.protocol === "http:" && url.port === "80") || (url.protocol === "https:" && url.port === "443")) url.port = "";
+    if (url.hash && !/^#(?:!\/|\/)/.test(url.hash)) url.hash = "";
     for (const key of [...url.searchParams.keys()]) {
-      if (/^_\d{10,}$/.test(key) && !url.searchParams.get(key)) url.searchParams.delete(key);
+      if (/^(?:utm_[^=]*|spm|from|source|src|ref|referer|referrer|campaign|campaignid|clickid|click_id|adid|ad_id|fbclid|gclid|msclkid|yclid|igshid|share_token)$/i.test(key)
+        || (/^_\d{10,}$/.test(key) && !url.searchParams.get(key))) url.searchParams.delete(key);
     }
+    url.searchParams.sort();
+    url.pathname = url.pathname.replace(/\/{2,}/g, "/");
+    if (url.pathname.length > 1) url.pathname = url.pathname.replace(/\/+$/, "");
     return url.href;
   };
 
