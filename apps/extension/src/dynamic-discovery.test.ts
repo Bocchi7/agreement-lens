@@ -103,6 +103,33 @@ describe("dynamic agreement discovery", () => {
     ]);
   });
 
+  it("captures URLs opened by delegated listeners on clickable spans", () => {
+    const dom = new JSDOM(`
+      <div class="agreement-text">
+        <span class="xylink yszc">《隐私政策》</span>
+        <span>和</span>
+        <span class="xylink fwxy">《服务协议》</span>
+      </div>
+    `, { url: "https://passport2.eastmoney.com/pub/login" });
+    const container = dom.window.document.querySelector(".agreement-text")!;
+    container.addEventListener("click", (event) => {
+      const target = (event.target as Element).closest(".xylink");
+      if (target?.classList.contains("yszc")) dom.window.open("https://about.eastmoney.com/home/conceal", "_blank");
+      if (target?.classList.contains("fwxy")) dom.window.open("https://about.eastmoney.com/home/protocol", "_blank");
+    });
+    vi.stubGlobal("document", dom.window.document);
+    vi.stubGlobal("location", dom.window.location);
+    vi.stubGlobal("window", dom.window);
+    vi.stubGlobal("MouseEvent", dom.window.MouseEvent);
+    vi.stubGlobal("URL", dom.window.URL);
+
+    const injectedResolver = new Function(`return (${resolveDynamicAgreementLinks.toString()})`)() as typeof resolveDynamicAgreementLinks;
+    expect(injectedResolver()).toEqual([
+      { title: "隐私政策", url: "https://about.eastmoney.com/home/conceal" },
+      { title: "服务协议", url: "https://about.eastmoney.com/home/protocol" }
+    ]);
+  });
+
   it("finds URLs in an ancestor React fiber reached through the return chain", () => {
     const dom = new JSDOM(`
       <a><span>服务协议</span></a>

@@ -205,7 +205,10 @@ export function resolveDynamicAgreementLinks(): DynamicAgreementLink[] {
     const directTarget = element.getAttribute("href")
       || element.getAttribute("data-href")
       || element.getAttribute("data-url");
-    if (directTarget || !element.matches("a,area,[role='link']")) return [];
+    const looksClickable = element.matches(
+      "a,area,[role='link'],button,[onclick],[class*='link'],[class*='Link']"
+    );
+    if (directTarget || !looksClickable) return [];
     const captured: string[] = [];
     const originalOpen = window.open;
     const capture = (value: unknown) => {
