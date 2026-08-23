@@ -16,7 +16,7 @@ import {
   getAnalysisRequest, getJob, getVersionComparisons, listRecentAnalyses, openKnowledge,
   saveAgentSession, setSaved
 } from "./db.js";
-import { enqueueAnalysis, enqueueRecheck, enqueueVersionCheck, newJob } from "./jobs.js";
+import { abortJob, enqueueAnalysis, enqueueRecheck, enqueueVersionCheck, newJob } from "./jobs.js";
 import { allowedExtensionId, serverPort } from "./config.js";
 import { repoRoot } from "./config.js";
 import { mergeSupplementalSources } from "./supplemental-sources.js";
@@ -107,7 +107,9 @@ app.get("/v1/jobs/:id", async (request, reply) => {
 });
 
 app.post("/v1/jobs/:id/cancel", async (request, reply) => {
-  const job = cancelJob((request.params as { id: string }).id);
+  const id = (request.params as { id: string }).id;
+  const job = cancelJob(id);
+  abortJob(id);
   return job ?? reply.code(404).send({ error: "任务不存在" });
 });
 

@@ -45,6 +45,7 @@ export interface WorkflowInput {
   promptDir?: string;
   domains?: Domain[];
   previousResult?: AnalysisResult;
+  signal?: AbortSignal;
   onMainAgentSession?: (session: MainAgentSession) => void;
 }
 
@@ -343,8 +344,10 @@ export async function runWorkflow(
         promptDir: input.promptDir,
         config: {
           ...modelConfig,
+          signal: input.signal,
           model: roleModel ?? modelConfig.model,
           agentName: domain,
+          traceId: input.analysisId,
           onProgress: ({ progress }) => updateAgent(domain, progress)
         }
       });
@@ -383,8 +386,10 @@ export async function runWorkflow(
         promptDir: input.promptDir,
         config: {
           ...modelConfig,
+          signal: input.signal,
           model: process.env.MODEL_VERIFIER ?? modelConfig.model,
           agentName: "verifier",
+          traceId: input.analysisId,
           onProgress: ({ progress }) => updateAgent("verifier", progress)
         }
       });
@@ -460,8 +465,10 @@ export async function runWorkflow(
         promptDir: input.promptDir,
         config: {
           ...modelConfig,
+          signal: input.signal,
           model: process.env.MODEL_MAIN ?? modelConfig.model,
           agentName: "main",
+          traceId: input.analysisId,
           onProgress: ({ progress }) => updateAgent("main", progress)
         }
       });

@@ -259,6 +259,61 @@ describe("OpenAI-compatible model adapter", () => {
     expect(finalMessages.at(-1)?.content).toContain("工具调用阶段已经结束");
   });
 
+  it("forces a final answer when the model repeats the same tool request", async () => {
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      response.setHeader("content-type", "application/json");
+      if (requestBodies.length <= 3) {
+        response.end(JSON.stringify({
+          choices: [{
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [{
+                id: `repeated-tool-${requestBodies.length}`,
+                type: "function",
+                function: { name: "search_sources", arguments: "{\"query\":\"自动续费\"}" }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      response.end(JSON.stringify({
+        choices: [{ message: { role: "assistant", content: JSON.stringify({ findings: [] }) } }]
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    const findings = await runModelSpecialist({
+      role: "fees",
+      sources: [{
+        id: "source-1", title: "会员协议", mediaType: "text", normalizedText: "服务将自动续费。",
+        fingerprint: "fixture", sections: [{ id: "section-1", heading: "续费", content: "服务将自动续费。" }],
+        fetchedAt: new Date().toISOString(), status: "ready"
+      }],
+      context: { action: "pay", concerns: ["money"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test", baseUrl: `http://127.0.0.1:${address.port}/v1`, model: "test-model",
+        reasoningEffort: "low", timeoutMs: 45_000, maxToolRounds: 100
+      }
+    });
+
+    expect(findings).toEqual([]);
+    expect(requestBodies).toHaveLength(4);
+    expect(requestBodies[3]?.tools).toBeUndefined();
+    const finalMessages = requestBodies[3]?.messages as Array<{ role: string; content?: string }>;
+    expect(finalMessages.at(-1)?.content).toContain("工具调用阶段已经结束");
+    expect(finalMessages.some((message) => message.role === "tool" && message.content?.includes("already been executed twice"))).toBe(true);
+  });
+
   it("returns complete large source sections to the model without a 30k truncation", async () => {
     const requestBodies: Array<Record<string, unknown>> = [];
     const server = http.createServer(async (request, response) => {

@@ -11,6 +11,22 @@ import path from "node:path";
 const queue: Array<() => Promise<void>> = [];
 let active = 0;
 const maxConcurrency = 2;
+const jobControllers = new Map<string, AbortController>();
+
+export function abortJob(jobId: string): void {
+  jobControllers.get(jobId)?.abort();
+}
+
+async function runWithJobSignal(jobId: string, task: (signal: AbortSignal) => Promise<void>): Promise<void> {
+  if (isCancelled(jobId)) return;
+  const controller = new AbortController();
+  jobControllers.set(jobId, controller);
+  try {
+    await task(controller.signal);
+  } finally {
+    if (jobControllers.get(jobId) === controller) jobControllers.delete(jobId);
+  }
+}
 
 function analysisInputSnapshot(input: CreateAnalysisInput): AnalysisInputSnapshot {
   return {
@@ -62,7 +78,7 @@ function assertUsableSources(sources: Awaited<ReturnType<typeof loadSourceGraph>
 }
 
 export function enqueueAnalysis(jobId: string, analysisId: string, serviceId: string, input: CreateAnalysisInput) {
-  queue.push(async () => {
+  queue.push(() => runWithJobSignal(jobId, async (signal) => {
     try {
       setJob(jobId, { state: "fetching", progress: 10, message: "正在读取并整理协议来源" });
       const selected = input.sources.filter((source) => source.selected).slice(0, maxSourceDocuments);
@@ -73,7 +89,7 @@ export function enqueueAnalysis(jobId: string, analysisId: string, serviceId: st
       let mainAgentSession: MainAgentSession | undefined;
       const result = await runWorkflow({
         analysisId, serviceId, serviceName: input.serviceName,
-        sources, context: input.context, promptDir: path.join(repoRoot, "prompts"),
+        sources, context: input.context, signal, promptDir: path.join(repoRoot, "prompts"),
         analysisInput: analysisInputSnapshot(input),
         onMainAgentSession: (session) => { mainAgentSession = session; }
       }, openKnowledge(), (progress) => setJob(jobId, {
@@ -87,7 +103,7 @@ export function enqueueAnalysis(jobId: string, analysisId: string, serviceId: st
       const message = error instanceof Error ? error.message : "分析任务失败";
       setJob(jobId, { state: "failed", progress: 100, message: "分析失败", error: message });
     }
-  });
+  }));
   pump();
 }
 
@@ -98,7 +114,7 @@ export function enqueueRecheck(
   input: CreateAnalysisInput,
   previousResult: AnalysisResult
 ) {
-  queue.push(async () => {
+  queue.push(() => runWithJobSignal(jobId, async (signal) => {
     try {
       setJob(jobId, { state: "fetching", progress: 12, message: "正在重新抓取并计算内容指纹" });
       const selected = input.sources.filter((source) => source.selected).slice(0, maxSourceDocuments);
@@ -128,6 +144,7 @@ export function enqueueRecheck(
         serviceName: input.serviceName,
         sources,
         context: input.context,
+        signal,
         promptDir: path.join(repoRoot, "prompts"),
         analysisInput: analysisInputSnapshot(input),
         saved: true,
@@ -163,7 +180,7 @@ export function enqueueRecheck(
       const message = error instanceof Error ? error.message : "版本复核失败";
       setJob(jobId, { state: "failed", progress: 100, message: "版本复核失败", error: message });
     }
-  });
+  }));
   pump();
 }
 
@@ -174,7 +191,7 @@ export function enqueueVersionCheck(
   input: CreateAnalysisInput,
   previousResult: AnalysisResult
 ) {
-  queue.push(async () => {
+  queue.push(() => runWithJobSignal(jobId, async (signal) => {
     try {
       setJob(jobId, { state: "fetching", progress: 12, message: "正在检查协议版本是否变化" });
       const selected = input.sources.filter((source) => source.selected).slice(0, maxSourceDocuments);
@@ -192,7 +209,7 @@ export function enqueueVersionCheck(
       const message = error instanceof Error ? error.message : "版本检查失败";
       setJob(jobId, { state: "failed", progress: 100, message: "版本检查失败", error: message });
     }
-  });
+  }));
   pump();
 }
 
