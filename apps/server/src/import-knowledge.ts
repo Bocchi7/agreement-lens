@@ -31,6 +31,13 @@ const insertDocument = db.prepare(`
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 let count = 0;
+const textMetadata = (value: unknown): string | null => {
+  if (value === undefined || value === null) return null;
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+  return null;
+};
+
 for (const file of fs.existsSync(inputDir) ? fs.readdirSync(inputDir).filter((name) => name.endsWith(".md")) : []) {
   const raw = fs.readFileSync(path.join(inputDir, file), "utf8");
   const parsed = matter(raw);
@@ -42,10 +49,10 @@ for (const file of fs.existsSync(inputDir) ? fs.readdirSync(inputDir).filter((na
     id,
     title,
     source,
-    parsed.data.jurisdiction ?? null,
-    parsed.data.document_type ?? null,
-    parsed.data.effective_date ?? null,
-    parsed.data.source_url ?? null,
+    textMetadata(parsed.data.jurisdiction),
+    textMetadata(parsed.data.document_type),
+    textMetadata(parsed.data.effective_date),
+    textMetadata(parsed.data.source_url),
     createHash("sha256").update(body).digest("hex"),
     JSON.stringify(parsed.data)
   );
