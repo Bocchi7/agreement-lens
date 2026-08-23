@@ -1,7 +1,42 @@
 import { describe, expect, it } from "vitest";
-import { contentFingerprint, routeChangedContent, runWorkflow } from "./index.js";
+import { contentFingerprint, dedupeFindings, routeChangedContent, runWorkflow } from "./index.js";
 
 describe("workflow", () => {
+  it("merges model findings that cite the same clause under different titles", () => {
+    const quote = "您一旦接受本协议，即在全世界范围内永久、免费、独家且不可撤销地授权平台用于商业用途并向第三方转授权。";
+    const makeFinding = (id: string, title: string, action: string, confidence: number) => ({
+      id,
+      category: "content" as const,
+      title,
+      trigger: "发布内容时",
+      platformAction: action,
+      userImpact: "内容可能被长期商业使用",
+      severity: "high" as const,
+      confidence,
+      actions: [action],
+      evidence: [{ sourceId: "terms", sectionId: "license", quote, verified: false }],
+      knowledgeRefs: [],
+      uncertainty: "",
+      status: "needs_verification" as const
+    });
+    const findings = dedupeFindings([
+      makeFinding("one", "用户发布内容被授予全球永久免费且不可撤销的广泛商业使用权", "平台可用于商业用途并转授权", 0.99),
+      makeFinding("two", "上传内容被授予全球永久且不可撤销的商业使用及转授权许可", "平台可修改内容并转授权", 0.99),
+      makeFinding("three", "发布内容被授予永久、免费且不可撤销的广泛商业使用权", "平台可制作衍生作品", 0.99),
+      makeFinding("four", "发布内容将被授予全球永久且不可撤销的独家商业使用权", "平台可在全球范围内独家使用", 0.98)
+    ]);
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.title).toBe("用户发布内容被授予全球永久免费且不可撤销的广泛商业使用权");
+    expect(findings[0]?.evidence).toHaveLength(1);
+    expect(findings[0]?.actions).toEqual([
+      "平台可用于商业用途并转授权",
+      "平台可修改内容并转授权",
+      "平台可制作衍生作品",
+      "平台可在全球范围内独家使用"
+    ]);
+  });
+
   it("finds and verifies an automatic renewal risk", async () => {
     const text = "会员服务将在到期后自动续费并从原支付账户扣款。用户可提前取消。";
     const result = await runWorkflow({
