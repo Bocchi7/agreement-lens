@@ -228,6 +228,73 @@ function extractNetEaseTermsRoute(script: string, kind: NetEaseTermsKind): strin
   return match?.[1];
 }
 
+function isMeituanRuleCenterUrl(url: URL): boolean {
+  return url.hostname.toLocaleLowerCase() === "rules-center.meituan.com"
+    && /^\/(?:rules-detail|rule-detail)\/\d+(?:\/\d+)?\/?$/i.test(url.pathname);
+}
+
+function meituanRuleId(url: URL): number | undefined {
+  const match = url.pathname.match(/^\/(?:rules-detail|rule-detail)\/(\d+)/i);
+  const id = match?.[1] ? Number(match[1]) : NaN;
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined;
+}
+
+function escapeHtmlText(value: string): string {
+  return value.replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  }[character] ?? character));
+}
+
+async function fetchMeituanRuleCenterHtml(url: URL): Promise<{ html: string; title: string } | undefined> {
+  if (!isMeituanRuleCenterUrl(url)) return undefined;
+  const sourceId = meituanRuleId(url);
+  if (!sourceId) return undefined;
+  const response = await fetch("https://rules-center.meituan.com/cap-rules-center/us/api/unionRule/queryUnionRuleDetail", {
+    method: "POST",
+    signal: AbortSignal.timeout(15_000),
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      "user-agent": "AgreementLens/0.1 (+local research project)"
+    },
+    body: JSON.stringify({
+      sourceId,
+      type: Number(url.pathname.match(/^\/rule-detail\/\d+\/(\d+)/i)?.[1] ?? 1)
+    })
+  });
+  if (!response.ok) throw new Error(`美团规则中心接口返回 HTTP ${response.status}`);
+  const payload = await response.json() as {
+    code?: number;
+    data?: {
+      unionRuleDTO?: {
+        title?: string;
+        subTitle?: string;
+        detail?: string;
+        publishTime?: string | number;
+        version?: string;
+      };
+    };
+  };
+  const rule = payload.data?.unionRuleDTO;
+  if (payload.code !== 0 || !rule?.detail?.trim()) throw new Error("美团规则中心接口未返回协议正文");
+  const published = rule.publishTime
+    ? `<p>发布日期：${escapeHtmlText(String(rule.publishTime))}</p>`
+    : "";
+  const title = rule.title ?? rule.subTitle ?? "美团规则";
+  return {
+    title,
+    html: `<main>
+      <h1>${escapeHtmlText(title)}</h1>
+      ${published}
+      <section>${rule.detail}</section>
+    </main>`
+  };
+}
+
 async function fetchNetEaseOfficialTermsHtml(url: URL): Promise<string | undefined> {
   const kind = netEaseTermsKind(url);
   if (!kind) return undefined;
@@ -364,6 +431,19 @@ export async function loadSource(source: DiscoveredSource, renderedHtml?: string
       const bytes = Uint8Array.from(Buffer.from(source.dataBase64, "base64"));
       return persistSnapshot(await parsePdf(source.id, source.title, bytes, source.url), bytes);
     }
+    const specialUrl = source.url ? new URL(source.url) : undefined;
+    if (specialUrl && source.kind === "url" && isMeituanRuleCenterUrl(specialUrl)) {
+      const meituanHtml = await fetchMeituanRuleCenterHtml(specialUrl);
+      if (meituanHtml) {
+        return persistSnapshot(parseHtml(source.id, meituanHtml.title, meituanHtml.html, source.url), meituanHtml.html, {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+            "x-agreement-lens-source": "meituan-rule-center-api"
+          }
+        });
+      }
+    }
     if (source.renderedHtml && source.kind === "url") {
       return persistSnapshot(parseHtml(source.id, source.title, source.renderedHtml, source.url), source.renderedHtml, {
         status: 200,
@@ -408,6 +488,16 @@ export async function loadSource(source: DiscoveredSource, renderedHtml?: string
     const html = decodeHtmlBytes(bytes, contentType);
     const parsed = parseHtml(source.id, source.title, html, source.url);
     if (parsed.normalizedText.length < 1000) {
+      const meituanHtml = await fetchMeituanRuleCenterHtml(url);
+      if (meituanHtml) {
+        return persistSnapshot(parseHtml(source.id, meituanHtml.title, meituanHtml.html, source.url), meituanHtml.html, {
+          status: response.status,
+          headers: {
+            ...Object.fromEntries(response.headers.entries()),
+            "x-agreement-lens-source": "meituan-rule-center-api"
+          }
+        });
+      }
       const netEaseHtml = await fetchNetEaseOfficialTermsHtml(url);
       if (netEaseHtml) {
         return persistSnapshot(parseHtml(source.id, source.title, netEaseHtml, source.url), netEaseHtml, {

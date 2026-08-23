@@ -32,10 +32,16 @@ function isClientRenderedShell(document: Document): boolean {
   return hasJavaScriptApp || /enable javascript|需要启用 javascript/i.test(noscriptText);
 }
 
+function hasEmptyAgreementContainer(document: Document): boolean {
+  return [...document.querySelectorAll(
+    ".detail.ProseMirror, .detail-container .detail, [class*='agreement-detail'], [class*='policy-detail']"
+  )].some((element) => (element.textContent ?? "").replace(/\s+/g, " ").trim().length < 80);
+}
+
 export function needsRenderedFallback(html: string): boolean {
   if (typeof DOMParser === "undefined") {
     return visibleTextLength(html) < 300 || hasClientRenderedShellMarkup(html);
   }
   const document = new DOMParser().parseFromString(html, "text/html");
-  return visibleTextLength(html) < 300 || isClientRenderedShell(document);
+  return visibleTextLength(html) < 300 || isClientRenderedShell(document) || hasEmptyAgreementContainer(document);
 }

@@ -51,6 +51,25 @@ describe("HTML readiness detection", () => {
     expect(needsRenderedFallback(html)).toBe(true);
   });
 
+  it("recognizes a rule page whose footer is present before its detail body", () => {
+    const dom = new JSDOM(`
+      <html>
+        <body>
+          <div id="app">
+            <div class="detail-container">
+              <div class="title"><h1></h1></div>
+              <div class="detail ProseMirror"></div>
+            </div>
+          </div>
+          <footer>${"新闻中心 媒体资源 供应商 联系我们 隐私政策 ".repeat(30)}</footer>
+        </body>
+      </html>
+    `);
+    vi.stubGlobal("DOMParser", dom.window.DOMParser);
+    expect(visibleTextLength(dom.serialize())).toBeGreaterThan(300);
+    expect(needsRenderedFallback(dom.serialize())).toBe(true);
+  });
+
   it("does not classify a normal document with an empty unrelated container as a shell", () => {
     const dom = new JSDOM(`
       <html>

@@ -97,15 +97,27 @@ async function captureRenderedTab(tabId: number): Promise<CapturedRenderedPage> 
         clone.querySelectorAll("script,style,noscript,template").forEach((node) => node.remove());
         return (clone.textContent ?? "").replace(/\s+/g, " ").trim().length;
       };
+      const agreementBodyIsStillLoading = () => {
+        const emptyDetail = [...document.querySelectorAll(
+          ".detail.ProseMirror, .detail-container .detail, [class*='agreement-detail'], [class*='policy-detail']"
+        )].some((element) => (element.textContent ?? "").replace(/\s+/g, " ").trim().length < 80);
+        const emptyDetailTitle = [...document.querySelectorAll(
+          ".detail-container .title h1, [class*='agreement-detail'] h1, [class*='policy-detail'] h1"
+        )].some((element) => !(element.textContent ?? "").trim());
+        return emptyDetail || emptyDetailTitle;
+      };
       const startedAt = Date.now();
-      for (let attempt = 0; attempt < 12; attempt += 1) {
+      for (let attempt = 0; attempt < 16; attempt += 1) {
         const textLength = visibleTextLength();
         const elapsed = Date.now() - startedAt;
         // A readable agreement is more valuable than a perfectly idle page.
         // Sites with timers or analytics can keep mutating their DOM forever.
-        if (textLength >= 300 && elapsed >= 500) break;
-        if (textLength >= 80 && (document.readyState === "complete" || elapsed >= 4_000)) break;
+        if (textLength >= 300 && elapsed >= 500 && !agreementBodyIsStillLoading()) break;
+        if (textLength >= 80 && elapsed >= 1_500 && !agreementBodyIsStillLoading()) break;
         await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      if (agreementBodyIsStillLoading() && visibleTextLength() < 300) {
+        throw new Error("协议正文动态加载未完成");
       }
       const clone = document.documentElement.cloneNode(true) as HTMLElement;
       clone.querySelectorAll("script,style,noscript,iframe,input,textarea,select,button,template").forEach((node) => node.remove());

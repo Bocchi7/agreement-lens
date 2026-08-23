@@ -243,6 +243,44 @@ describe("source loading", () => {
     }
   });
 
+  it("recovers Meituan rule-center agreements from the detail API even when the browser captured only the footer", async () => {
+    const originalFetch = globalThis.fetch;
+    const detail = `<h2>一、协议说明</h2><p>${"美团用户服务协议正文，包含账号注册、服务使用、隐私处理和账号处置规则。".repeat(120)}</p>`;
+    let requestBody = "";
+    globalThis.fetch = (async (input, init) => {
+      expect(String(input)).toBe("https://rules-center.meituan.com/cap-rules-center/us/api/unionRule/queryUnionRuleDetail");
+      requestBody = String(init?.body ?? "");
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          unionRuleDTO: {
+            title: "美团用户服务协议",
+            publishTime: "2023年12月28日",
+            detail
+          }
+        }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    try {
+      const [source] = await loadSourceGraph([{
+        id: `meituan-rule-api-${Date.now()}`,
+        kind: "url",
+        title: "《美团服务协议》",
+        url: "https://rules-center.meituan.com/rules-detail/4",
+        renderedHtml: `<html><body><div class="detail-container"><div class="title"><h1></h1></div><div class="detail ProseMirror"></div></div><footer>${"新闻中心 媒体资源 联系我们 ".repeat(20)}</footer></body></html>`,
+        selected: true,
+        relation: "primary"
+      }], undefined, 1);
+      expect(JSON.parse(requestBody)).toEqual({ sourceId: 4, type: 1 });
+      expect(source?.status).toBe("ready");
+      expect(source?.title).toBe("美团用户服务协议");
+      expect(source?.normalizedText).toContain("美团用户服务协议正文");
+      expect(source?.normalizedText.length).toBeGreaterThan(3000);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("recovers all NetEase Music official agreement bodies from the static app shell", async () => {
     const originalFetch = globalThis.fetch;
     const routes = {

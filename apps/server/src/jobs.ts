@@ -45,8 +45,17 @@ function isCancelled(jobId: string): boolean {
 }
 
 function assertUsableSources(sources: Awaited<ReturnType<typeof loadSourceGraph>>) {
-  if (sources.some((source) => source.normalizedText.trim().length > 80)) return;
-  const detail = sources.map((source) => source.error).filter(Boolean)[0];
+  const hasUsableSource = sources.some((source) => {
+    const length = source.normalizedText.trim().length;
+    return source.mediaType === "text" || source.mediaType === "pdf"
+      ? length > 80
+      : length >= 300;
+  });
+  if (hasUsableSource) return;
+  const detail = sources.map((source) => source.error).filter(Boolean)[0]
+    ?? (sources.length
+      ? `来源正文过短（最长 ${Math.max(...sources.map((source) => source.normalizedText.trim().length), 0)} 字），可能仍依赖动态渲染`
+      : undefined);
   throw new Error(detail
     ? `没有获取到可分析的协议正文：${detail}`
     : "没有获取到可分析的协议正文，请打开协议页面或手动粘贴文本后重试");
