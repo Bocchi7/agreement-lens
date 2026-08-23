@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import type { AnalysisInputSnapshot, AnalysisResult, CreateAnalysisInput, JobStatus, UserContext, VersionComparison } from "@agreement-lens/shared";
+import { dedupeFindings } from "@agreement-lens/agent-core";
 import type { MainAgentSession } from "@agreement-lens/agent-core";
 import { appDbPath, dataDir, knowledgeDbPath, snapshotDir } from "./config.js";
 import { runKnowledgeShell } from "./knowledge-shell.js";
@@ -169,10 +170,21 @@ export function getAgentSession(analysisId: string): MainAgentSession | undefine
   return row ? JSON.parse(row.session_json) as MainAgentSession : undefined;
 }
 
+function compactDuplicateFindings(result: AnalysisResult): AnalysisResult {
+  const findings = dedupeFindings(result.findings);
+  if (findings.length === result.findings.length) return result;
+  const validIds = new Set(findings.map((finding) => finding.id));
+  const topFindingIds = [
+    ...result.topFindingIds.filter((id) => validIds.has(id)),
+    ...findings.filter((finding) => finding.status === "verified").map((finding) => finding.id)
+  ].filter((id, index, ids) => ids.indexOf(id) === index).slice(0, 3);
+  return { ...result, findings, topFindingIds };
+}
+
 export function getAnalysis(id: string): AnalysisResult | undefined {
   const row = db.prepare("SELECT result_json, request_json FROM analyses WHERE id=?").get(id) as { result_json: string | null; request_json: string } | undefined;
   if (!row?.result_json) return;
-  const result = JSON.parse(row.result_json) as AnalysisResult;
+  const result = compactDuplicateFindings(JSON.parse(row.result_json) as AnalysisResult);
   if (!result.analysisInput && row.request_json) {
     const request = JSON.parse(row.request_json) as CreateAnalysisInput;
     result.analysisInput = {
