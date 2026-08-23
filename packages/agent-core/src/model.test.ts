@@ -18,6 +18,7 @@ describe("OpenAI-compatible model adapter", () => {
       process.env.MODEL_API_FORMAT = "responses";
       expect(modelConfigFromEnv()?.apiKey).toBe("resolved-secret");
       expect(modelConfigFromEnv()?.apiFormat).toBe("responses");
+      expect(modelConfigFromEnv()?.toolMode).toBe("native");
       expect(modelConfigFromEnv()?.reasoningEffort).toBe("low");
       expect(modelConfigFromEnv()?.timeoutMs).toBe(86_400_000);
       expect(modelConfigFromEnv()?.maxToolRounds).toBe(100);
@@ -381,66 +382,6 @@ describe("OpenAI-compatible model adapter", () => {
     expect(finalMessages.at(-1)?.content).toContain("工具调用阶段已经结束");
   });
 
-  it("forces a final answer when the model repeats the same tool request", async () => {
-    const requestBodies: Array<Record<string, unknown>> = [];
-    const server = http.createServer(async (request, response) => {
-      const chunks: Buffer[] = [];
-      for await (const chunk of request) chunks.push(Buffer.from(chunk));
-      requestBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
-      response.setHeader("content-type", "application/json");
-      if (requestBodies.length <= 3) {
-        response.end(JSON.stringify({
-          choices: [{
-            message: {
-              role: "assistant",
-              content: null,
-              tool_calls: [{
-                id: `repeated-tool-${requestBodies.length}`,
-                type: "function",
-                function: {
-                  name: "search_sources",
-                  arguments: requestBodies.length % 2 === 1
-                    ? "{\"query\":\"自动续费\",\"limit\":5}"
-                    : "{\"limit\":5,\"query\":\"自动续费\"}"
-                }
-              }]
-            }
-          }]
-        }));
-        return;
-      }
-      response.end(JSON.stringify({
-        choices: [{ message: { role: "assistant", content: JSON.stringify({ findings: [] }) } }]
-      }));
-    });
-    servers.push(server);
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
-
-    const findings = await runModelSpecialist({
-      role: "fees",
-      sources: [{
-        id: "source-1", title: "会员协议", mediaType: "text", normalizedText: "服务将自动续费。",
-        fingerprint: "fixture", sections: [{ id: "section-1", heading: "续费", content: "服务将自动续费。" }],
-        fetchedAt: new Date().toISOString(), status: "ready"
-      }],
-      context: { action: "pay", concerns: ["money"], redlines: [], notes: "" },
-      knowledge: { search: () => [] },
-      config: {
-        apiKey: "test", baseUrl: `http://127.0.0.1:${address.port}/v1`, model: "test-model",
-        reasoningEffort: "low", timeoutMs: 45_000, maxToolRounds: 100
-      }
-    });
-
-    expect(findings).toEqual([]);
-    expect(requestBodies).toHaveLength(4);
-    expect(requestBodies[3]?.tools).toBeUndefined();
-    const finalMessages = requestBodies[3]?.messages as Array<{ role: string; content?: string }>;
-    expect(finalMessages.at(-1)?.content).toContain("工具调用阶段已经结束");
-    expect(finalMessages.some((message) => message.role === "tool" && message.content?.includes("already been executed twice"))).toBe(true);
-  });
-
   it("returns complete large source sections to the model without a 30k truncation", async () => {
     const requestBodies: Array<Record<string, unknown>> = [];
     const server = http.createServer(async (request, response) => {
@@ -734,6 +675,100 @@ describe("OpenAI-compatible model adapter", () => {
     expect(retryMessages.some((message) => message.role === "assistant" && !message.content)).toBe(false);
     expect(progress.some((update) => update.retries === 1)).toBe(true);
     expect(progress.some((update) => update.retries === 2)).toBe(true);
+  });
+
+  it("uses native Gemini function calls and preserves tool results in the next request", async () => {
+    let calls = 0;
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const requestPaths: string[] = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestPaths.push(request.url ?? "");
+      requestBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      calls++;
+      response.setHeader("content-type", "application/json");
+      if (calls === 1) {
+        response.end(JSON.stringify({
+          candidates: [{
+            content: {
+              role: "model",
+              parts: [{
+                thoughtSignature: "native-thought-signature",
+                functionCall: {
+                  name: "search_sources",
+                  args: { query: "自动续费", limit: 3 }
+                }
+              }]
+            }
+          }],
+          usageMetadata: { promptTokenCount: 123, candidatesTokenCount: 11 }
+        }));
+        return;
+      }
+      response.end(JSON.stringify({
+        candidates: [{
+          content: {
+            role: "model",
+            parts: [{ text: JSON.stringify({ findings: [] }) }]
+          }
+        }],
+        usageMetadata: { promptTokenCount: 456, candidatesTokenCount: 22 }
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    const findings = await runModelSpecialist({
+      role: "fees",
+      sources: [{
+        id: "source-1",
+        title: "会员协议",
+        mediaType: "text",
+        normalizedText: "服务将在到期后自动续费并扣款。",
+        fingerprint: "fixture",
+        sections: [{
+          id: "section-1",
+          heading: "续费",
+          content: "服务将在到期后自动续费并扣款。"
+        }],
+        fetchedAt: new Date().toISOString(),
+        status: "ready"
+      }],
+      context: { action: "pay", concerns: ["money"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        model: "gemini-test",
+        apiFormat: "gemini",
+        reasoningEffort: "low",
+        timeoutMs: 45_000,
+        maxToolRounds: 2,
+        agentName: "fees"
+      }
+    });
+
+    expect(findings).toEqual([]);
+    expect(calls).toBe(2);
+    expect(requestPaths).toEqual([
+      "/v1beta/models/gemini-test:generateContent",
+      "/v1beta/models/gemini-test:generateContent"
+    ]);
+    expect(requestBodies[0]?.tools).toBeDefined();
+    expect(requestBodies[0]?.systemInstruction).toBeDefined();
+    const secondContents = requestBodies[1]?.contents as Array<{
+      role: string;
+      parts: Array<{ functionCall?: { name?: string }; functionResponse?: { name?: string; response?: unknown } }>;
+    }>;
+    expect(secondContents.some((content) => content.role === "model"
+      && content.parts.some((part) => part.functionCall?.name === "search_sources"
+        && (part as { thoughtSignature?: string }).thoughtSignature === "native-thought-signature"))).toBe(true);
+    expect(secondContents.some((content) => content.role === "user"
+      && content.parts.some((part) => part.functionResponse?.name === "search_sources"
+        && JSON.stringify(part.functionResponse?.response).includes("自动续费")))).toBe(true);
   });
 
   it("turns an accidental integrator JSON response into a natural follow-up answer", async () => {
