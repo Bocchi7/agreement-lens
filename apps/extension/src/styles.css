@@ -57,8 +57,6 @@ button { color: inherit; }
 .history-preview-main em { margin-top: 5px; color: #28634f; font-size: 9px; line-height: 1.4; font-style: normal; }
 .history-preview-main em span { display: block; }
 .history-check-cancel { margin: -6px 18px 14px; color: #983623; }
-.running-history { width: min(100%, 360px); margin: 12px auto 18px; padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; border: 1px solid #cadbd1; border-radius: 6px; background: #edf5f0; color: #28634f; font-size: 10px; line-height: 1.45; text-align: left; }
-.running-history svg { flex: none; margin-top: 1px; }
 .running-elapsed { margin: -14px auto 18px; color: #65766e; font-size: 10px; }
 .pair-symbol { width: 56px; height: 56px; display: grid; place-items: center; color: #174d3f; background: #e3eee8; border: 1px solid #ccddd4; border-radius: 8px; }
 .pair-symbol.offline-symbol { color: #9c3725; background: #f8e2dc; border-color: #efc7bd; }

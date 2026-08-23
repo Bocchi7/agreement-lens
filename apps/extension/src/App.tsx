@@ -1253,7 +1253,7 @@ export function App() {
   if (phase === "permission") return <Shell onOpenHistory={historyLauncher}><PermissionScreen onGrant={grantAndScan} /></Shell>;
   if (phase === "scanning") return <Shell onOpenHistory={historyLauncher}><Centered><LoaderCircle className="spin" /><p className="eyebrow">正在读取当前站点</p><h2>扫描协议入口</h2></Centered></Shell>;
   if (phase === "preparing") return <Shell onOpenHistory={historyLauncher}><Centered><LoaderCircle className="spin" /><p className="eyebrow">正在准备分析</p><h2>读取协议原文</h2><p>正在获取所选页面并整理分析材料。</p></Centered></Shell>;
-  if (phase === "running" && job && !(preserveResultWhileRunning && result)) return <Shell onOpenHistory={historyLauncher}><RunningScreen job={job} sources={sources} currentHistory={currentHistory} historyCheckState={historyCheckState} onCancel={() => void cancelRunningJob()} /></Shell>;
+  if (phase === "running" && job && !(preserveResultWhileRunning && result)) return <Shell onOpenHistory={historyLauncher}><RunningScreen job={job} sources={sources} onCancel={() => void cancelRunningJob()} /></Shell>;
   if (phase === "offline") return <Shell offline><OfflineScreen detail={error} /></Shell>;
   if (phase === "error") return <Shell onOpenHistory={historyLauncher}><Centered><AlertTriangle size={30} /><h2>操作失败</h2><p>{error}</p><button className="primary" onClick={() => { setError(""); setPhase(snapshot ? "prepare" : "permission"); }}><RefreshCw size={16} />返回并重试</button></Centered></Shell>;
   if (phase === "history") return <Shell onOpenHistory={historyLauncher}><HistoryScreen entries={historyEntries} loading={historyLoading} error={historyError} loadingId={historyLoadingId} deletingId={historyDeletingId} onRetry={() => void refreshHistory()} onOpen={openHistoryEntry} onDelete={deleteHistoryEntry} onBack={returnFromHistory} hasReturn={Boolean(historyReturn)} /></Shell>;
@@ -1400,13 +1400,13 @@ function PrepareScreen(props: {
   const currentVersionSummary = props.historyCheckState === "checking"
     ? "正在检查当前协议是否变化"
     : props.historyCheckState === "unchanged"
-      ? "当前协议材料与历史分析一致"
+      ? "当前协议材料与历史分析一致，可按需重新分析"
       : props.historyCheckState === "changed"
-        ? "当前协议材料与历史分析不一致，可能发生变化"
+        ? "当前协议材料与历史分析不一致，建议重新分析"
         : props.historyCheckState === "failed"
-          ? "版本检查失败，请重试"
-          : props.historyCheckState === "cancelled"
-            ? "版本检查已中断，点击开始分析可直接分析"
+            ? "版本检查失败，请重试"
+            : props.historyCheckState === "cancelled"
+              ? "版本检查已中断，点击开始分析将重新分析当前材料"
             : "正在检查当前协议版本";
   return <main className="prepare">
     <section className="page-intro"><p className="eyebrow">当前页面</p><h1>{snapshot?.pageTitle ?? "未识别页面"}</h1><p className="page-url">{snapshot?.pageUrl}</p><div className="scan-summary"><CheckCircle2 size={17} /><span>发现 {sources.length} 份可能相关的规则</span></div></section>
@@ -1455,7 +1455,7 @@ function PrepareScreen(props: {
   </main>;
 }
 
-function RunningScreen({ job, sources, currentHistory, historyCheckState, onCancel }: { job: JobStatus; sources: DiscoveredSource[]; currentHistory: HistoryEntry | null; historyCheckState: HistoryCheckState; onCancel: () => void }) {
+function RunningScreen({ job, sources, onCancel }: { job: JobStatus; sources: DiscoveredSource[]; onCancel: () => void }) {
   const [clock, setClock] = useState(Date.now());
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 1_000);
@@ -1470,7 +1470,7 @@ function RunningScreen({ job, sources, currentHistory, historyCheckState, onCanc
     ["main", "结论整合"],
     ["router", "版本路由"]
   ] as const;
-  return <main className="running"><div className="radar"><span /><Search size={28} /></div><p className="eyebrow">{currentHistory && historyCheckState !== "changed" ? "正在核验历史版本" : `正在分析 ${sources.length} 份材料`}</p><h1>{job.message}</h1><p className="running-elapsed">已等待 {formatElapsed(clock - new Date(job.createdAt).getTime())}</p>{currentHistory && historyCheckState !== "changed" && <div className="running-history"><History size={15} /><span>已找到历史分析，先比较协议正文；未变化时直接复用，不会重复调用模型。</span></div>}<div className="progress-track"><i style={{ width: `${job.progress}%` }} /></div><span className="progress-number">{job.progress}%</span><div className="agent-grid">{agentDefinitions.map(([key, name]) => {
+  return <main className="running"><div className="radar"><span /><Search size={28} /></div><p className="eyebrow">正在分析 {sources.length} 份材料</p><h1>{job.message}</h1><p className="running-elapsed">已等待 {formatElapsed(clock - new Date(job.createdAt).getTime())}</p><div className="progress-track"><i style={{ width: `${job.progress}%` }} /></div><span className="progress-number">{job.progress}%</span><div className="agent-grid">{agentDefinitions.map(([key, name]) => {
     const progress = job.agents?.[key];
     const status = progress?.status ?? "idle";
     const Icon = status === "completed" ? Check : status === "failed" ? AlertTriangle : status === "running" ? LoaderCircle : Circle;
