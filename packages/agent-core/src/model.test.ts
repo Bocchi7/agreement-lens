@@ -771,6 +771,48 @@ describe("OpenAI-compatible model adapter", () => {
         && JSON.stringify(part.functionResponse?.response).includes("自动续费")))).toBe(true);
   });
 
+  it("does not present inline materials as an exhausted tool budget", async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    const progress: Array<{ message?: string }> = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBody = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({
+        choices: [{ message: { role: "assistant", content: JSON.stringify({ findings: [] }) } }]
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    const findings = await runModelSpecialist({
+      role: "fees",
+      sources: [],
+      context: { action: "pay", concerns: ["money"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        model: "test-model",
+        toolMode: "inline",
+        reasoningEffort: "low",
+        timeoutMs: 45_000,
+        maxToolRounds: 100,
+        agentName: "fees",
+        onProgress: ({ progress: update }) => progress.push(update)
+      }
+    });
+
+    expect(findings).toEqual([]);
+    expect(requestBody?.tools).toBeUndefined();
+    const messages = requestBody?.messages as Array<{ content?: string }>;
+    expect(messages.some((message) => message.content?.includes("工具调用阶段已经结束"))).toBe(false);
+    expect(progress.some((update) => update.message === "正在根据已提供的协议材料生成答案")).toBe(true);
+  });
+
   it("turns an accidental integrator JSON response into a natural follow-up answer", async () => {
     let requestBody: Record<string, unknown> | undefined;
     const server = http.createServer(async (request, response) => {

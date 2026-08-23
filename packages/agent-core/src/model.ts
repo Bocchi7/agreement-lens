@@ -1065,16 +1065,20 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
       ? { max_completion_tokens: config.maxCompletionTokens }
       : {};
     const allowTools = config.toolMode !== "inline" && round < config.maxToolRounds;
-    const requestMessages = allowTools
-      ? conversation
-      : [...conversation, {
+    const requestMessages = !allowTools && config.toolMode !== "inline"
+      ? [...conversation, {
           role: "user" as const,
           content: "工具调用阶段已经结束。不要再调用任何工具，请仅根据已经获得的协议材料和工具结果，直接输出完整最终答案。结构化任务必须只输出约定的完整 JSON；对话任务必须直接用简体中文回答用户。"
-        }];
+        }]
+      : conversation;
     reportModelProgress(config, {
       status: "running",
       rounds: round + 1,
-      message: allowTools ? "正在调用模型" : "工具轮次已用尽，正在生成最终答案"
+      message: config.toolMode === "inline"
+        ? "正在根据已提供的协议材料生成答案"
+        : allowTools
+          ? "正在调用模型"
+          : "工具轮次已用尽，正在生成最终答案"
     });
     const streamResponse = !allowTools && config.apiFormat !== "gemini";
     const responseInput = config.apiFormat === "responses" ? responsesInput(requestMessages) : undefined;
