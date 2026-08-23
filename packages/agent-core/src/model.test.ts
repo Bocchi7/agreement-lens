@@ -697,6 +697,7 @@ describe("OpenAI-compatible model adapter", () => {
                 thoughtSignature: "native-thought-signature",
                 functionCall: {
                   name: "search_sources",
+                  id: "native-call-1",
                   args: { query: "自动续费", limit: 3 }
                 }
               }]
@@ -761,14 +762,116 @@ describe("OpenAI-compatible model adapter", () => {
     expect(requestBodies[0]?.systemInstruction).toBeDefined();
     const secondContents = requestBodies[1]?.contents as Array<{
       role: string;
-      parts: Array<{ functionCall?: { name?: string }; functionResponse?: { name?: string; response?: unknown } }>;
+      parts: Array<{
+        functionCall?: { name?: string; id?: string };
+        functionResponse?: { name?: string; id?: string; response?: unknown };
+      }>;
     }>;
     expect(secondContents.some((content) => content.role === "model"
       && content.parts.some((part) => part.functionCall?.name === "search_sources"
+        && part.functionCall.id === "native-call-1"
         && (part as { thoughtSignature?: string }).thoughtSignature === "native-thought-signature"))).toBe(true);
     expect(secondContents.some((content) => content.role === "user"
       && content.parts.some((part) => part.functionResponse?.name === "search_sources"
+        && part.functionResponse.id === "native-call-1"
         && JSON.stringify(part.functionResponse?.response).includes("自动续费")))).toBe(true);
+  });
+
+  it("uses a user function-response turn when a Gemini gateway omits call IDs", async () => {
+    let calls = 0;
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      calls++;
+      response.setHeader("content-type", "application/json");
+      if (calls === 1) {
+        response.end(JSON.stringify({
+          candidates: [{
+            content: {
+              role: "model",
+              parts: [{
+                functionCall: {
+                  name: "search_sources",
+                  args: { query: "自动续费", limit: 3 }
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      response.end(JSON.stringify({
+        candidates: [{
+          content: { role: "model", parts: [{ text: JSON.stringify({ findings: [] }) }] }
+        }]
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    await runModelSpecialist({
+      role: "fees",
+      sources: [{
+        id: "source-1", title: "会员协议", mediaType: "text", normalizedText: "服务自动续费。",
+        fingerprint: "fixture", sections: [{ id: "section-1", heading: "续费", content: "服务自动续费。" }],
+        fetchedAt: new Date().toISOString(), status: "ready"
+      }],
+      context: { action: "pay", concerns: ["money"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test", baseUrl: `http://127.0.0.1:${address.port}/v1`, model: "gemini-test",
+        apiFormat: "gemini", reasoningEffort: "low", timeoutMs: 45_000, maxToolRounds: 2
+      }
+    });
+
+    const secondContents = requestBodies[1]?.contents as Array<{
+      role: string;
+      parts: Array<{ functionResponse?: { name?: string; id?: string } }>;
+    }>;
+    const responsePart = secondContents.find((content) => content.role === "user"
+      && content.parts.some((part) => part.functionResponse?.name === "search_sources"))?.parts[0]?.functionResponse;
+    expect(responsePart?.id).toBeUndefined();
+  });
+
+  it("fails immediately when a Gemini gateway ignores function responses and repeats a call", async () => {
+    let calls = 0;
+    const server = http.createServer(async (_request, response) => {
+      calls++;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({
+        candidates: [{
+          content: {
+            role: "model",
+            parts: [{ functionCall: { name: "search_sources", args: { query: "自动续费", limit: 3 } } }]
+          }
+        }],
+        usageMetadata: { promptTokenCount: 321 }
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    await expect(runModelSpecialist({
+      role: "fees",
+      sources: [{
+        id: "source-1", title: "会员协议", mediaType: "text", normalizedText: "服务自动续费。",
+        fingerprint: "fixture", sections: [{ id: "section-1", heading: "续费", content: "服务自动续费。" }],
+        fetchedAt: new Date().toISOString(), status: "ready"
+      }],
+      context: { action: "pay", concerns: ["money"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test", baseUrl: `http://127.0.0.1:${address.port}/v1`, model: "gemini-test",
+        apiFormat: "gemini", reasoningEffort: "low", timeoutMs: 45_000, maxToolRounds: 100, maxRetries: 100
+      }
+    })).rejects.toThrow("Gemini 原生工具调用续接失败");
+    expect(calls).toBe(2);
   });
 
   it("does not present inline materials as an exhausted tool budget", async () => {

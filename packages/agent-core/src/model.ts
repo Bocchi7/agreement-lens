@@ -17,6 +17,8 @@ interface ChatMessage {
   content: string | null;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
+  geminiContent?: GeminiContent;
+  geminiPromptTokenCount?: number;
 }
 
 export interface MainAgentSession {
@@ -89,12 +91,14 @@ interface GeminiPart {
   };
 }
 
+interface GeminiContent {
+  role?: "user" | "model";
+  parts?: GeminiPart[];
+}
+
 interface GeminiResponse {
   candidates?: Array<{
-    content?: {
-      role?: string;
-      parts?: GeminiPart[];
-    };
+    content?: GeminiContent;
     finishReason?: string;
   }>;
   usageMetadata?: Record<string, unknown> | null;
@@ -228,6 +232,10 @@ export interface ModelConfig {
 }
 
 const DEFAULT_MODEL_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+
+class ModelProtocolError extends Error {
+  readonly nonRetryable = true;
+}
 
 interface ToolsContext {
   sources: SourceDocument[];
@@ -745,31 +753,46 @@ function geminiInput(messages: ChatMessage[]): {
     .map((message) => message.content ?? "")
     .filter(Boolean)
     .join("\n\n");
-  const callNames = new Map<string, string>();
+  const calls = new Map<string, { name: string; providerId?: string }>();
   const contents: Array<{ role: "user" | "model"; parts: Array<Record<string, unknown>> }> = [];
-  const append = (role: "user" | "model", parts: Array<Record<string, unknown>>) => {
-    if (!parts.length) return;
-    const previous = contents.at(-1);
-    if (previous?.role === role) {
-      previous.parts.push(...parts);
-      return;
-    }
-    contents.push({ role, parts });
-  };
 
-  for (const message of messages) {
+  for (let index = 0; index < messages.length; index++) {
+    let message = messages[index]!;
     if (message.role === "system") continue;
     if (message.role === "tool") {
-      const name = message.tool_call_id ? callNames.get(message.tool_call_id) : undefined;
-      if (!name) {
-        throw new Error(`Gemini tool result is missing its function name (${message.tool_call_id ?? "unknown"}).`);
-      }
-      append("user", [{
-        functionResponse: {
-          name,
-          response: geminiToolResponse(message.content ?? "")
+      const parts: Array<Record<string, unknown>> = [];
+      do {
+        const call = message.tool_call_id ? calls.get(message.tool_call_id) : undefined;
+        if (!call) {
+          throw new Error(`Gemini tool result is missing its function name (${message.tool_call_id ?? "unknown"}).`);
         }
-      }]);
+        parts.push({
+          functionResponse: {
+            name: call.name,
+            response: geminiToolResponse(message.content ?? ""),
+            ...(call.providerId ? { id: call.providerId } : {})
+          }
+        });
+        index++;
+        message = messages[index]!;
+      } while (message?.role === "tool");
+      index--;
+      // Gemini's Generate Content protocol places functionResponse parts in the
+      // next user turn. Keep parallel responses together to preserve call order.
+      contents.push({ role: "user", parts });
+      continue;
+    }
+
+    if (message.role === "assistant" && message.geminiContent?.parts?.length) {
+      const rawCalls = message.geminiContent.parts.filter((part) => part.functionCall?.name);
+      rawCalls.forEach((part, callIndex) => {
+        const localId = message.tool_calls?.[callIndex]?.id;
+        const name = part.functionCall?.name;
+        if (localId && name) {
+          calls.set(localId, { name, providerId: part.functionCall?.id });
+        }
+      });
+      contents.push(message.geminiContent as { role: "user" | "model"; parts: Array<Record<string, unknown>> });
       continue;
     }
 
@@ -783,16 +806,17 @@ function geminiInput(messages: ChatMessage[]): {
       } catch {
         args = { rawArguments: call.function.arguments };
       }
-      callNames.set(call.id, call.function.name);
+      calls.set(call.id, { name: call.function.name, providerId: call.id });
       parts.push({
         functionCall: {
           name: call.function.name,
-          args
+          args,
+          ...(call.id ? { id: call.id } : {})
         },
         ...(call.function.thoughtSignature ? { thoughtSignature: call.function.thoughtSignature } : {})
       });
     }
-    append(role, parts);
+    if (parts.length) contents.push({ role, parts });
   }
 
   return {
@@ -828,10 +852,13 @@ function responseMessageFromGemini(body: GeminiResponse): ChatMessage {
     .map((part) => part.text ?? "")
     .filter(Boolean)
     .join("");
+  const promptTokenCount = body.usageMetadata?.promptTokenCount;
   return {
     role: "assistant",
     content: content || null,
-    tool_calls: toolCalls.length ? toolCalls : undefined
+    tool_calls: toolCalls.length ? toolCalls : undefined,
+    geminiContent: body.candidates?.[0]?.content,
+    ...(typeof promptTokenCount === "number" ? { geminiPromptTokenCount: promptTokenCount } : {})
   };
 }
 
@@ -1058,6 +1085,40 @@ function messageDiagnostics(messages: ChatMessage[]): Array<Record<string, unkno
   }));
 }
 
+function lastAssistantToolCallMessage(messages: ChatMessage[]): ChatMessage | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]!;
+    if (message.role === "assistant" && message.tool_calls?.length) return message;
+  }
+  return undefined;
+}
+
+function sameToolCalls(left: ToolCall[], right: ToolCall[]): boolean {
+  return left.length === right.length && left.every((call, index) => {
+    const other = right[index];
+    return other
+      && call.function.name === other.function.name
+      && call.function.arguments === other.function.arguments;
+  });
+}
+
+function assertGeminiToolContinuation(config: ModelConfig, conversation: ChatMessage[], message: ChatMessage) {
+  if (config.apiFormat !== "gemini" || !message.tool_calls?.length) return;
+  const previous = lastAssistantToolCallMessage(conversation);
+  if (
+    previous?.geminiPromptTokenCount !== undefined
+    && message.geminiPromptTokenCount === previous.geminiPromptTokenCount
+    && previous.tool_calls
+    && sameToolCalls(previous.tool_calls, message.tool_calls)
+  ) {
+    throw new ModelProtocolError(
+      "Gemini 原生工具调用续接失败：服务端收到 functionResponse 后未纳入上一轮对话，" +
+      "而是以相同输入重新发起了同一工具调用。该网关不兼容 Gemini 多轮工具调用；" +
+      "本次不会自动切换为 inline 模式。请改用完整支持 Gemini Generate Content 工具续接的端点。"
+    );
+  }
+}
+
 async function completion(config: ModelConfig, messages: ChatMessage[], context: ToolsContext): Promise<string> {
   let conversation = [...messages];
   for (let round = 0; round <= config.maxToolRounds; round++) {
@@ -1195,6 +1256,7 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
     }
     if (!message) throw lastError instanceof Error ? lastError : new Error("Model request failed");
     if (!message.tool_calls?.length) return message.content ?? "";
+    assertGeminiToolContinuation(config, conversation, message);
     console.info("[agent-core] model requested tools", JSON.stringify({
       agent: config.agentName ?? "unknown",
       traceId: config.traceId,
@@ -1260,6 +1322,10 @@ async function parseWithRetry<T>(
     } catch (error) {
       lastError = error;
       if (config.signal?.aborted) throw error;
+      if (error instanceof ModelProtocolError || (typeof error === "object" && error !== null
+        && "nonRetryable" in error && (error as { nonRetryable?: unknown }).nonRetryable === true)) {
+        throw error;
+      }
       if (attempt >= maxRetries) break;
       reportModelProgress(config, {
         status: "running",
@@ -1610,8 +1676,6 @@ export function modelConfigFromEnv(): ModelConfig | undefined {
     const variableName = reference?.[1];
     return variableName ? process.env[variableName] : value;
   };
-  const apiKey = resolveEnvReference(process.env.OPENAI_API_KEY);
-  if (!apiKey) return;
   const configuredEffort = resolveEnvReference(process.env.MODEL_REASONING_EFFORT);
   const reasoningEffort = configuredEffort === "medium" || configuredEffort === "high" ? configuredEffort : "low";
   const configuredApiFormat = resolveEnvReference(process.env.MODEL_API_FORMAT);
@@ -1620,6 +1684,10 @@ export function modelConfigFromEnv(): ModelConfig | undefined {
     : configuredApiFormat === "gemini"
       ? "gemini"
       : "chat";
+  const apiKey = apiFormat === "gemini"
+    ? resolveEnvReference(process.env.GEMINI_API_KEY) ?? resolveEnvReference(process.env.OPENAI_API_KEY)
+    : resolveEnvReference(process.env.OPENAI_API_KEY);
+  if (!apiKey) return;
   const configuredToolMode = resolveEnvReference(process.env.MODEL_TOOL_MODE);
   const toolMode = configuredToolMode === "inline" ? "inline" : "native";
   const configuredTimeout = Number(resolveEnvReference(process.env.MODEL_TIMEOUT_MS));
@@ -1628,7 +1696,11 @@ export function modelConfigFromEnv(): ModelConfig | undefined {
   const configuredOutputTokens = Number(resolveEnvReference(process.env.MODEL_MAX_COMPLETION_TOKENS));
   return {
     apiKey,
-    baseUrl: resolveEnvReference(process.env.OPENAI_BASE_URL) ?? "https://api.openai.com/v1",
+    baseUrl: apiFormat === "gemini"
+      ? resolveEnvReference(process.env.GEMINI_BASE_URL)
+        ?? resolveEnvReference(process.env.OPENAI_BASE_URL)
+        ?? "https://generativelanguage.googleapis.com"
+      : resolveEnvReference(process.env.OPENAI_BASE_URL) ?? "https://api.openai.com/v1",
     model: resolveEnvReference(process.env.MODEL_NAME) ?? "gpt-4.1-mini",
     apiFormat,
     toolMode,
