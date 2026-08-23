@@ -200,6 +200,77 @@ function parseHtml(id: string, title: string, html: string, url?: string): Sourc
   };
 }
 
+type NetEaseTermsKind = "service" | "privacy" | "children";
+
+const netEaseTermsRoutes: Record<NetEaseTermsKind, string> = {
+  service: "https://y.music.163.com/g/yida/36a81250504747a19283b29e4e9ff38c",
+  privacy: "https://y.music.163.com/g/yida/6a5be9e3502947a9b794fc01932a83a3",
+  children: "https://y.music.163.com/g/yida/b70f764b084a41a0b69e5c641158514f"
+};
+
+function netEaseTermsKind(url: URL): NetEaseTermsKind | undefined {
+  if (url.hostname.toLocaleLowerCase() !== "st.music.163.com") return undefined;
+  const match = url.pathname.match(/^\/official-terms\/(service|privacy|children)\/?$/i);
+  return match?.[1]?.toLocaleLowerCase() as NetEaseTermsKind | undefined;
+}
+
+function extractNetEaseTermsRoute(script: string, kind: NetEaseTermsKind): string | undefined {
+  const labels: Record<NetEaseTermsKind, string> = {
+    service: "网易云音乐服务条款中文",
+    privacy: "网易云音乐隐私政策中文",
+    children: "网易云音乐儿童个人信息保护规则及监护人须知"
+  };
+  const escapedLabel = labels[kind].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = script.match(new RegExp(
+    `["']${escapedLabel}["']\\s*:\\s*["'](https://y\\.music\\.163\\.com/[^"']+)["']`,
+    "u"
+  ));
+  return match?.[1];
+}
+
+async function fetchNetEaseOfficialTermsHtml(url: URL): Promise<string | undefined> {
+  const kind = netEaseTermsKind(url);
+  if (!kind) return undefined;
+
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(15_000),
+    headers: {
+      "user-agent": "Mozilla/5.0 AgreementLens/0.1",
+      accept: "text/html,application/xhtml+xml"
+    }
+  });
+  if (!response.ok) throw new Error(`网易云音乐协议页面返回 HTTP ${response.status}`);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const html = decodeHtmlBytes(bytes, response.headers.get("content-type") ?? "text/html");
+  const dom = new JSDOM(html, { url: url.href });
+  const scriptSrc = [...dom.window.document.querySelectorAll<HTMLScriptElement>("script[src]")]
+    .map((script) => script.getAttribute("src"))
+    .find((src) => src && /\.js(?:[?#]|$)/i.test(src));
+
+  let termsUrl = netEaseTermsRoutes[kind];
+  if (scriptSrc) {
+    const appScriptResponse = await fetch(new URL(scriptSrc, url), {
+      signal: AbortSignal.timeout(15_000),
+      headers: { "user-agent": "Mozilla/5.0 AgreementLens/0.1" }
+    });
+    if (appScriptResponse.ok) {
+      const appScript = await appScriptResponse.text();
+      termsUrl = extractNetEaseTermsRoute(appScript, kind) ?? termsUrl;
+    }
+  }
+
+  const termsResponse = await fetch(termsUrl, {
+    signal: AbortSignal.timeout(15_000),
+    headers: {
+      "user-agent": "Mozilla/5.0 AgreementLens/0.1",
+      accept: "text/html,application/xhtml+xml"
+    }
+  });
+  if (!termsResponse.ok) throw new Error(`网易云音乐协议正文返回 HTTP ${termsResponse.status}`);
+  const termsBytes = new Uint8Array(await termsResponse.arrayBuffer());
+  return decodeHtmlBytes(termsBytes, termsResponse.headers.get("content-type") ?? "text/html");
+}
+
 async function fetchJdPrivacyApiHtml(url: URL): Promise<string | undefined> {
   if (url.hostname.toLowerCase() !== "about.jd.com" || !/^\/privacy\/?$/i.test(url.pathname)) {
     return undefined;
@@ -337,6 +408,16 @@ export async function loadSource(source: DiscoveredSource, renderedHtml?: string
     const html = decodeHtmlBytes(bytes, contentType);
     const parsed = parseHtml(source.id, source.title, html, source.url);
     if (parsed.normalizedText.length < 1000) {
+      const netEaseHtml = await fetchNetEaseOfficialTermsHtml(url);
+      if (netEaseHtml) {
+        return persistSnapshot(parseHtml(source.id, source.title, netEaseHtml, source.url), netEaseHtml, {
+          status: response.status,
+          headers: {
+            ...Object.fromEntries(response.headers.entries()),
+            "x-agreement-lens-source": "netease-official-terms"
+          }
+        });
+      }
       const dynamicHtml = await fetchJdPrivacyApiHtml(url);
       if (dynamicHtml) {
         return persistSnapshot(parseHtml(source.id, source.title, dynamicHtml, source.url), dynamicHtml, {

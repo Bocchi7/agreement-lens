@@ -243,6 +243,78 @@ describe("source loading", () => {
     }
   });
 
+  it("recovers all NetEase Music official agreement bodies from the static app shell", async () => {
+    const originalFetch = globalThis.fetch;
+    const routes = {
+      service: "https://y.music.163.com/g/yida/service-route",
+      privacy: "https://y.music.163.com/g/yida/privacy-route",
+      children: "https://y.music.163.com/g/yida/children-route"
+    };
+    const script = `
+      {"网易云音乐隐私政策中文":"${routes.privacy}",
+      "网易云音乐服务条款中文":"${routes.service}",
+      "网易云音乐儿童个人信息保护规则及监护人须知":"${routes.children}"}
+    `;
+    const pages = {
+      service: `<html><head><title>网易云音乐服务条款</title></head><body>
+        <main><h1>网易云音乐服务条款</h1><p>${"服务条款正文，包含账号、内容授权、服务变更和责任限制。".repeat(80)}</p></main>
+      </body></html>`,
+      privacy: `<html><head><title>网易云音乐隐私政策</title></head><body>
+        <main><h1>网易云音乐隐私政策</h1><p>${"隐私政策正文，包含信息收集、使用、共享、存储和用户权利。".repeat(80)}</p></main>
+      </body></html>`,
+      children: `<html><head><title>儿童隐私政策</title></head><body>
+        <main><h1>网易云音乐儿童个人信息保护规则及监护人须知</h1><p>${"儿童隐私政策正文，包含监护人同意、信息保护和删除权利。".repeat(80)}</p></main>
+      </body></html>`
+    };
+    const responsesByUrl = new Map([
+      [routes.service, pages.service],
+      [routes.privacy, pages.privacy],
+      [routes.children, pages.children]
+    ]);
+    globalThis.fetch = (async (input) => {
+      const requestUrl = String(input);
+      if (requestUrl.includes("/official-terms/")) {
+        return new Response('<html><head><script src="/static/main.example.js"></script></head><body><div id="root"></div></body></html>', {
+          status: 200,
+          headers: { "content-type": "text/html" }
+        });
+      }
+      if (requestUrl.endsWith("/static/main.example.js")) {
+        return new Response(script, {
+          status: 200,
+          headers: { "content-type": "application/javascript" }
+        });
+      }
+      const page = responsesByUrl.get(requestUrl);
+      return new Response(page ?? "not found", {
+        status: page ? 200 : 404,
+        headers: { "content-type": "text/html" }
+      });
+    }) as typeof fetch;
+    try {
+      for (const [kind, expectedTitle] of [
+        ["service", "网易云音乐服务条款"],
+        ["privacy", "网易云音乐隐私政策"],
+        ["children", "儿童隐私政策"]
+      ] as const) {
+        const [source] = await loadSourceGraph([{
+          id: `netease-${kind}-${Date.now()}`,
+          kind: "url",
+          title: expectedTitle,
+          url: `https://st.music.163.com/official-terms/${kind}`,
+          selected: true,
+          relation: "direct"
+        }], undefined, 1);
+        expect(source?.status).toBe("ready");
+        expect(source?.title).toBe(expectedTitle);
+        expect(source?.normalizedText).toContain(expectedTitle);
+        expect(source?.normalizedText.length).toBeGreaterThan(2000);
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("keeps section tools aligned with text extracted by Readability", async () => {
     const body = Array.from({ length: 80 }, (_, index) =>
       `<div data-leaf="true"><span>第 ${index + 1} 项个人信息处理规则：说明收集目的、共享对象、保存期限和删除方式。</span></div>`
