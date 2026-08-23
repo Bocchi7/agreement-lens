@@ -268,7 +268,10 @@ export function App() {
   useEffect(() => {
     void (async () => {
       const page = await currentSnapshot();
-      discoveryLockedRef.current = Boolean(page);
+      // An empty snapshot is provisional: login/register pages often render
+      // their agreement links only after the user switches login modes.
+      // Freeze discovery only after at least one candidate has been found.
+      discoveryLockedRef.current = Boolean(page?.sources.length);
       setSnapshot(page);
       setSources(page?.sources ?? []);
       setContext((current) => ({ ...current, action: inferAction(page) }));
@@ -402,10 +405,10 @@ export function App() {
     const listener = (message: { type?: string; payload?: PageSnapshot }) => {
       if (message.type !== "PAGE_STATE_UPDATED" || !message.payload) return;
       if (discoveryLockedRef.current || scanInProgressRef.current) return;
-      discoveryLockedRef.current = true;
       setSnapshot(message.payload);
       setSources(message.payload.sources);
       setContext((current) => ({ ...current, action: inferAction(message.payload ?? null) }));
+      if (message.payload.sources.length) discoveryLockedRef.current = true;
       if (message.payload.sources.length && (phase === "permission" || phase === "prepare")) setPhase("prepare");
     };
     chrome.runtime.onMessage.addListener(listener);
@@ -520,7 +523,7 @@ export function App() {
       setError("");
       await api.pair(pairCode);
       const page = await currentSnapshot();
-      discoveryLockedRef.current = Boolean(page);
+      discoveryLockedRef.current = Boolean(page?.sources.length);
       setSnapshot(page);
       setSources(page?.sources ?? []);
       setContext((current) => ({ ...current, action: inferAction(page) }));
@@ -563,7 +566,7 @@ export function App() {
       }
       if (!page || page.tabId !== tab.id) page = topFrameResponse.snapshot ?? null;
       if (!page || page.tabId !== tab.id) throw new Error("扫描已执行，但没有收到当前页面的识别结果");
-      discoveryLockedRef.current = true;
+      discoveryLockedRef.current = Boolean(page.sources.length);
       setSnapshot(page);
       setSources(page.sources);
       setContext((current) => ({ ...current, action: inferAction(page) }));

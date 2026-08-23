@@ -161,6 +161,24 @@ describe("agreement discovery", () => {
     ]);
   });
 
+  it("finds the agreements rendered after switching the Dianping login mode", () => {
+    const dom = new JSDOM(`
+      <div class="pc-agreement">
+        <input type="checkbox" id="pc-check">
+        <label for="pc-check">我已阅读并同意大众点评网以下政策协议</label>
+        <span class="agreement-item">
+          <a href="https://rules-center.meituan.com/rules-detail/4" target="_blank">《美团服务协议》、</a>
+          <a href="https://rules-center.meituan.com/rules-detail/605" target="_blank">《隐私政策》</a>
+        </span>
+      </div>
+    `, { url: "https://account.dianping.com/pclogin?redir=https://m.dianping.com/dphome" });
+    const sources = discoverAgreementSources(dom.window.document, dom.window.location.href);
+    expect(sources.map((source) => source.url)).toEqual([
+      "https://rules-center.meituan.com/rules-detail/4",
+      "https://rules-center.meituan.com/rules-detail/605"
+    ]);
+  });
+
   it("uses agreement terms from link attributes when visible text is generic", () => {
     const dom = new JSDOM(`
       <a href="/privacy" aria-label="个人信息保护政策">了解详情</a>
