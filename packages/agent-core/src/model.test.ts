@@ -11,10 +11,13 @@ describe("OpenAI-compatible model adapter", () => {
   it("resolves an API key referenced from another environment variable", () => {
     const previousKey = process.env.OPENAI_API_KEY;
     const previousReferencedKey = process.env.TEST_MODEL_API_KEY;
+    const previousApiFormat = process.env.MODEL_API_FORMAT;
     try {
       process.env.OPENAI_API_KEY = "$TEST_MODEL_API_KEY";
       process.env.TEST_MODEL_API_KEY = "resolved-secret";
+      process.env.MODEL_API_FORMAT = "responses";
       expect(modelConfigFromEnv()?.apiKey).toBe("resolved-secret");
+      expect(modelConfigFromEnv()?.apiFormat).toBe("responses");
       expect(modelConfigFromEnv()?.reasoningEffort).toBe("low");
       expect(modelConfigFromEnv()?.timeoutMs).toBe(86_400_000);
       expect(modelConfigFromEnv()?.maxToolRounds).toBe(100);
@@ -25,6 +28,8 @@ describe("OpenAI-compatible model adapter", () => {
       else process.env.OPENAI_API_KEY = previousKey;
       if (previousReferencedKey === undefined) delete process.env.TEST_MODEL_API_KEY;
       else process.env.TEST_MODEL_API_KEY = previousReferencedKey;
+      if (previousApiFormat === undefined) delete process.env.MODEL_API_FORMAT;
+      else process.env.MODEL_API_FORMAT = previousApiFormat;
     }
   });
 
@@ -115,6 +120,9 @@ describe("OpenAI-compatible model adapter", () => {
 
     expect(calls).toBe(2);
     expect(requestBodies[0]?.reasoning_effort).toBe("low");
+    expect(requestBodies[0]?.messages).not.toEqual(requestBodies[1]?.messages);
+    expect((requestBodies[0]?.messages as unknown[]).length).toBe(2);
+    expect((requestBodies[1]?.messages as unknown[]).length).toBe(4);
     const firstMessages = requestBodies[0]?.messages as Array<{ role: string; content?: string }>;
     const systemPrompt = firstMessages.find((message) => message.role === "system")?.content ?? "";
     expect(systemPrompt).toContain("confidence is a JSON number from 0 to 1");
@@ -123,6 +131,66 @@ describe("OpenAI-compatible model adapter", () => {
     expect(findings[0]?.evidence[0]?.quote).toContain("自动续费");
     expect(progress.some((update) => update.rounds === 1)).toBe(true);
     expect(progress.some((update) => update.rounds === 2)).toBe(true);
+  });
+
+  it("uses the native Responses format when configured", async () => {
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      response.setHeader("content-type", "application/json");
+      if (requestBodies.length === 1) {
+        response.end(JSON.stringify({
+          output: [{
+            type: "function_call",
+            id: "fc-1",
+            call_id: "call-1",
+            name: "search_sources",
+            arguments: JSON.stringify({ query: "自动续费" })
+          }],
+          usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 }
+        }));
+        return;
+      }
+      response.end(JSON.stringify({
+        output: [{
+          type: "message",
+          content: [{ type: "output_text", text: JSON.stringify({ findings: [] }) }]
+        }],
+        usage: { input_tokens: 140, output_tokens: 30, total_tokens: 170 }
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    const findings = await runModelSpecialist({
+      role: "fees",
+      sources: [{
+        id: "source-1", title: "会员协议", mediaType: "text", normalizedText: "服务将自动续费。",
+        fingerprint: "fixture", sections: [{ id: "section-1", heading: "续费", content: "服务将自动续费。" }],
+        fetchedAt: new Date().toISOString(), status: "ready"
+      }],
+      context: { action: "pay", concerns: ["money"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test", baseUrl: `http://127.0.0.1:${address.port}/v1`, model: "gpt-5.6-terra",
+        apiFormat: "responses", reasoningEffort: "low", timeoutMs: 45_000, maxToolRounds: 2
+      }
+    });
+
+    expect(findings).toEqual([]);
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[0]?.messages).toBeUndefined();
+    expect(requestBodies[0]?.input).toBeDefined();
+    expect(requestBodies[0]?.tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "function", name: "search_sources" })
+    ]));
+    expect(requestBodies[1]?.input).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "function_call_output", call_id: "call-1" })
+    ]));
   });
 
   it("returns explicit tool errors instead of executing missing arguments", async () => {
@@ -329,7 +397,12 @@ describe("OpenAI-compatible model adapter", () => {
               tool_calls: [{
                 id: `repeated-tool-${requestBodies.length}`,
                 type: "function",
-                function: { name: "search_sources", arguments: "{\"query\":\"自动续费\"}" }
+                function: {
+                  name: "search_sources",
+                  arguments: requestBodies.length % 2 === 1
+                    ? "{\"query\":\"自动续费\",\"limit\":5}"
+                    : "{\"limit\":5,\"query\":\"自动续费\"}"
+                }
               }]
             }
           }]

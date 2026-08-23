@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
   evidenceReferenceSchema,
@@ -61,6 +61,22 @@ interface CompletionReadResult {
   message: ChatMessage;
   usage?: Record<string, unknown> | null;
   repairedToolCallTransport: boolean;
+}
+
+interface ResponsesOutputItem {
+  type?: string;
+  id?: string;
+  call_id?: string;
+  name?: string;
+  arguments?: string;
+  content?: Array<{ type?: string; text?: string }>;
+}
+
+interface ResponsesResponse {
+  output?: ResponsesOutputItem[];
+  output_text?: string;
+  usage?: Record<string, unknown> | null;
+  error?: { message?: string };
 }
 
 interface ToolCallRepairResult {
@@ -173,6 +189,7 @@ export interface ModelConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  apiFormat?: "chat" | "responses";
   reasoningEffort: "low" | "medium" | "high";
   timeoutMs: number;
   signal?: AbortSignal;
@@ -603,6 +620,152 @@ async function readCompletionResponse(response: Response): Promise<CompletionRea
   };
 }
 
+function responsesToolDefinitions() {
+  return tools.map((tool) => ({
+    type: "function" as const,
+    ...tool.function
+  }));
+}
+
+function responsesInput(messages: ChatMessage[]): {
+  instructions?: string;
+  input: Array<Record<string, unknown>>;
+} {
+  const instructions = messages
+    .filter((message) => message.role === "system")
+    .map((message) => message.content ?? "")
+    .filter(Boolean)
+    .join("\n\n");
+  const input: Array<Record<string, unknown>> = [];
+  for (const message of messages) {
+    if (message.role === "system") continue;
+    if (message.role === "tool") {
+      input.push({
+        type: "function_call_output",
+        call_id: message.tool_call_id,
+        output: message.content ?? ""
+      });
+      continue;
+    }
+    if (message.role === "assistant" && message.tool_calls?.length) {
+      for (const call of message.tool_calls) {
+        input.push({
+          type: "function_call",
+          call_id: call.id,
+          name: call.function.name,
+          arguments: call.function.arguments
+        });
+      }
+      if (message.content) input.push({ role: "assistant", content: message.content });
+      continue;
+    }
+    input.push({ role: message.role, content: message.content ?? "" });
+  }
+  return { instructions: instructions || undefined, input };
+}
+
+function responseMessageFromOutput(body: ResponsesResponse): ChatMessage {
+  const toolCalls = (body.output ?? [])
+    .filter((item) => item.type === "function_call" && item.name)
+    .map((item, index) => ({
+      id: item.call_id ?? item.id ?? `response-tool-${index}`,
+      type: "function" as const,
+      function: {
+        name: item.name ?? "",
+        arguments: item.arguments ?? "{}"
+      }
+    }));
+  const text = body.output_text ?? (body.output ?? [])
+    .filter((item) => item.type === "message")
+    .flatMap((item) => item.content ?? [])
+    .filter((part) => part.type === "output_text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("");
+  return {
+    role: "assistant",
+    content: text || null,
+    tool_calls: toolCalls.length ? toolCalls : undefined
+  };
+}
+
+async function readResponsesResponse(response: Response): Promise<CompletionReadResult> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("text/event-stream") || !response.body) {
+    const body = await response.json() as ResponsesResponse;
+    if (!response.ok) throw new Error(body.error?.message ?? `Model request failed (${response.status})`);
+    return {
+      message: responseMessageFromOutput(body),
+      usage: body.usage,
+      repairedToolCallTransport: false
+    };
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  let eventCount = 0;
+  let usage: Record<string, unknown> | null | undefined;
+  const toolCalls = new Map<number, ToolCall>();
+  const consume = (block: string) => {
+    const dataLine = block.split(/\r?\n/).find((line) => line.startsWith("data:"));
+    if (!dataLine) return;
+    const payload = dataLine.slice(5).trim();
+    if (!payload || payload === "[DONE]") return;
+    const event = JSON.parse(payload) as {
+      type?: string;
+      delta?: string;
+      output_index?: number;
+      item?: ResponsesOutputItem;
+      response?: ResponsesResponse;
+      error?: { message?: string };
+    };
+    eventCount++;
+    if (event.error?.message) throw new Error(event.error.message);
+    if (event.type === "response.output_text.delta") content += event.delta ?? "";
+    if (event.type === "response.completed") usage = event.response?.usage;
+    if (event.type === "response.output_item.added" && event.item?.type === "function_call") {
+      const index = event.output_index ?? toolCalls.size;
+      toolCalls.set(index, {
+        id: event.item.call_id ?? event.item.id ?? `response-tool-${index}`,
+        type: "function",
+        function: { name: event.item.name ?? "", arguments: event.item.arguments ?? "" }
+      });
+    }
+    if (event.type === "response.function_call_arguments.delta") {
+      const index = event.output_index ?? 0;
+      const current = toolCalls.get(index) ?? {
+        id: `response-tool-${index}`,
+        type: "function" as const,
+        function: { name: "", arguments: "" }
+      };
+      current.function.arguments += event.delta ?? "";
+      toolCalls.set(index, current);
+    }
+  };
+  while (true) {
+    const chunk = await reader.read();
+    buffer += decoder.decode(chunk.value ?? new Uint8Array(), { stream: !chunk.done });
+    const blocks = buffer.split(/\r?\n\r?\n/);
+    buffer = blocks.pop() ?? "";
+    for (const block of blocks) consume(block);
+    if (chunk.done) break;
+  }
+  if (buffer) consume(buffer);
+  const parsedToolCalls = [...toolCalls.entries()].sort(([left], [right]) => left - right).map(([, call]) => call);
+  console.info("[agent-core] native Responses stream completed", JSON.stringify({
+    eventCount,
+    contentLength: content.length,
+    toolCalls: parsedToolCalls.map((call) => call.function.name),
+    usage
+  }));
+  return {
+    message: { role: "assistant", content: content || null, tool_calls: parsedToolCalls.length ? parsedToolCalls : undefined },
+    usage,
+    repairedToolCallTransport: false
+  };
+}
+
 function isJsonObject(value: string): boolean {
   try {
     const parsed = JSON.parse(value);
@@ -655,6 +818,42 @@ function repairToolCalls(toolCalls: ToolCall[]): ToolCallRepairResult {
   return { calls: repaired.filter((call) => call.function.name.trim()), repaired: changed };
 }
 
+function canonicalizeJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalizeJson(item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalizeJson(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function canonicalizeToolArguments(argumentsText: string): string {
+  try {
+    return canonicalizeJson(JSON.parse(argumentsText || "{}"));
+  } catch {
+    return argumentsText || "{}";
+  }
+}
+
+function digest(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+function messageDiagnostics(messages: ChatMessage[]): Array<Record<string, unknown>> {
+  return messages.map((message) => ({
+    role: message.role,
+    contentLength: message.content?.length ?? 0,
+    toolCallId: message.tool_call_id,
+    toolCalls: message.tool_calls?.map((call) => ({
+      id: call.id,
+      name: call.function.name,
+      argumentsLength: call.function.arguments.length
+    }))
+  }));
+}
+
 async function completion(config: ModelConfig, messages: ChatMessage[], context: ToolsContext): Promise<string> {
   let conversation = [...messages];
   let forceFinal = false;
@@ -675,50 +874,66 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
       rounds: round + 1,
       message: allowTools ? "正在调用模型" : "工具轮次已用尽，正在生成最终答案"
     });
+    const streamResponse = !allowTools;
+    const responseInput = config.apiFormat === "responses" ? responsesInput(requestMessages) : undefined;
+    const requestBody = config.apiFormat === "responses"
+      ? JSON.stringify({
+          model: config.model,
+          ...responseInput,
+          reasoning: { effort: config.reasoningEffort },
+          ...(config.maxCompletionTokens ? { max_output_tokens: config.maxCompletionTokens } : {}),
+          ...(allowTools ? { tools: responsesToolDefinitions(), tool_choice: "auto" } : {}),
+          stream: streamResponse
+        })
+      : JSON.stringify({
+          model: config.model,
+          reasoning_effort: config.reasoningEffort,
+          ...outputBudget,
+          temperature: 0.1,
+          messages: requestMessages,
+          ...(allowTools ? { tools, tool_choice: "auto" } : {}),
+          stream: streamResponse,
+          ...(streamResponse ? { stream_options: { include_usage: true } } : {})
+        });
     console.info("[agent-core] model completion request", JSON.stringify({
       agent: config.agentName ?? "unknown",
       traceId: config.traceId,
+      apiFormat: config.apiFormat ?? "chat",
       round,
       allowTools,
-      messageCount: requestMessages.length
+      messageCount: requestMessages.length,
+      requestBytes: Buffer.byteLength(requestBody),
+      requestDigest: digest(requestBody),
+      messageDiagnostics: messageDiagnostics(requestMessages),
+      lastMessage: messageDiagnostics(requestMessages).at(-1)
     }));
-    const requestPayload = {
-      model: config.model,
-      reasoning_effort: config.reasoningEffort,
-      ...outputBudget,
-      temperature: 0.1,
-      messages: requestMessages,
-      ...(allowTools ? { tools, tool_choice: "auto" } : {})
-    };
-    // The configured gateway has a broken streaming tool-call adapter: tool
-    // arguments may be split across synthetic calls and usage may be reported
-    // as zero. Keep streaming for visible final answers, but use the regular
-    // JSON response for tool turns so the provider returns one canonical call
-    // and its actual completion usage.
-    const streamResponse = !allowTools;
-    const requestBody = JSON.stringify({
-      ...requestPayload,
-      stream: streamResponse,
-      ...(streamResponse ? { stream_options: { include_usage: true } } : {})
-    });
     const maxRetries = config.maxRetries ?? 2;
     let message: ChatMessage | undefined;
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+        const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}/${config.apiFormat === "responses" ? "responses" : "chat/completions"}`, {
           method: "POST",
           signal: config.signal ? AbortSignal.any([config.signal, AbortSignal.timeout(config.timeoutMs)]) : AbortSignal.timeout(config.timeoutMs),
           headers: {
             "content-type": "application/json",
-            authorization: `Bearer ${config.apiKey}`
+            authorization: `Bearer ${config.apiKey}`,
+            ...(config.traceId ? {
+              "x-agreement-lens-trace-id": config.traceId,
+              "x-agreement-lens-agent": config.agentName ?? "unknown",
+              "x-agreement-lens-round": String(round),
+              "x-agreement-lens-attempt": String(attempt)
+            } : {})
           },
           body: requestBody
         });
-        const completionResult = await readCompletionResponse(response);
+        const completionResult = config.apiFormat === "responses"
+          ? await readResponsesResponse(response)
+          : await readCompletionResponse(response);
         console.info("[agent-core] model response usage", JSON.stringify({
           agent: config.agentName ?? "unknown",
           traceId: config.traceId,
+          apiFormat: config.apiFormat ?? "chat",
           round,
           streamed: streamResponse,
           usage: completionResult.usage,
@@ -752,12 +967,7 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
     if (!message.tool_calls?.length) return message.content ?? "";
     const repeatedCalls: string[] = [];
     for (const call of message.tool_calls) {
-      let normalizedArguments = call.function.arguments || "{}";
-      try {
-        normalizedArguments = JSON.stringify(JSON.parse(normalizedArguments));
-      } catch {
-        // The tool executor will report malformed arguments to the model.
-      }
+      const normalizedArguments = canonicalizeToolArguments(call.function.arguments);
       const key = `${call.function.name}:${normalizedArguments}`;
       const count = (toolCallCounts.get(key) ?? 0) + 1;
       toolCallCounts.set(key, count);
@@ -819,10 +1029,12 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
       continue;
     }
     for (const call of message.tool_calls) {
+      const result = await executeTool(call, context);
+      const resultContent = JSON.stringify(result);
       conversation.push({
         role: "tool",
         tool_call_id: call.id,
-        content: JSON.stringify(await executeTool(call, context))
+        content: resultContent
       });
     }
   }
@@ -1175,6 +1387,8 @@ export function modelConfigFromEnv(): ModelConfig | undefined {
   if (!apiKey) return;
   const configuredEffort = resolveEnvReference(process.env.MODEL_REASONING_EFFORT);
   const reasoningEffort = configuredEffort === "medium" || configuredEffort === "high" ? configuredEffort : "low";
+  const configuredApiFormat = resolveEnvReference(process.env.MODEL_API_FORMAT);
+  const apiFormat = configuredApiFormat === "responses" ? "responses" : "chat";
   const configuredTimeout = Number(resolveEnvReference(process.env.MODEL_TIMEOUT_MS));
   const configuredRounds = Number(resolveEnvReference(process.env.MODEL_MAX_TOOL_ROUNDS));
   const configuredRetries = Number(resolveEnvReference(process.env.MODEL_MAX_RETRIES));
@@ -1183,6 +1397,7 @@ export function modelConfigFromEnv(): ModelConfig | undefined {
     apiKey,
     baseUrl: resolveEnvReference(process.env.OPENAI_BASE_URL) ?? "https://api.openai.com/v1",
     model: resolveEnvReference(process.env.MODEL_NAME) ?? "gpt-4.1-mini",
+    apiFormat,
     reasoningEffort,
     timeoutMs: Number.isFinite(configuredTimeout) && configuredTimeout >= 10_000 ? configuredTimeout : DEFAULT_MODEL_TIMEOUT_MS,
     maxToolRounds: Number.isInteger(configuredRounds) && configuredRounds >= 0 && configuredRounds <= 100 ? configuredRounds : 100,
