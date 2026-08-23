@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { GoogleGenAI } from "@google/genai";
 import { z } from "zod";
 import {
   evidenceReferenceSchema,
@@ -18,7 +19,6 @@ interface ChatMessage {
   tool_call_id?: string;
   tool_calls?: ToolCall[];
   geminiContent?: GeminiContent;
-  geminiPromptTokenCount?: number;
 }
 
 export interface MainAgentSession {
@@ -81,28 +81,9 @@ interface ResponsesResponse {
   error?: { message?: string };
 }
 
-interface GeminiPart {
-  text?: string;
-  thoughtSignature?: string;
-  functionCall?: {
-    name?: string;
-    args?: unknown;
-    id?: string;
-  };
-}
-
 interface GeminiContent {
   role?: "user" | "model";
-  parts?: GeminiPart[];
-}
-
-interface GeminiResponse {
-  candidates?: Array<{
-    content?: GeminiContent;
-    finishReason?: string;
-  }>;
-  usageMetadata?: Record<string, unknown> | null;
-  error?: { message?: string };
+  parts?: Array<Record<string, unknown>>;
 }
 
 interface ToolCallRepairResult {
@@ -232,10 +213,6 @@ export interface ModelConfig {
 }
 
 const DEFAULT_MODEL_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
-
-class ModelProtocolError extends Error {
-  readonly nonRetryable = true;
-}
 
 interface ToolsContext {
   sources: SourceDocument[];
@@ -710,210 +687,6 @@ function responsesInput(messages: ChatMessage[]): {
   return { instructions: instructions || undefined, input };
 }
 
-function geminiSchema(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(geminiSchema);
-  if (!value || typeof value !== "object") return value;
-  const schema = value as Record<string, unknown>;
-  return Object.fromEntries(Object.entries(schema)
-    .filter(([key]) => key !== "additionalProperties" && key !== "$schema")
-    .map(([key, item]) => {
-      if (key === "type" && typeof item === "string") return [key, item.toUpperCase()];
-      return [key, geminiSchema(item)];
-    }));
-}
-
-function geminiToolDefinitions() {
-  return [{
-    functionDeclarations: tools.map((tool) => ({
-      name: tool.function.name,
-      description: tool.function.description,
-      parameters: geminiSchema(tool.function.parameters)
-    }))
-  }];
-}
-
-function geminiToolResponse(value: string): Record<string, unknown> {
-  try {
-    const parsed = JSON.parse(value);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-    return { result: parsed };
-  } catch {
-    return { result: value };
-  }
-}
-
-function geminiInput(messages: ChatMessage[]): {
-  systemInstruction?: { parts: Array<{ text: string }> };
-  contents: Array<{ role: "user" | "model"; parts: Array<Record<string, unknown>> }>;
-} {
-  const systemText = messages
-    .filter((message) => message.role === "system")
-    .map((message) => message.content ?? "")
-    .filter(Boolean)
-    .join("\n\n");
-  const calls = new Map<string, { name: string; providerId?: string }>();
-  const contents: Array<{ role: "user" | "model"; parts: Array<Record<string, unknown>> }> = [];
-
-  for (let index = 0; index < messages.length; index++) {
-    let message = messages[index]!;
-    if (message.role === "system") continue;
-    if (message.role === "tool") {
-      const parts: Array<Record<string, unknown>> = [];
-      do {
-        const call = message.tool_call_id ? calls.get(message.tool_call_id) : undefined;
-        if (!call) {
-          throw new Error(`Gemini tool result is missing its function name (${message.tool_call_id ?? "unknown"}).`);
-        }
-        parts.push({
-          functionResponse: {
-            name: call.name,
-            response: geminiToolResponse(message.content ?? ""),
-            ...(call.providerId ? { id: call.providerId } : {})
-          }
-        });
-        index++;
-        message = messages[index]!;
-      } while (message?.role === "tool");
-      index--;
-      // Gemini's Generate Content protocol places functionResponse parts in the
-      // next user turn. Keep parallel responses together to preserve call order.
-      contents.push({ role: "user", parts });
-      continue;
-    }
-
-    if (message.role === "assistant" && message.geminiContent?.parts?.length) {
-      const rawCalls = message.geminiContent.parts.filter((part) => part.functionCall?.name);
-      rawCalls.forEach((part, callIndex) => {
-        const localId = message.tool_calls?.[callIndex]?.id;
-        const name = part.functionCall?.name;
-        if (localId && name) {
-          calls.set(localId, { name, providerId: part.functionCall?.id });
-        }
-      });
-      contents.push(message.geminiContent as { role: "user" | "model"; parts: Array<Record<string, unknown>> });
-      continue;
-    }
-
-    const role = message.role === "assistant" ? "model" : "user";
-    const parts: Array<Record<string, unknown>> = [];
-    if (message.content) parts.push({ text: message.content });
-    for (const call of message.tool_calls ?? []) {
-      let args: unknown = {};
-      try {
-        args = JSON.parse(call.function.arguments || "{}");
-      } catch {
-        args = { rawArguments: call.function.arguments };
-      }
-      calls.set(call.id, { name: call.function.name, providerId: call.id });
-      parts.push({
-        functionCall: {
-          name: call.function.name,
-          args,
-          ...(call.id ? { id: call.id } : {})
-        },
-        ...(call.function.thoughtSignature ? { thoughtSignature: call.function.thoughtSignature } : {})
-      });
-    }
-    if (parts.length) contents.push({ role, parts });
-  }
-
-  return {
-    ...(systemText ? { systemInstruction: { parts: [{ text: systemText }] } } : {}),
-    contents
-  };
-}
-
-function geminiEndpoint(baseUrl: string, model: string, stream: boolean): string {
-  const normalized = baseUrl.replace(/\/+$/, "");
-  const encodedModel = encodeURIComponent(model);
-  const root = /\/v1(?:\/.*)?$/.test(normalized)
-    ? normalized.replace(/\/v1(?:\/.*)?$/, "")
-    : normalized;
-  const endpointBase = root.endsWith("/v1beta") ? root : `${root}/v1beta`;
-  return `${endpointBase}/models/${encodedModel}:${stream ? "streamGenerateContent?alt=sse" : "generateContent"}`;
-}
-
-function responseMessageFromGemini(body: GeminiResponse): ChatMessage {
-  const parts = body.candidates?.[0]?.content?.parts ?? [];
-  const toolCalls = parts
-    .filter((part) => part.functionCall?.name)
-    .map((part, index) => ({
-      id: part.functionCall?.id ?? `gemini-tool-${index}-${randomUUID()}`,
-      type: "function" as const,
-      function: {
-        name: part.functionCall?.name ?? "",
-        arguments: JSON.stringify(part.functionCall?.args ?? {}),
-        ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {})
-      }
-    }));
-  const content = parts
-    .map((part) => part.text ?? "")
-    .filter(Boolean)
-    .join("");
-  const promptTokenCount = body.usageMetadata?.promptTokenCount;
-  return {
-    role: "assistant",
-    content: content || null,
-    tool_calls: toolCalls.length ? toolCalls : undefined,
-    geminiContent: body.candidates?.[0]?.content,
-    ...(typeof promptTokenCount === "number" ? { geminiPromptTokenCount: promptTokenCount } : {})
-  };
-}
-
-async function readGeminiResponse(response: Response): Promise<CompletionReadResult> {
-  const contentType = response.headers.get("content-type") ?? "";
-  if (!contentType.includes("text/event-stream") || !response.body) {
-    const body = await response.json() as GeminiResponse;
-    if (!response.ok) throw new Error(body.error?.message ?? `Model request failed (${response.status})`);
-    return {
-      message: responseMessageFromGemini(body),
-      usage: body.usageMetadata,
-      repairedToolCallTransport: false
-    };
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let latest: GeminiResponse | undefined;
-  let eventCount = 0;
-  while (true) {
-    const chunk = await reader.read();
-    buffer += decoder.decode(chunk.value ?? new Uint8Array(), { stream: !chunk.done });
-    const blocks = buffer.split(/\r?\n\r?\n/);
-    buffer = blocks.pop() ?? "";
-    for (const block of blocks) {
-      const data = block.split(/\r?\n/).find((line) => line.startsWith("data:"))?.slice(5).trim();
-      if (!data || data === "[DONE]") continue;
-      latest = JSON.parse(data) as GeminiResponse;
-      eventCount++;
-    }
-    if (chunk.done) break;
-  }
-  if (buffer) {
-    const data = buffer.split(/\r?\n/).find((line) => line.startsWith("data:"))?.slice(5).trim();
-    if (data && data !== "[DONE]") {
-      latest = JSON.parse(data) as GeminiResponse;
-      eventCount++;
-    }
-  }
-  if (!latest) throw new Error("Gemini stream did not contain a response");
-  const message = responseMessageFromGemini(latest);
-  console.info("[agent-core] native Gemini stream completed", JSON.stringify({
-    eventCount,
-    contentLength: message.content?.length ?? 0,
-    toolCalls: message.tool_calls?.map((call) => call.function.name) ?? [],
-    usage: latest.usageMetadata
-  }));
-  return {
-    message,
-    usage: latest.usageMetadata,
-    repairedToolCallTransport: false
-  };
-}
-
 function responseMessageFromOutput(body: ResponsesResponse): ChatMessage {
   const toolCalls = (body.output ?? [])
     .filter((item) => item.type === "function_call" && item.name)
@@ -1085,41 +858,222 @@ function messageDiagnostics(messages: ChatMessage[]): Array<Record<string, unkno
   }));
 }
 
-function lastAssistantToolCallMessage(messages: ChatMessage[]): ChatMessage | undefined {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const message = messages[index]!;
-    if (message.role === "assistant" && message.tool_calls?.length) return message;
-  }
-  return undefined;
+function geminiBaseUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/(?:v1|v1beta|v1alpha)\/?$/, "").replace(/\/+$/, "");
 }
 
-function sameToolCalls(left: ToolCall[], right: ToolCall[]): boolean {
-  return left.length === right.length && left.every((call, index) => {
-    const other = right[index];
-    return other
-      && call.function.name === other.function.name
-      && call.function.arguments === other.function.arguments;
+function geminiToolDefinitions() {
+  return [{
+    functionDeclarations: tools.map((tool) => ({
+      name: tool.function.name,
+      description: tool.function.description,
+      parametersJsonSchema: tool.function.parameters
+    }))
+  }];
+}
+
+function geminiSystemInstruction(messages: ChatMessage[]): string | undefined {
+  const content = messages
+    .filter((message) => message.role === "system")
+    .map((message) => message.content ?? "")
+    .filter(Boolean)
+    .join("\n\n");
+  return content || undefined;
+}
+
+function geminiToolResult(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function geminiContents(messages: ChatMessage[]): Array<GeminiContent> {
+  const callNames = new Map<string, string>();
+  const contents: GeminiContent[] = [];
+  for (let index = 0; index < messages.length; index++) {
+    let message = messages[index]!;
+    if (message.role === "system") continue;
+    if (message.role === "tool") {
+      const parts: Array<Record<string, unknown>> = [];
+      do {
+        const name = message.tool_call_id ? callNames.get(message.tool_call_id) : undefined;
+        if (!name) throw new Error(`Gemini 工具结果缺少函数名（${message.tool_call_id ?? "unknown"}）。`);
+        parts.push({
+          functionResponse: {
+            name,
+            response: { result: geminiToolResult(message.content ?? "") }
+          }
+        });
+        index++;
+        message = messages[index]!;
+      } while (message?.role === "tool");
+      index--;
+      contents.push({ role: "user", parts });
+      continue;
+    }
+    if (message.role === "assistant" && message.geminiContent) {
+      const rawCalls = message.geminiContent.parts?.filter((part) => {
+        const functionCall = part.functionCall;
+        return Boolean(functionCall && typeof functionCall === "object" && "name" in functionCall);
+      }) ?? [];
+      rawCalls.forEach((part, callIndex) => {
+        const functionCall = part.functionCall as { name?: unknown };
+        const localId = message.tool_calls?.[callIndex]?.id;
+        if (localId && typeof functionCall.name === "string") callNames.set(localId, functionCall.name);
+      });
+      contents.push(message.geminiContent);
+      continue;
+    }
+    const role = message.role === "assistant" ? "model" : "user";
+    const parts: Array<Record<string, unknown>> = [];
+    if (message.content) parts.push({ text: message.content });
+    for (const call of message.tool_calls ?? []) {
+      let args: unknown = {};
+      try {
+        args = JSON.parse(call.function.arguments || "{}");
+      } catch {
+        args = { rawArguments: call.function.arguments };
+      }
+      callNames.set(call.id, call.function.name);
+      parts.push({ functionCall: { name: call.function.name, args } });
+    }
+    if (parts.length) contents.push({ role, parts });
+  }
+  return contents;
+}
+
+function geminiMessage(response: {
+  text?: string;
+  functionCalls?: Array<{ name?: string; args?: unknown }>;
+  candidates?: Array<{ content?: GeminiContent }>;
+}): ChatMessage {
+  const rawContent = response.candidates?.[0]?.content;
+  const calls = response.functionCalls ?? (rawContent?.parts ?? [])
+    .flatMap((part) => {
+      const functionCall = part.functionCall;
+      return functionCall && typeof functionCall === "object" ? [functionCall as { name?: string; args?: unknown }] : [];
+    });
+  const toolCalls = calls
+    .filter((call) => typeof call.name === "string" && Boolean(call.name))
+    .map((call, index) => ({
+      id: `gemini-tool-${index}-${randomUUID()}`,
+      type: "function" as const,
+      function: { name: call.name!, arguments: JSON.stringify(call.args ?? {}) }
+    }));
+  const text = (rawContent?.parts ?? [])
+    .flatMap((part) => typeof part.text === "string" ? [part.text] : [])
+    .join("");
+  return {
+    role: "assistant",
+    content: text || (!rawContent ? response.text ?? null : null),
+    tool_calls: toolCalls.length ? toolCalls : undefined,
+    geminiContent: rawContent
+  };
+}
+
+async function completionWithGeminiSdk(config: ModelConfig, messages: ChatMessage[], context: ToolsContext): Promise<string> {
+  const client = new GoogleGenAI({
+    apiKey: config.apiKey,
+    apiVersion: "v1beta",
+    httpOptions: {
+      baseUrl: geminiBaseUrl(config.baseUrl),
+      apiVersion: "v1beta",
+      timeout: config.timeoutMs,
+      retryOptions: { attempts: 1 }
+    }
   });
-}
+  const lastUserIndex = messages.map((message) => message.role).lastIndexOf("user");
+  if (lastUserIndex < 0) throw new Error("Gemini 对话缺少用户输入。");
+  const pendingUserMessage = messages[lastUserIndex]?.content ?? "";
+  const history = geminiContents(messages.slice(0, lastUserIndex));
+  const chatConfig = {
+    ...(geminiSystemInstruction(messages) ? { systemInstruction: geminiSystemInstruction(messages) } : {}),
+    temperature: 0.1,
+    thinkingConfig: { thinkingLevel: config.reasoningEffort },
+    httpOptions: { retryOptions: { attempts: 1 } },
+    ...(config.maxCompletionTokens ? { maxOutputTokens: config.maxCompletionTokens } : {}),
+    ...(config.toolMode !== "inline" ? {
+      tools: geminiToolDefinitions(),
+      toolConfig: { functionCallingConfig: { mode: "AUTO" }
+      }
+    } : {})
+  };
+  const chat = client.chats.create({
+    model: config.model,
+    config: chatConfig,
+    history
+  } as never);
+  let nextMessage: unknown = pendingUserMessage;
 
-function assertGeminiToolContinuation(config: ModelConfig, conversation: ChatMessage[], message: ChatMessage) {
-  if (config.apiFormat !== "gemini" || !message.tool_calls?.length) return;
-  const previous = lastAssistantToolCallMessage(conversation);
-  if (
-    previous?.geminiPromptTokenCount !== undefined
-    && message.geminiPromptTokenCount === previous.geminiPromptTokenCount
-    && previous.tool_calls
-    && sameToolCalls(previous.tool_calls, message.tool_calls)
-  ) {
-    throw new ModelProtocolError(
-      "Gemini 原生工具调用续接失败：服务端收到 functionResponse 后未纳入上一轮对话，" +
-      "而是以相同输入重新发起了同一工具调用。该网关不兼容 Gemini 多轮工具调用；" +
-      "本次不会自动切换为 inline 模式。请改用完整支持 Gemini Generate Content 工具续接的端点。"
-    );
+  for (let round = 0; round <= config.maxToolRounds; round++) {
+    reportModelProgress(config, {
+      status: "running",
+      rounds: round + 1,
+      message: config.toolMode === "inline"
+        ? "正在通过 Gemini SDK 生成答案"
+        : "正在通过 Gemini SDK 调用模型"
+    });
+    console.info("[agent-core] Gemini SDK request", JSON.stringify({
+      agent: config.agentName ?? "unknown",
+      traceId: config.traceId,
+      round,
+      messageKind: typeof nextMessage === "string" ? "user-text" : "function-response",
+      historyMessages: chat.getHistory().length
+    }));
+    const maxRetries = config.maxRetries ?? 2;
+    let message: ChatMessage | undefined;
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await chat.sendMessage({ message: nextMessage as never }) as {
+          text?: string;
+          functionCalls?: Array<{ name?: string; args?: unknown }>;
+          candidates?: Array<{ content?: GeminiContent }>;
+          usageMetadata?: Record<string, unknown>;
+        };
+        message = geminiMessage(response);
+        console.info("[agent-core] Gemini SDK response", JSON.stringify({
+          agent: config.agentName ?? "unknown",
+          traceId: config.traceId,
+          round,
+          usage: response.usageMetadata,
+          contentLength: message.content?.length ?? 0,
+          toolCalls: message.tool_calls?.map((call) => call.function.name) ?? []
+        }));
+        break;
+      } catch (error) {
+        lastError = error;
+        if (config.signal?.aborted) throw error;
+        if (attempt >= maxRetries) throw error;
+        reportModelProgress(config, {
+          status: "running",
+          retries: attempt + 1,
+          message: `Gemini 请求失败，准备第 ${attempt + 1} 次重试`
+        });
+        await new Promise((resolve) => setTimeout(resolve, Math.min(5_000, 400 * (attempt + 1))));
+      }
+    }
+    if (!message) throw lastError instanceof Error ? lastError : new Error("Gemini request failed");
+    if (!message.tool_calls?.length) return message.content ?? "";
+    if (config.toolMode === "inline") {
+      throw new Error("Gemini 在 inline 模式下请求了工具；请直接基于已提供材料输出最终答案。");
+    }
+    nextMessage = await Promise.all(message.tool_calls.map(async (call) => ({
+      functionResponse: {
+        name: call.function.name,
+        response: { result: await executeTool(call, context) }
+      }
+    })));
   }
+  throw new Error(`Gemini 工具调用超过上限（${config.maxToolRounds}）。`);
 }
 
 async function completion(config: ModelConfig, messages: ChatMessage[], context: ToolsContext): Promise<string> {
+  if (config.apiFormat === "gemini") {
+    return completionWithGeminiSdk(config, messages, context);
+  }
   let conversation = [...messages];
   for (let round = 0; round <= config.maxToolRounds; round++) {
     const outputBudget = config.maxCompletionTokens
@@ -1141,9 +1095,8 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
           ? "正在调用模型"
           : "工具轮次已用尽，正在生成最终答案"
     });
-    const streamResponse = !allowTools && config.apiFormat !== "gemini";
+    const streamResponse = !allowTools;
     const responseInput = config.apiFormat === "responses" ? responsesInput(requestMessages) : undefined;
-    const nativeGeminiInput = config.apiFormat === "gemini" ? geminiInput(requestMessages) : undefined;
     const requestBody = config.apiFormat === "responses"
       ? JSON.stringify({
           model: config.model,
@@ -1153,23 +1106,6 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
           ...(allowTools ? { tools: responsesToolDefinitions(), tool_choice: "auto" } : {}),
           stream: streamResponse
         })
-      : config.apiFormat === "gemini"
-        ? JSON.stringify({
-            ...nativeGeminiInput,
-            generationConfig: {
-              temperature: 0.1,
-              ...(config.maxCompletionTokens ? { maxOutputTokens: config.maxCompletionTokens } : {}),
-              thinkingConfig: {
-                thinkingLevel: config.reasoningEffort.toUpperCase()
-              }
-            },
-            ...(allowTools
-              ? {
-                  tools: geminiToolDefinitions(),
-                  toolConfig: { functionCallingConfig: { mode: "AUTO" } }
-                }
-              : {}),
-          })
       : JSON.stringify({
           model: config.model,
           reasoning_effort: config.reasoningEffort,
@@ -1197,16 +1133,13 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        const endpoint = config.apiFormat === "gemini"
-          ? geminiEndpoint(config.baseUrl, config.model, streamResponse)
-          : `${config.baseUrl.replace(/\/$/, "")}/${config.apiFormat === "responses" ? "responses" : "chat/completions"}`;
+        const endpoint = `${config.baseUrl.replace(/\/$/, "")}/${config.apiFormat === "responses" ? "responses" : "chat/completions"}`;
         const response = await fetch(endpoint, {
           method: "POST",
           signal: config.signal ? AbortSignal.any([config.signal, AbortSignal.timeout(config.timeoutMs)]) : AbortSignal.timeout(config.timeoutMs),
           headers: {
             "content-type": "application/json",
             authorization: `Bearer ${config.apiKey}`,
-            ...(config.apiFormat === "gemini" ? { "x-goog-api-key": config.apiKey } : {}),
             ...(config.traceId ? {
               "x-agreement-lens-trace-id": config.traceId,
               "x-agreement-lens-agent": config.agentName ?? "unknown",
@@ -1218,9 +1151,7 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
         });
         const completionResult = config.apiFormat === "responses"
           ? await readResponsesResponse(response)
-          : config.apiFormat === "gemini"
-            ? await readGeminiResponse(response)
-            : await readCompletionResponse(response);
+          : await readCompletionResponse(response);
         console.info("[agent-core] model response usage", JSON.stringify({
           agent: config.agentName ?? "unknown",
           traceId: config.traceId,
@@ -1256,7 +1187,6 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
     }
     if (!message) throw lastError instanceof Error ? lastError : new Error("Model request failed");
     if (!message.tool_calls?.length) return message.content ?? "";
-    assertGeminiToolContinuation(config, conversation, message);
     console.info("[agent-core] model requested tools", JSON.stringify({
       agent: config.agentName ?? "unknown",
       traceId: config.traceId,
@@ -1322,10 +1252,6 @@ async function parseWithRetry<T>(
     } catch (error) {
       lastError = error;
       if (config.signal?.aborted) throw error;
-      if (error instanceof ModelProtocolError || (typeof error === "object" && error !== null
-        && "nonRetryable" in error && (error as { nonRetryable?: unknown }).nonRetryable === true)) {
-        throw error;
-      }
       if (attempt >= maxRetries) break;
       reportModelProgress(config, {
         status: "running",
