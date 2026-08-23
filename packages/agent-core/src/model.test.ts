@@ -306,7 +306,9 @@ describe("OpenAI-compatible model adapter", () => {
     expect(findings).toEqual([]);
     expect(requestBodies).toHaveLength(2);
     expect(requestBodies[0]?.tools).toBeDefined();
+    expect(requestBodies[0]?.stream).toBe(false);
     expect(requestBodies[1]?.tools).toBeUndefined();
+    expect(requestBodies[1]?.stream).toBe(true);
     const finalMessages = requestBodies[1]?.messages as Array<{ role: string; content?: string }>;
     expect(finalMessages.at(-1)?.content).toContain("工具调用阶段已经结束");
   });
@@ -542,7 +544,7 @@ describe("OpenAI-compatible model adapter", () => {
       }
     });
     expect(findings[0]?.title).toBe("自动续费");
-    expect(requestBodies[0]?.stream).toBe(true);
+    expect(requestBodies[0]?.stream).toBe(false);
     expect((requestBodies[1]?.messages as Array<{ role: string }>).some((message) => message.role === "assistant")).toBe(true);
     expect((requestBodies[1]?.messages as Array<{ role: string; content?: string }>).at(-1)?.content).toContain("校验错误");
   });

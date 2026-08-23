@@ -33,6 +33,7 @@ interface ToolCall {
 interface ChatResponse {
   choices?: Array<{ message?: ChatMessage & { content?: unknown } }>;
   error?: { message?: string };
+  usage?: Record<string, unknown> | null;
 }
 
 interface StreamResponse {
@@ -54,6 +55,17 @@ interface StreamResponse {
   }>;
   error?: { message?: string };
   usage?: Record<string, unknown> | null;
+}
+
+interface CompletionReadResult {
+  message: ChatMessage;
+  usage?: Record<string, unknown> | null;
+  repairedToolCallTransport: boolean;
+}
+
+interface ToolCallRepairResult {
+  calls: ToolCall[];
+  repaired: boolean;
 }
 
 const categoryAliases: Record<string, Finding["category"]> = {
@@ -473,17 +485,24 @@ const followUpConversationInstruction = [
   "除非用户明确要求 JSON，否则只返回面向用户的自然语言 Markdown 答案。"
 ].join("\n");
 
-async function readCompletionResponse(response: Response): Promise<ChatMessage> {
+async function readCompletionResponse(response: Response): Promise<CompletionReadResult> {
   const contentType = response.headers.get("content-type") ?? "";
   if (!contentType.includes("text/event-stream") || !response.body) {
     const body = await response.json() as ChatResponse;
     if (!response.ok) throw new Error(body.error?.message ?? `Model request failed (${response.status})`);
     const message = body.choices?.[0]?.message;
     if (!message) throw new Error("Model response did not contain a message");
+    const repaired = message.tool_calls?.length
+      ? repairToolCalls(message.tool_calls)
+      : { calls: [], repaired: false };
     return {
-      ...message,
-      content: messageContent(message.content),
-      tool_calls: message.tool_calls?.length ? repairToolCalls(message.tool_calls) : undefined
+      message: {
+        ...message,
+        content: messageContent(message.content),
+        tool_calls: repaired.calls.length ? repaired.calls : undefined
+      },
+      usage: body.usage,
+      repairedToolCallTransport: repaired.repaired
     };
   }
 
@@ -495,6 +514,7 @@ async function readCompletionResponse(response: Response): Promise<ChatMessage> 
   let eventCount = 0;
   let finishReason: string | null | undefined;
   let usage: Record<string, unknown> | null | undefined;
+  let transportRepairApplied = false;
   const toolCalls = new Map<number, ToolCall>();
   const consume = (line: string) => {
     if (!line.startsWith("data:")) return;
@@ -529,6 +549,9 @@ async function readCompletionResponse(response: Response): Promise<ChatMessage> 
       if (part.id) current.id = part.id;
       if (part.function?.name) current.function.name += part.function.name;
       if (part.function?.arguments) {
+        if (isEmptyJsonObject(current.function.arguments) && isJsonObject(part.function.arguments)) {
+          transportRepairApplied = true;
+        }
         current.function.arguments = isEmptyJsonObject(current.function.arguments)
           && isJsonObject(part.function.arguments)
           ? part.function.arguments
@@ -546,9 +569,10 @@ async function readCompletionResponse(response: Response): Promise<ChatMessage> 
     if (chunk.done) break;
   }
   if (buffer) consume(buffer);
-  const parsedToolCalls = repairToolCalls([...toolCalls.entries()]
+  const repairedToolCalls = repairToolCalls([...toolCalls.entries()]
     .sort(([left], [right]) => left - right)
     .map(([, call]) => call));
+  const parsedToolCalls = repairedToolCalls.calls;
   console.info("[agent-core] model stream completed", JSON.stringify({
     eventCount,
     contentLength: content.length,
@@ -569,9 +593,13 @@ async function readCompletionResponse(response: Response): Promise<ChatMessage> 
     }));
   }
   return {
-    role: "assistant",
-    content: content || null,
-    tool_calls: parsedToolCalls.length ? parsedToolCalls : undefined
+    message: {
+      role: "assistant",
+      content: content || null,
+      tool_calls: parsedToolCalls.length ? parsedToolCalls : undefined
+    },
+    usage,
+    repairedToolCallTransport: transportRepairApplied || repairedToolCalls.repaired
   };
 }
 
@@ -594,8 +622,9 @@ function isEmptyJsonObject(value: string): boolean {
   }
 }
 
-function repairToolCalls(toolCalls: ToolCall[]): ToolCall[] {
+function repairToolCalls(toolCalls: ToolCall[]): ToolCallRepairResult {
   const repaired = [...toolCalls];
+  let changed = false;
   // A few OpenAI-compatible gateways emit the real arguments as a separate
   // unnamed call after a named `{}` placeholder. Treat it as transport
   // fragmentation, not as a second call.
@@ -611,17 +640,19 @@ function repairToolCalls(toolCalls: ToolCall[]): ToolCall[] {
     ) {
       previous.function.arguments = current.function.arguments;
       repaired.splice(index, 1);
+      changed = true;
       index--;
     }
   }
   const invalidToolCalls = repaired.filter((call) => !call.function.name.trim());
   if (invalidToolCalls.length) {
+    changed = true;
     console.warn("[agent-core] dropping streamed tool calls without a function name", JSON.stringify({
       count: invalidToolCalls.length,
       arguments: invalidToolCalls.map((call) => call.function.arguments.slice(0, 500))
     }));
   }
-  return repaired.filter((call) => call.function.name.trim());
+  return { calls: repaired.filter((call) => call.function.name.trim()), repaired: changed };
 }
 
 async function completion(config: ModelConfig, messages: ChatMessage[], context: ToolsContext): Promise<string> {
@@ -651,14 +682,24 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
       allowTools,
       messageCount: requestMessages.length
     }));
-    const requestBody = JSON.stringify({
+    const requestPayload = {
       model: config.model,
       reasoning_effort: config.reasoningEffort,
       ...outputBudget,
       temperature: 0.1,
-      stream: true,
       messages: requestMessages,
       ...(allowTools ? { tools, tool_choice: "auto" } : {})
+    };
+    // The configured gateway has a broken streaming tool-call adapter: tool
+    // arguments may be split across synthetic calls and usage may be reported
+    // as zero. Keep streaming for visible final answers, but use the regular
+    // JSON response for tool turns so the provider returns one canonical call
+    // and its actual completion usage.
+    const streamResponse = !allowTools;
+    const requestBody = JSON.stringify({
+      ...requestPayload,
+      stream: streamResponse,
+      ...(streamResponse ? { stream_options: { include_usage: true } } : {})
     });
     const maxRetries = config.maxRetries ?? 2;
     let message: ChatMessage | undefined;
@@ -674,7 +715,18 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
           },
           body: requestBody
         });
-        message = await readCompletionResponse(response);
+        const completionResult = await readCompletionResponse(response);
+        console.info("[agent-core] model response usage", JSON.stringify({
+          agent: config.agentName ?? "unknown",
+          traceId: config.traceId,
+          round,
+          streamed: streamResponse,
+          usage: completionResult.usage,
+          repairedToolCallTransport: completionResult.repairedToolCallTransport,
+          contentLength: completionResult.message.content?.length ?? 0,
+          toolCalls: completionResult.message.tool_calls?.map((call) => call.function.name) ?? []
+        }));
+        message = completionResult.message;
         break;
       } catch (error) {
         lastError = error;
