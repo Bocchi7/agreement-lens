@@ -973,6 +973,58 @@ function geminiMessage(response: {
   };
 }
 
+function geminiInputContents(message: unknown): GeminiContent[] {
+  if (typeof message === "string") {
+    return [{ role: "user", parts: [{ text: message }] }];
+  }
+  if (Array.isArray(message)) {
+    return [{
+      role: "user",
+      parts: message.flatMap((item) => {
+        if (!item || typeof item !== "object") return [];
+        return [item as Record<string, unknown>];
+      })
+    }];
+  }
+  if (message && typeof message === "object") {
+    return [{ role: "user", parts: [message as Record<string, unknown>] }];
+  }
+  throw new Error("Gemini 对话缺少有效的用户输入。");
+}
+
+function normalizedGeminiModelContent(response: {
+  text?: string;
+  candidates?: Array<{ content?: GeminiContent }>;
+}): GeminiContent {
+  const rawContent = response.candidates?.[0]?.content;
+  const parts = rawContent?.parts?.filter((part) => part && Object.keys(part).length > 0)
+    ?? (response.text ? [{ text: response.text }] : []);
+  if (!parts.length) {
+    throw new Error("Gemini 返回了空的模型内容，无法继续原生工具会话。");
+  }
+  // Some OpenAI-compatible Gemini relays omit candidate.content.role. The
+  // official SDK Chat helper then treats that turn as invalid and silently
+  // removes it from the next request's curated history. Keep an explicit,
+  // native Gemini history so each continuation always includes every turn.
+  return { role: "model", parts };
+}
+
+function geminiHistoryDiagnostics(contents: GeminiContent[]): Record<string, unknown> {
+  const serialized = JSON.stringify(contents);
+  return {
+    contents: contents.length,
+    bytes: Buffer.byteLength(serialized, "utf8"),
+    digest: digest(serialized),
+    roles: contents.map((content) => content.role),
+    partKinds: contents.map((content) => (content.parts ?? []).map((part) => (
+      "functionCall" in part ? "functionCall"
+        : "functionResponse" in part ? "functionResponse"
+          : "text" in part ? "text"
+            : "other"
+    )))
+  };
+}
+
 async function completionWithGeminiSdk(config: ModelConfig, messages: ChatMessage[], context: ToolsContext): Promise<string> {
   const client = new GoogleGenAI({
     apiKey: config.apiKey,
@@ -1000,11 +1052,7 @@ async function completionWithGeminiSdk(config: ModelConfig, messages: ChatMessag
       }
     } : {})
   };
-  const chat = client.chats.create({
-    model: config.model,
-    config: chatConfig,
-    history
-  } as never);
+  const nativeHistory = [...history];
   let nextMessage: unknown = pendingUserMessage;
 
   for (let round = 0; round <= config.maxToolRounds; round++) {
@@ -1015,32 +1063,45 @@ async function completionWithGeminiSdk(config: ModelConfig, messages: ChatMessag
         ? "正在通过 Gemini SDK 生成答案"
         : "正在通过 Gemini SDK 调用模型"
     });
+    const inputContents = geminiInputContents(nextMessage);
+    const requestContents = [...nativeHistory, ...inputContents];
     console.info("[agent-core] Gemini SDK request", JSON.stringify({
       agent: config.agentName ?? "unknown",
       traceId: config.traceId,
       round,
       messageKind: typeof nextMessage === "string" ? "user-text" : "function-response",
-      historyMessages: chat.getHistory().length
+      history: geminiHistoryDiagnostics(nativeHistory),
+      request: geminiHistoryDiagnostics(requestContents)
     }));
     const maxRetries = config.maxRetries ?? 2;
     let message: ChatMessage | undefined;
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        const response = await chat.sendMessage({ message: nextMessage as never }) as {
+        const response = await client.models.generateContent({
+          model: config.model,
+          contents: requestContents as never,
+          config: chatConfig as never
+        }) as {
           text?: string;
           functionCalls?: Array<{ name?: string; args?: unknown }>;
           candidates?: Array<{ content?: GeminiContent }>;
           usageMetadata?: Record<string, unknown>;
         };
-        message = geminiMessage(response);
+        const modelContent = normalizedGeminiModelContent(response);
+        message = geminiMessage({
+          ...response,
+          candidates: [{ content: modelContent }]
+        });
+        nativeHistory.push(...inputContents, modelContent);
         console.info("[agent-core] Gemini SDK response", JSON.stringify({
           agent: config.agentName ?? "unknown",
           traceId: config.traceId,
           round,
           usage: response.usageMetadata,
           contentLength: message.content?.length ?? 0,
-          toolCalls: message.tool_calls?.map((call) => call.function.name) ?? []
+          toolCalls: message.tool_calls?.map((call) => call.function.name) ?? [],
+          historyAfterResponse: geminiHistoryDiagnostics(nativeHistory)
         }));
         break;
       } catch (error) {

@@ -677,7 +677,7 @@ describe("OpenAI-compatible model adapter", () => {
     expect(progress.some((update) => update.retries === 2)).toBe(true);
   });
 
-  it("uses the official Gemini SDK for native tool continuations", async () => {
+  it("keeps the complete native Gemini history when a relay omits the model role", async () => {
     let calls = 0;
     const requestBodies: Array<Record<string, unknown>> = [];
     const requestPaths: string[] = [];
@@ -692,7 +692,6 @@ describe("OpenAI-compatible model adapter", () => {
         response.end(JSON.stringify({
           candidates: [{
             content: {
-              role: "model",
               parts: [{
                 functionCall: {
                   name: "search_sources",
@@ -757,8 +756,14 @@ describe("OpenAI-compatible model adapter", () => {
     });
     const secondContents = requestBodies[1]?.contents as Array<{
       role: string;
-      parts: Array<{ functionCall?: { name?: string }; functionResponse?: { name?: string; response?: { result?: unknown } } }>;
+      parts: Array<{
+        text?: string;
+        functionCall?: { name?: string };
+        functionResponse?: { name?: string; response?: { result?: unknown } };
+      }>;
     }>;
+    expect(secondContents.some((content) => content.role === "user"
+      && content.parts.some((part) => part.text?.includes("\"sourceCatalog\"")))).toBe(true);
     expect(secondContents.some((content) => content.role === "model"
       && content.parts.some((part) => part.functionCall?.name === "search_sources"))).toBe(true);
     expect(secondContents.some((content) => content.role === "user"
