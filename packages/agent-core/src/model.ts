@@ -129,7 +129,10 @@ const verifierOutputSchema = z.object({
     status: z.enum(["verified", "needs_verification", "rejected"]),
     confidence: z.number().min(0).max(1),
     uncertainty: z.string().default("")
-  }))
+  })),
+  findings: z.array(specialistFindingSchema.extend({
+    sourceFindingIds: z.array(z.string()).min(1)
+  })).max(48)
 });
 
 const integratorOutputSchema = z.object({
@@ -723,18 +726,40 @@ export async function runModelVerifier(input: {
   knowledge: KnowledgeTool;
   promptDir?: string;
   config: ModelConfig;
-}): Promise<Array<{ findingId: string; status: Finding["status"]; confidence: number; uncertainty: string }>> {
+}): Promise<{
+  decisions: Array<{ findingId: string; status: Finding["status"]; confidence: number; uncertainty: string }>;
+  findings: Array<z.infer<typeof specialistFindingSchema> & { sourceFindingIds: string[] }>;
+}> {
   const payload = await parseWithRetry(input.config, [
     {
       role: "system",
-      content: `${readPrompt(input.promptDir, "common")}\n\n${readPrompt(input.promptDir, "verifier")}\nReturn JSON only: {decisions:[{findingId,status,confidence,uncertainty}]}. confidence must be a JSON number from 0 to 1, for example 0.85, never "high" or another string.`
+      content: [
+        readPrompt(input.promptDir, "common"),
+        readPrompt(input.promptDir, "verifier"),
+        "你不仅要逐条核验证据，还要负责最终风险清单的语义整合。不要使用关键词、标题相似度或任何固定规则；请理解每条 finding 的事实、触发条件、平台权利、用户影响和原文证据后，判断哪些 finding 实际描述的是同一个法律效果。",
+        "同一法律效果只输出一个 finding，并在 sourceFindingIds 中列出被合并的输入 findingId；触发条件、权利对象、期限、可撤回性、适用对象或用户后果实质不同的 finding 必须分开。",
+        "findings 必须覆盖所有未被 rejected 的实质性风险，不得因为合并而丢失独立风险；每条 finding 至少保留一条来自 sourceFindingIds 的逐字证据，最多保留两条最有代表性的证据。",
+        "Return JSON only: {decisions:[{findingId,status,confidence,uncertainty}],findings:[{sourceFindingIds,category,title,trigger,platformAction,userImpact,severity,confidence,actions,evidence,knowledgeRefs,uncertainty}]}. confidence must be a JSON number from 0 to 1, for example 0.85, never \"high\" or another string."
+      ].join("\n\n")
     },
     { role: "user", content: JSON.stringify({ findings: input.findings, sourceCatalog: sourceCatalog(input.sources) }) }
-  ], { sources: input.sources, knowledge: input.knowledge }, verifierOutputSchema, undefined, normalizeVerifierOutput);
-  return payload.decisions.map((decision) => ({
-    ...decision,
-    uncertainty: decision.uncertainty ?? ""
-  }));
+  ], { sources: input.sources, knowledge: input.knowledge }, verifierOutputSchema, undefined, (value) => {
+    const normalized = normalizeVerifierOutput(value) as Record<string, unknown>;
+    return normalizeSpecialistOutput(normalized);
+  });
+  return {
+    decisions: payload.decisions.map((decision) => ({
+      ...decision,
+      uncertainty: decision.uncertainty ?? ""
+    })),
+    findings: payload.findings.map((finding) => ({
+      ...finding,
+      category: finding.category as Finding["category"],
+      sourceFindingIds: finding.sourceFindingIds,
+      knowledgeRefs: finding.knowledgeRefs ?? [],
+      uncertainty: finding.uncertainty ?? ""
+    }))
+  };
 }
 
 export async function runModelIntegrator(input: {

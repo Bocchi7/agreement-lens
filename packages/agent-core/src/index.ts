@@ -224,83 +224,6 @@ function verify(findings: Finding[], sources: SourceDocument[]): Finding[] {
   });
 }
 
-function normalizedQuote(quote: string): string {
-  return normalizeEvidenceText(quote).toLocaleLowerCase();
-}
-
-function evidenceSignature(finding: Finding): string {
-  return [...new Set(finding.evidence.map((evidence) => (
-    `${evidence.sourceId}:${evidence.sectionId}:${normalizedQuote(evidence.quote)}`
-  )))].sort().join("\n");
-}
-
-function hasSameEvidence(left: Finding, right: Finding): boolean {
-  const leftSignature = evidenceSignature(left);
-  return Boolean(leftSignature) && leftSignature === evidenceSignature(right);
-}
-
-function findingDetailScore(finding: Finding): number {
-  const text = `${finding.title} ${finding.platformAction} ${finding.userImpact}`;
-  const signals = ["全球", "永久", "免费", "独家", "不可撤销", "商业", "转授权", "改编", "衍生"];
-  return signals.reduce((score, signal) => score + (text.includes(signal) ? 1 : 0), 0);
-}
-
-function preferredFinding(left: Finding, right: Finding): Finding {
-  const severityDelta = severityWeight[right.severity] - severityWeight[left.severity];
-  if (severityDelta !== 0) return severityDelta > 0 ? right : left;
-  if (right.confidence !== left.confidence) return right.confidence > left.confidence ? right : left;
-  return findingDetailScore(right) > findingDetailScore(left) ? right : left;
-}
-
-function uniqueStrings(values: string[]): string[] {
-  return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
-}
-
-function mergeFindings(left: Finding, right: Finding): Finding {
-  const primary = preferredFinding(left, right);
-  const secondary = primary === left ? right : left;
-  const evidence = [...primary.evidence, ...secondary.evidence].filter((item, index, items) => (
-    items.findIndex((candidate) => (
-      candidate.sourceId === item.sourceId
-      && candidate.sectionId === item.sectionId
-      && normalizedQuote(candidate.quote) === normalizedQuote(item.quote)
-    )) === index
-  ));
-  const uncertainty = uniqueStrings([primary.uncertainty, secondary.uncertainty]).join("；");
-  const status = primary.status === "verified" || secondary.status === "verified"
-    ? "verified"
-    : primary.status === "needs_verification" || secondary.status === "needs_verification"
-      ? "needs_verification"
-      : "rejected";
-  return {
-    ...primary,
-    evidence,
-    actions: uniqueStrings([...primary.actions, ...secondary.actions]),
-    knowledgeRefs: uniqueStrings([...primary.knowledgeRefs, ...secondary.knowledgeRefs]),
-    uncertainty,
-    status
-  };
-}
-
-export function dedupeFindings(findings: Finding[]): Finding[] {
-  const deduped: Finding[] = [];
-  for (const finding of findings) {
-    const exactTitleIndex = deduped.findIndex((existing) => (
-      existing.category === finding.category && existing.title === finding.title
-    ));
-    const sameEvidenceIndex = deduped.findIndex((existing) => (
-      existing.category === finding.category && hasSameEvidence(existing, finding)
-    ));
-    const index = exactTitleIndex >= 0 ? exactTitleIndex : sameEvidenceIndex;
-    if (index < 0) {
-      deduped.push(finding);
-    } else {
-      deduped[index] = mergeFindings(deduped[index]!, finding);
-    }
-  }
-  return deduped;
-}
-
 function domainForCategory(category: Finding["category"]): Domain {
   if (category === "money") return "fees";
   if (category === "data") return "privacy";
@@ -448,12 +371,12 @@ export async function runWorkflow(
       .map((finding) => rebindFinding(finding, input.sources))
       .filter((finding): finding is Finding => Boolean(finding))
     : [];
-  let findings = verify(dedupeFindings([...preserved, ...groups.flat()]), input.sources);
-  const verifierEnabled = process.env.MODEL_VERIFIER_ENABLED === "true";
+  let findings = verify([...preserved, ...groups.flat()], input.sources);
+  const verifierEnabled = process.env.MODEL_VERIFIER_ENABLED !== "false";
   if (modelConfig && findings.length && verifierEnabled) {
     updateAgent("verifier", { status: "running", message: "正在核验证据" });
     try {
-      const decisions = await runModelVerifier({
+      const verification = await runModelVerifier({
         findings,
         sources: input.sources,
         knowledge,
@@ -465,18 +388,35 @@ export async function runWorkflow(
           onProgress: ({ progress }) => updateAgent("verifier", progress)
         }
       });
-      updateAgent("verifier", { status: "completed", message: "证据核验完成" });
-      const decisionMap = new Map(decisions.map((decision) => [decision.findingId, decision]));
-      findings = findings.map((finding) => {
-        const decision = decisionMap.get(finding.id);
-        if (!decision || finding.evidence.some((evidence) => !evidence.verified)) return finding;
+      updateAgent("verifier", { status: "completed", message: "证据核验与风险整合完成" });
+      const decisionMap = new Map(verification.decisions.map((decision) => [decision.findingId, decision]));
+      if (verification.findings.length !== findings.length) {
+        console.info("[agent-core] verifier consolidated findings", {
+          before: findings.length,
+          after: verification.findings.length
+        });
+      }
+      const consolidated = verification.findings.map((finding) => {
+        const linkedDecisions = finding.sourceFindingIds
+          .map((id) => decisionMap.get(id))
+          .filter((decision): decision is NonNullable<typeof decision> => Boolean(decision));
+        const decisionUncertainty = linkedDecisions.map((decision) => decision.uncertainty).filter(Boolean).join("；");
         return {
           ...finding,
-          status: decision.status,
-          confidence: Math.min(finding.confidence, decision.confidence),
-          uncertainty: decision.uncertainty
+          id: randomUUID(),
+          status: "needs_verification" as const,
+          knowledgeRefs: finding.knowledgeRefs ?? [],
+          uncertainty: [finding.uncertainty, decisionUncertainty].filter(Boolean).join("；"),
+          confidence: linkedDecisions.length
+            ? Math.min(finding.confidence, ...linkedDecisions.map((decision) => decision.confidence))
+            : finding.confidence,
+          evidence: finding.evidence.map((evidence) => ({ ...evidence, verified: false }))
         };
       });
+      if (findings.length && !consolidated.length) throw new Error("复核器未返回整合后的风险清单");
+      findings = verify(consolidated, input.sources)
+        .filter((finding) => finding.status !== "rejected")
+        .sort((a, b) => severityWeight[b.severity] - severityWeight[a.severity] || b.confidence - a.confidence);
     } catch (error) {
       console.warn("[agent-core] verifier failed", error);
       updateAgent("verifier", {

@@ -1,6 +1,6 @@
 import http from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
-import { modelConfigFromEnv, runModelFollowUp, runModelSpecialist } from "./model.js";
+import { modelConfigFromEnv, runModelFollowUp, runModelSpecialist, runModelVerifier } from "./model.js";
 
 const servers: http.Server[] = [];
 afterEach(async () => {
@@ -123,6 +123,84 @@ describe("OpenAI-compatible model adapter", () => {
     expect(findings[0]?.evidence[0]?.quote).toContain("自动续费");
     expect(progress.some((update) => update.rounds === 1)).toBe(true);
     expect(progress.some((update) => update.rounds === 2)).toBe(true);
+  });
+
+  it("lets the verifier consolidate semantically duplicate findings", async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBody = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({
+        choices: [{
+          message: {
+            role: "assistant",
+            content: JSON.stringify({
+              decisions: [
+                { findingId: "finding-a", status: "verified", confidence: 0.9, uncertainty: "" },
+                { findingId: "finding-b", status: "verified", confidence: 0.88, uncertainty: "" }
+              ],
+              findings: [{
+                sourceFindingIds: ["finding-a", "finding-b"],
+                category: "content",
+                title: "平台获得长期且不可撤回的内容使用许可",
+                trigger: "用户发布内容时",
+                platformAction: "平台可以长期使用内容并向第三方授权",
+                userImpact: "内容后续使用范围可能超出用户预期",
+                severity: "high",
+                confidence: 0.88,
+                actions: ["上传前核对授权期限和使用范围"],
+                evidence: [{
+                  sourceId: "source-1",
+                  sectionId: "section-1",
+                  quote: "平台可以永久使用您发布的内容并向第三方授权。"
+                }],
+                knowledgeRefs: [],
+                uncertainty: ""
+              }]
+            })
+          }
+        }]
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    const result = await runModelVerifier({
+      findings: [
+        {
+          id: "finding-a", category: "content", title: "内容授权期限很长", trigger: "发布内容时",
+          platformAction: "平台可以长期使用内容", userImpact: "内容可能被持续使用", severity: "high", confidence: 0.9,
+          actions: ["核对授权范围"], evidence: [{ sourceId: "source-1", sectionId: "section-1", quote: "平台可以永久使用您发布的内容并向第三方授权。", verified: false }],
+          knowledgeRefs: [], uncertainty: "", status: "needs_verification"
+        },
+        {
+          id: "finding-b", category: "content", title: "发布内容可被平台继续使用", trigger: "上传内容时",
+          platformAction: "平台可以继续使用发布内容", userImpact: "用户可能无法限制后续使用", severity: "high", confidence: 0.88,
+          actions: ["核对是否可以撤回"], evidence: [{ sourceId: "source-1", sectionId: "section-1", quote: "平台可以永久使用您发布的内容并向第三方授权。", verified: false }],
+          knowledgeRefs: [], uncertainty: "", status: "needs_verification"
+        }
+      ],
+      sources: [{
+        id: "source-1", title: "用户协议", mediaType: "text", normalizedText: "平台可以永久使用您发布的内容并向第三方授权。",
+        fingerprint: "fixture", fetchedAt: new Date().toISOString(), status: "ready",
+        sections: [{ id: "section-1", heading: "内容授权", content: "平台可以永久使用您发布的内容并向第三方授权。" }]
+      }],
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test", baseUrl: `http://127.0.0.1:${address.port}/v1`, model: "test-model",
+        reasoningEffort: "low", timeoutMs: 45_000, maxToolRounds: 1
+      }
+    });
+
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]?.sourceFindingIds).toEqual(["finding-a", "finding-b"]);
+    const systemPrompt = ((requestBody?.messages as Array<{ role: string; content?: string }>) ?? [])
+      .find((message) => message.role === "system")?.content ?? "";
+    expect(systemPrompt).toContain("不要使用关键词、标题相似度或任何固定规则");
   });
 
   it("forces a final answer after the configured tool rounds instead of failing", async () => {
