@@ -125,6 +125,58 @@ describe("OpenAI-compatible model adapter", () => {
     expect(progress.some((update) => update.rounds === 2)).toBe(true);
   });
 
+  it("returns explicit tool errors instead of executing missing arguments", async () => {
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      response.setHeader("content-type", "application/json");
+      if (requestBodies.length === 1) {
+        response.end(JSON.stringify({
+          choices: [{
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [{
+                id: "tool-empty",
+                type: "function",
+                function: { name: "search_sources", arguments: "{}" }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      response.end(JSON.stringify({
+        choices: [{ message: { role: "assistant", content: JSON.stringify({ findings: [] }) } }]
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    await runModelSpecialist({
+      role: "privacy",
+      sources: [],
+      context: { action: "authorize", concerns: ["data"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        model: "test-model",
+        reasoningEffort: "low",
+        timeoutMs: 45_000,
+        maxToolRounds: 2
+      }
+    });
+
+    const secondMessages = requestBodies[1]?.messages as Array<{ role: string; content?: string }>;
+    expect(secondMessages.find((message) => message.role === "tool")?.content)
+      .toContain("missing required field: query");
+  });
+
   it("lets the verifier consolidate semantically duplicate findings", async () => {
     let requestBody: Record<string, unknown> | undefined;
     const server = http.createServer(async (request, response) => {
@@ -493,6 +545,71 @@ describe("OpenAI-compatible model adapter", () => {
     expect(requestBodies[0]?.stream).toBe(true);
     expect((requestBodies[1]?.messages as Array<{ role: string }>).some((message) => message.role === "assistant")).toBe(true);
     expect((requestBodies[1]?.messages as Array<{ role: string; content?: string }>).at(-1)?.content).toContain("校验错误");
+  });
+
+  it("repairs gateways that split tool arguments into an unnamed streamed call", async () => {
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      response.statusCode = 200;
+      response.setHeader("content-type", "text/event-stream");
+      if (requestBodies.length === 1) {
+        response.write(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{
+          index: 0, id: "call-1", type: "function", function: { name: "read_source_section", arguments: "" }
+        }] } }] })}\n\n`);
+        response.write(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{
+          index: 0, function: { arguments: "{}" }
+        }] } }] })}\n\n`);
+        response.write(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{
+          index: 1, id: "call-2", type: "function", function: {
+            arguments: JSON.stringify({ sourceId: "source-1", sectionId: "section-1" })
+          }
+        }] }, finish_reason: "tool_calls" }] })}\n\n`);
+        response.end("data: [DONE]\n\n");
+        return;
+      }
+      response.write(`data: ${JSON.stringify({ choices: [{ delta: {
+        content: JSON.stringify({ findings: [] })
+      } }] })}\n\n`);
+      response.end("data: [DONE]\n\n");
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    await runModelSpecialist({
+      role: "privacy",
+      sources: [{
+        id: "source-1", title: "隐私政策", mediaType: "text",
+        normalizedText: "平台会处理个人信息。",
+        fingerprint: "fixture",
+        sections: [{ id: "section-1", heading: "信息处理", content: "平台会处理个人信息。" }],
+        fetchedAt: new Date().toISOString(), status: "ready"
+      }],
+      context: { action: "authorize", concerns: ["data"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test", baseUrl: `http://127.0.0.1:${address.port}/v1`, model: "test-model",
+        reasoningEffort: "low", timeoutMs: 45_000, maxToolRounds: 2
+      }
+    });
+
+    expect(requestBodies).toHaveLength(2);
+    const secondMessages = requestBodies[1]?.messages as Array<{
+      role: string;
+      content?: string;
+      tool_calls?: Array<{ function: { name: string; arguments: string } }>;
+    }>;
+    const assistant = secondMessages.find((message) => message.role === "assistant");
+    expect(assistant?.tool_calls).toHaveLength(1);
+    expect(assistant?.tool_calls?.[0]?.function.name).toBe("read_source_section");
+    expect(assistant?.tool_calls?.[0]?.function.arguments).toBe(JSON.stringify({
+      sourceId: "source-1", sectionId: "section-1"
+    }));
+    expect(secondMessages.find((message) => message.role === "tool")?.content).toContain("平台会处理个人信息");
   });
 
   it("retries transient empty streamed responses with a fresh final-answer instruction", async () => {
