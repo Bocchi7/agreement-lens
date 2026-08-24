@@ -1,4 +1,5 @@
 import type { PageSnapshot } from "./types";
+import { decodeHtmlBytes } from "@agreement-lens/shared";
 import { resolveAgreementLinksFromLoadedScripts, resolveDynamicAgreementLinks } from "./dynamic-discovery";
 import { setTabBadge as updateTabBadge } from "./tab-badge";
 import { mergeDiscoveredSources } from "./frame-discovery";
@@ -306,7 +307,10 @@ async function fetchStaticHtmlSource(
     if (contentType && !contentType.includes("html") && !contentType.includes("xhtml")) {
       throw new Error(`来源不是 HTML 页面（${contentType}）`);
     }
-    const html = await response.text();
+    // Response.text() always assumes UTF-8. A number of Chinese agreement
+    // pages declare GBK/GB18030 and become irreversible mojibake here before
+    // the server ever gets a chance to parse them.
+    const html = decodeHtmlBytes(new Uint8Array(await response.arrayBuffer()), contentType);
     if (!html) throw new Error("来源返回空白页面");
     if (html.length > MAX_HTML_BYTES) throw new Error("页面超过 2 MB");
     const textLength = visibleTextLength(html);
