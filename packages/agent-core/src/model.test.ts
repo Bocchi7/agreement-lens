@@ -123,11 +123,14 @@ describe("OpenAI-compatible model adapter", () => {
     expect(requestBodies[0]?.reasoning_effort).toBe("low");
     expect(requestBodies[0]?.messages).not.toEqual(requestBodies[1]?.messages);
     expect((requestBodies[0]?.messages as unknown[]).length).toBe(2);
-    expect((requestBodies[1]?.messages as unknown[]).length).toBe(4);
+    expect((requestBodies[1]?.messages as unknown[]).length).toBe(5);
     const firstMessages = requestBodies[0]?.messages as Array<{ role: string; content?: string }>;
     const systemPrompt = firstMessages.find((message) => message.role === "system")?.content ?? "";
+    const continuationMessages = requestBodies[1]?.messages as Array<{ role: string; content?: string }>;
     expect(systemPrompt).toContain("confidence is a JSON number from 0 to 1");
     expect(systemPrompt).toContain("Never use qualitative confidence labels");
+    expect(continuationMessages.at(-1)?.content).toContain("以下是本轮已实际执行的工具返回结果");
+    expect(continuationMessages.at(-1)?.content).toContain("自动续费");
     expect(findings).toHaveLength(1);
     expect(findings[0]?.evidence[0]?.quote).toContain("自动续费");
     expect(progress.some((update) => update.rounds === 1)).toBe(true);
@@ -707,10 +710,18 @@ describe("OpenAI-compatible model adapter", () => {
         }));
         return;
       }
-      const body = JSON.stringify(requestBodies.at(-1));
-      if (!body.includes(sentinel)) {
+      const currentRequest = requestBodies.at(-1);
+      const hasShadowTranscript = ((currentRequest?.contents ?? []) as Array<{
+        role?: string;
+        parts?: Array<{ text?: string }>;
+      }>).some((content) => content.role === "user"
+        && content.parts?.some((part) =>
+          part.text?.includes("以下是本轮已实际执行的工具返回结果")
+          && part.text.includes(sentinel)
+        ));
+      if (!hasShadowTranscript) {
         response.statusCode = 400;
-        response.end(JSON.stringify({ error: { message: "The function response did not contain the section sentinel." } }));
+        response.end(JSON.stringify({ error: { message: "The native request did not contain the shadow tool transcript." } }));
         return;
       }
       response.end(JSON.stringify({
@@ -797,6 +808,9 @@ describe("OpenAI-compatible model adapter", () => {
       && content.parts.some((part) => part.text?.includes("\"sourceCatalog\"")))).toBe(true);
     expect(secondContents.some((content) => content.role === "model"
       && content.parts.some((part) => part.functionCall?.name === "read_source_section"))).toBe(true);
+    expect(secondContents.some((content) => content.role === "user"
+      && content.parts.some((part) => part.text?.includes("以下是本轮已实际执行的工具返回结果")
+        && part.text.includes(sentinel)))).toBe(true);
     expect(secondContents.some((content) => content.role === "user"
       && content.parts.some((part) => part.functionResponse?.name === "read_source_section"
         && part.functionResponse.id === "gemini-call-1"
