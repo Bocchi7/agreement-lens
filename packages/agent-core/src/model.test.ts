@@ -681,6 +681,8 @@ describe("OpenAI-compatible model adapter", () => {
     let calls = 0;
     const requestBodies: Array<Record<string, unknown>> = [];
     const requestPaths: string[] = [];
+    const sentinel = "SENTINEL-7f4c2a-只存在于完整协议正文";
+    const sourceText = `${"协议目录和一般说明。".repeat(40)}${sentinel}`;
     const server = http.createServer(async (request, response) => {
       const chunks: Buffer[] = [];
       for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -694,8 +696,8 @@ describe("OpenAI-compatible model adapter", () => {
             content: {
               parts: [{
                 functionCall: {
-                  name: "search_sources",
-                  args: { query: "自动续费", limit: 3 },
+                  name: "read_source_section",
+                  args: { sourceId: "source-1", sectionId: "section-1" },
                   id: "gemini-call-1"
                 },
                 thoughtSignature: "opaque-gemini-signature"
@@ -705,11 +707,37 @@ describe("OpenAI-compatible model adapter", () => {
         }));
         return;
       }
+      const body = JSON.stringify(requestBodies.at(-1));
+      if (!body.includes(sentinel)) {
+        response.statusCode = 400;
+        response.end(JSON.stringify({ error: { message: "The function response did not contain the section sentinel." } }));
+        return;
+      }
       response.end(JSON.stringify({
         candidates: [{
           content: {
             role: "model",
-            parts: [{ text: JSON.stringify({ findings: [] }) }]
+            parts: [{
+              text: JSON.stringify({
+                findings: [{
+                  category: "money",
+                  title: sentinel,
+                  trigger: "用户使用服务",
+                  platformAction: "平台保留相关处理权",
+                  userImpact: "用户需要了解该项安排",
+                  severity: "medium",
+                  confidence: 0.8,
+                  actions: ["阅读完整条款"],
+                  evidence: [{
+                    sourceId: "source-1",
+                    sectionId: "section-1",
+                    quote: sentinel
+                  }],
+                  knowledgeRefs: [],
+                  uncertainty: ""
+                }]
+              })
+            }]
           }
         }]
       }));
@@ -725,9 +753,9 @@ describe("OpenAI-compatible model adapter", () => {
         id: "source-1",
         title: "会员协议",
         mediaType: "text",
-        normalizedText: "服务将在到期后自动续费并扣款。",
+        normalizedText: sourceText,
         fingerprint: "fixture",
-        sections: [{ id: "section-1", heading: "续费", content: "服务将在到期后自动续费并扣款。" }],
+        sections: [{ id: "section-1", heading: "续费", content: sourceText }],
         fetchedAt: new Date().toISOString(),
         status: "ready"
       }],
@@ -745,7 +773,8 @@ describe("OpenAI-compatible model adapter", () => {
       }
     });
 
-    expect(findings).toEqual([]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.title).toBe(sentinel);
     expect(calls).toBe(2);
     expect(requestPaths).toEqual([
       "/v1beta/models/gemini-test:generateContent",
@@ -767,11 +796,87 @@ describe("OpenAI-compatible model adapter", () => {
     expect(secondContents.some((content) => content.role === "user"
       && content.parts.some((part) => part.text?.includes("\"sourceCatalog\"")))).toBe(true);
     expect(secondContents.some((content) => content.role === "model"
-      && content.parts.some((part) => part.functionCall?.name === "search_sources"))).toBe(true);
+      && content.parts.some((part) => part.functionCall?.name === "read_source_section"))).toBe(true);
     expect(secondContents.some((content) => content.role === "user"
-      && content.parts.some((part) => part.functionResponse?.name === "search_sources"
+      && content.parts.some((part) => part.functionResponse?.name === "read_source_section"
         && part.functionResponse.id === "gemini-call-1"
-        && JSON.stringify(part.functionResponse.response?.output).includes("自动续费")))).toBe(true);
+        && JSON.stringify(part.functionResponse.response?.output).includes(sentinel)))).toBe(true);
+  });
+
+  it("returns an explicit native Gemini no-match result instead of an empty array", async () => {
+    let calls = 0;
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      calls++;
+      response.setHeader("content-type", "application/json");
+      if (calls === 1) {
+        response.end(JSON.stringify({
+          candidates: [{
+            content: {
+              role: "model",
+              parts: [{
+                functionCall: {
+                  name: "search_sources",
+                  args: { query: "不存在的费用规则", limit: 3 },
+                  id: "gemini-call-no-match"
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const toolResponse = JSON.stringify(requestBodies.at(-1));
+      if (!toolResponse.includes("\"matchCount\":0") || !toolResponse.includes("No supplied source section matched")) {
+        response.statusCode = 400;
+        response.end(JSON.stringify({ error: { message: "Missing explicit no-match function response." } }));
+        return;
+      }
+      response.end(JSON.stringify({
+        candidates: [{
+          content: {
+            role: "model",
+            parts: [{ text: JSON.stringify({ findings: [] }) }]
+          }
+        }]
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    const findings = await runModelSpecialist({
+      role: "fees",
+      sources: [{
+        id: "source-1",
+        title: "账户说明",
+        mediaType: "text",
+        normalizedText: "这份材料只说明头像和通知设置。",
+        fingerprint: "fixture",
+        sections: [{ id: "section-1", heading: "设置", content: "这份材料只说明头像和通知设置。" }],
+        fetchedAt: new Date().toISOString(),
+        status: "ready"
+      }],
+      context: { action: "register", concerns: ["money"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        model: "gemini-test",
+        apiFormat: "gemini",
+        reasoningEffort: "low",
+        timeoutMs: 45_000,
+        maxToolRounds: 2,
+        agentName: "fees"
+      }
+    });
+
+    expect(findings).toEqual([]);
+    expect(calls).toBe(2);
   });
 
   it("does not present inline materials as an exhausted tool budget", async () => {
