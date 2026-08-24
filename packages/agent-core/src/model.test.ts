@@ -695,8 +695,10 @@ describe("OpenAI-compatible model adapter", () => {
               parts: [{
                 functionCall: {
                   name: "search_sources",
-                  args: { query: "自动续费", limit: 3 }
-                }
+                  args: { query: "自动续费", limit: 3 },
+                  id: "gemini-call-1"
+                },
+                thoughtSignature: "opaque-gemini-signature"
               }]
             }
           }]
@@ -759,7 +761,7 @@ describe("OpenAI-compatible model adapter", () => {
       parts: Array<{
         text?: string;
         functionCall?: { name?: string };
-        functionResponse?: { name?: string; response?: { result?: unknown } };
+        functionResponse?: { name?: string; id?: string; response?: { output?: unknown } };
       }>;
     }>;
     expect(secondContents.some((content) => content.role === "user"
@@ -768,7 +770,8 @@ describe("OpenAI-compatible model adapter", () => {
       && content.parts.some((part) => part.functionCall?.name === "search_sources"))).toBe(true);
     expect(secondContents.some((content) => content.role === "user"
       && content.parts.some((part) => part.functionResponse?.name === "search_sources"
-        && JSON.stringify(part.functionResponse.response?.result).includes("自动续费")))).toBe(true);
+        && part.functionResponse.id === "gemini-call-1"
+        && JSON.stringify(part.functionResponse.response?.output).includes("自动续费")))).toBe(true);
   });
 
   it("does not present inline materials as an exhausted tool budget", async () => {

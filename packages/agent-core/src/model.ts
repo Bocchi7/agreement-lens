@@ -29,7 +29,12 @@ export interface MainAgentSession {
 interface ToolCall {
   id: string;
   type: "function";
-  function: { name: string; arguments: string; thoughtSignature?: string };
+  function: {
+    name: string;
+    arguments: string;
+    thoughtSignature?: string;
+    geminiCallId?: string;
+  };
 }
 
 interface ChatResponse {
@@ -903,7 +908,7 @@ function geminiContents(messages: ChatMessage[]): Array<GeminiContent> {
         parts.push({
           functionResponse: {
             name,
-            response: { result: geminiToolResult(message.content ?? "") }
+            response: { output: geminiToolResult(message.content ?? "") }
           }
         });
         index++;
@@ -946,21 +951,43 @@ function geminiContents(messages: ChatMessage[]): Array<GeminiContent> {
 
 function geminiMessage(response: {
   text?: string;
-  functionCalls?: Array<{ name?: string; args?: unknown }>;
+  functionCalls?: Array<{ name?: string; args?: unknown; id?: string }>;
   candidates?: Array<{ content?: GeminiContent }>;
 }): ChatMessage {
   const rawContent = response.candidates?.[0]?.content;
-  const calls = response.functionCalls ?? (rawContent?.parts ?? [])
+  // Use the original content parts when available. Gemini 3 binds a tool
+  // result to a specific function call through both its opaque thought
+  // signature (kept on the part) and the call ID (returned in the response).
+  // The convenience `response.functionCalls` list does not reliably retain
+  // all of that transport metadata across compatible endpoints.
+  const rawCalls = (rawContent?.parts ?? [])
     .flatMap((part) => {
       const functionCall = part.functionCall;
-      return functionCall && typeof functionCall === "object" ? [functionCall as { name?: string; args?: unknown }] : [];
+      return functionCall && typeof functionCall === "object"
+        ? [functionCall as { name?: string; args?: unknown; id?: string }]
+        : [];
     });
-  const toolCalls = calls
+  const responseCalls = response.functionCalls ?? [];
+  const resolvedCalls = rawCalls.length
+    ? rawCalls.map((call, index) => ({
+        ...call,
+        // Some compatible endpoints keep the opaque model part but omit its
+        // ID there, while the SDK's normalized functionCalls view still has
+        // it. Prefer the raw part, then recover only that missing transport
+        // field from the corresponding normalized call.
+        ...(call.id ? {} : { id: responseCalls[index]?.id })
+      }))
+    : responseCalls;
+  const toolCalls = resolvedCalls
     .filter((call) => typeof call.name === "string" && Boolean(call.name))
     .map((call, index) => ({
       id: `gemini-tool-${index}-${randomUUID()}`,
       type: "function" as const,
-      function: { name: call.name!, arguments: JSON.stringify(call.args ?? {}) }
+      function: {
+        name: call.name!,
+        arguments: JSON.stringify(call.args ?? {}),
+        ...(typeof call.id === "string" && call.id ? { geminiCallId: call.id } : {})
+      }
     }));
   const text = (rawContent?.parts ?? [])
     .flatMap((part) => typeof part.text === "string" ? [part.text] : [])
@@ -1011,6 +1038,31 @@ function normalizedGeminiModelContent(response: {
 
 function geminiHistoryDiagnostics(contents: GeminiContent[]): Record<string, unknown> {
   const serialized = JSON.stringify(contents);
+  const toolMetadata = contents.flatMap((content, contentIndex) => (content.parts ?? []).flatMap((part, partIndex) => {
+    if (part.functionCall && typeof part.functionCall === "object") {
+      const call = part.functionCall as { name?: unknown; id?: unknown };
+      return [{
+        contentIndex,
+        partIndex,
+        kind: "functionCall",
+        name: typeof call.name === "string" ? call.name : undefined,
+        hasId: typeof call.id === "string" && Boolean(call.id),
+        hasThoughtSignature: typeof part.thoughtSignature === "string" && Boolean(part.thoughtSignature)
+      }];
+    }
+    if (part.functionResponse && typeof part.functionResponse === "object") {
+      const response = part.functionResponse as { name?: unknown; id?: unknown };
+      return [{
+        contentIndex,
+        partIndex,
+        kind: "functionResponse",
+        name: typeof response.name === "string" ? response.name : undefined,
+        hasId: typeof response.id === "string" && Boolean(response.id),
+        hasThoughtSignature: typeof part.thoughtSignature === "string" && Boolean(part.thoughtSignature)
+      }];
+    }
+    return [];
+  }));
   return {
     contents: contents.length,
     bytes: Buffer.byteLength(serialized, "utf8"),
@@ -1021,7 +1073,8 @@ function geminiHistoryDiagnostics(contents: GeminiContent[]): Record<string, unk
         : "functionResponse" in part ? "functionResponse"
           : "text" in part ? "text"
             : "other"
-    )))
+    ))),
+    toolMetadata
   };
 }
 
@@ -1101,6 +1154,10 @@ async function completionWithGeminiSdk(config: ModelConfig, messages: ChatMessag
           usage: response.usageMetadata,
           contentLength: message.content?.length ?? 0,
           toolCalls: message.tool_calls?.map((call) => call.function.name) ?? [],
+          toolCallMetadata: message.tool_calls?.map((call) => ({
+            name: call.function.name,
+            hasGeminiCallId: Boolean(call.function.geminiCallId)
+          })) ?? [],
           historyAfterResponse: geminiHistoryDiagnostics(nativeHistory)
         }));
         break;
@@ -1124,7 +1181,8 @@ async function completionWithGeminiSdk(config: ModelConfig, messages: ChatMessag
     nextMessage = await Promise.all(message.tool_calls.map(async (call) => ({
       functionResponse: {
         name: call.function.name,
-        response: { result: await executeTool(call, context) }
+        ...(call.function.geminiCallId ? { id: call.function.geminiCallId } : {}),
+        response: { output: await executeTool(call, context) }
       }
     })));
   }
