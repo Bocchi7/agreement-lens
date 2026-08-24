@@ -180,7 +180,9 @@ export function getAnalysis(id: string): AnalysisResult | undefined {
       sources: request.sources
         .filter((source) => source.selected)
         .map(({ dataBase64: _dataBase64, renderedHtml: _renderedHtml, ...source }) => source),
-      context: request.context
+      context: request.context,
+      ...(request.model ? { model: request.model } : {}),
+      ...(request.reasoningEffort ? { reasoningEffort: request.reasoningEffort } : {})
     } satisfies AnalysisInputSnapshot;
   }
   return result;

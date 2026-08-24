@@ -10,7 +10,7 @@ import {
 import type {
   AgentProgress, AnalysisResult, DiscoveredSource, Finding, JobStatus, UserContext, VersionComparison
 } from "@agreement-lens/shared";
-import { maxSourceDocuments } from "@agreement-lens/shared";
+import { maxSourceDocuments, modelChoices, reasoningEfforts } from "@agreement-lens/shared";
 import { api, ApiError } from "./api";
 import type { HistoryEntry } from "./api";
 import type { PageSnapshot } from "./types";
@@ -39,6 +39,15 @@ const concernOptions: Array<{ value: UserContext["concerns"][number]; label: str
   { value: "remedies", label: "维权" }
 ];
 const redlineOptions = ["不能自动续费", "不能共享给第三方", "内容不能长期授权", "账号停用前必须通知"];
+const modelLabels: Record<typeof modelChoices[number], string> = {
+  "gpt-5.6-luna": "gpt-5.6-luna",
+  "gpt-5.6-terra": "gpt-5.6-terra",
+  "deepseek-v4-flash": "deepseek-v4-flash",
+  "gemini-3.7-flash": "gemini-3.7-flash"
+};
+function isModelChoice(value: string | undefined): value is typeof modelChoices[number] {
+  return Boolean(value && (modelChoices as readonly string[]).includes(value));
+}
 const categoryMeta = {
   money: { label: "费用", icon: CircleDollarSign },
   data: { label: "数据", icon: Database },
@@ -226,6 +235,8 @@ export function App() {
   const [snapshot, setSnapshot] = useState<PageSnapshot | null>(null);
   const [sources, setSources] = useState<DiscoveredSource[]>([]);
   const [context, setContext] = useState<UserContext>({ action: "register", concerns: ["money", "data"], redlines: [], notes: "" });
+  const [selectedModel, setSelectedModel] = useState<typeof modelChoices[number]>("gemini-3.7-flash");
+  const [selectedReasoning, setSelectedReasoning] = useState<typeof reasoningEfforts[number]>("low");
   const [pairCode, setPairCode] = useState("246810");
   const [error, setError] = useState("");
   const [job, setJob] = useState<JobStatus | null>(null);
@@ -264,6 +275,15 @@ export function App() {
   const versionCheckKeyRef = useRef("");
   const versionCheckSourceSignatureRef = useRef("");
   const runningReturnRef = useRef<{ phase: "prepare" | "result"; result: AnalysisResult | null }>({ phase: "prepare", result: null });
+
+  function applyCapabilities(capabilities: { model: string; reasoningEffort: string }) {
+    if ((modelChoices as readonly string[]).includes(capabilities.model)) {
+      setSelectedModel(capabilities.model as typeof modelChoices[number]);
+    }
+    if ((reasoningEfforts as readonly string[]).includes(capabilities.reasoningEffort)) {
+      setSelectedReasoning(capabilities.reasoningEffort as typeof reasoningEfforts[number]);
+    }
+  }
 
   useEffect(() => {
     void (async () => {
@@ -308,7 +328,7 @@ export function App() {
         const existing = localStorage.getItem("pairToken");
         if (existing) {
           try {
-            await api.capabilities();
+            applyCapabilities(await api.capabilities());
             setPhase("prepare");
           } catch {
             localStorage.removeItem("pairToken");
@@ -322,7 +342,7 @@ export function App() {
       const stored = await chrome.storage.local.get("pairToken");
       if (!stored.pairToken) return setPhase("pair");
       try {
-        await api.capabilities();
+        applyCapabilities(await api.capabilities());
       } catch (cause) {
         if (cause instanceof ApiError && cause.status === 401) {
           await chrome.storage.local.remove("pairToken");
@@ -781,7 +801,9 @@ export function App() {
       }
       const created = await api.createAnalysis({
         serviceName: snapshot.pageTitle, pageUrl: snapshot.pageUrl,
-        sources: preparedSources, context
+        sources: preparedSources, context,
+        model: selectedModel,
+        reasoningEffort: selectedReasoning
       });
       const pendingJob = {
         id: created.jobId, analysisId: created.analysisId, kind: "analysis", state: "queued",
@@ -896,6 +918,8 @@ export function App() {
         pageUrl: snapshot.pageUrl,
         sources: sources.filter((source) => source.selected),
         context,
+        model: selectedModel,
+        reasoningEffort: selectedReasoning,
         checkOnly: true
       });
       const pendingJob = {
@@ -1071,7 +1095,9 @@ export function App() {
           text: source.mediaType === "text" ? source.normalizedText : undefined,
           selected: true,
           relation: "primary"
-        }))
+        })),
+        model: isModelChoice(result.analysisInput?.model) ? result.analysisInput.model : selectedModel,
+        reasoningEffort: result.analysisInput?.reasoningEffort ?? selectedReasoning
       });
       const pendingJob = {
         id: created.jobId, analysisId: created.analysisId, kind: "recheck", state: "queued",
@@ -1286,6 +1312,8 @@ export function App() {
     <PrepareScreen
       snapshot={snapshot} sources={sources} setSources={setSources}
       context={context} setContext={setContext} start={startAnalysis}
+      selectedModel={selectedModel} setSelectedModel={setSelectedModel}
+      selectedReasoning={selectedReasoning} setSelectedReasoning={setSelectedReasoning}
       rescan={grantAndScan}
       manualOpen={manualOpen} manualFormValid={isManualFormValid()}
       manualText={manualText} setManualText={setManualText}
@@ -1388,6 +1416,8 @@ function OfflineScreen({ detail }: { detail?: string }) {
 function PrepareScreen(props: {
   snapshot: PageSnapshot | null; sources: DiscoveredSource[]; setSources: React.Dispatch<React.SetStateAction<DiscoveredSource[]>>;
   context: UserContext; setContext: React.Dispatch<React.SetStateAction<UserContext>>; start: () => void;
+  selectedModel: typeof modelChoices[number]; setSelectedModel: (value: typeof modelChoices[number]) => void;
+  selectedReasoning: typeof reasoningEfforts[number]; setSelectedReasoning: (value: typeof reasoningEfforts[number]) => void;
   rescan: () => void;
   manualOpen: boolean; manualText: string; setManualText: (v: string) => void; addManualText: () => void;
   manualUrl: string; setManualUrl: (v: string) => void; addPdfFiles: (files: FileList | null) => void;
@@ -1451,6 +1481,12 @@ function PrepareScreen(props: {
       <div className="redline-list">{redlineOptions.map((redline) => <label key={redline}><input type="checkbox" checked={context.redlines.includes(redline)} onChange={(event) => setContext({ ...context, redlines: event.target.checked ? [...context.redlines, redline] : context.redlines.filter((item) => item !== redline) })} /><span className="checkbox-ui"><Check size={13} /></span>{redline}</label>)}</div>
       <label className="field compact"><span>个人底线或补充情况（可选）</span><textarea placeholder="例如：内容不能用于训练模型" value={context.notes} onChange={(e) => setContext({ ...context, notes: e.target.value, redlines: [...context.redlines.filter((item) => redlineOptions.includes(item)), ...(e.target.value ? [e.target.value] : [])] })} /></label>
     </section>
+    <section className="section"><div className="section-heading"><div><span className="step">4</span><h2>模型设置</h2></div></div>
+      <div className="model-settings">
+        <label className="field compact"><span>模型</span><select value={props.selectedModel} onChange={(event) => props.setSelectedModel(event.target.value as typeof modelChoices[number])}>{modelChoices.map((model) => <option value={model} key={model}>{modelLabels[model]}</option>)}</select></label>
+        <label className="field compact"><span>思考强度</span><select value={props.selectedReasoning} onChange={(event) => props.setSelectedReasoning(event.target.value as typeof reasoningEfforts[number])}>{reasoningEfforts.map((effort) => <option value={effort} key={effort}>{effort}</option>)}</select></label>
+      </div>
+    </section>
     <div className="sticky-action"><div><strong>{sources.filter((source) => source.selected).length}</strong><span>份材料</span></div><button className="primary" disabled={props.historyLoading || props.historyCheckState === "checking" || !sources.some((source) => source.selected)} onClick={props.start}>{props.historyLoading ? <LoaderCircle size={17} className="spin" /> : <Sparkles size={17} />}{props.historyLoading ? "正在查找历史" : "开始分析"}</button></div>
   </main>;
 }
@@ -1506,6 +1542,7 @@ function AnalysisInputView({ input }: { input: AnalysisResult["analysisInput"] }
         <div className="analysis-input-group"><strong>确认分析材料 · {input.sources.length} 份</strong><div className="analysis-input-sources">{input.sources.map((source) => <div className="analysis-input-source" key={source.id}><span>{source.title}</span>{source.url ? <a href={source.url} target="_blank" rel="noreferrer" title="打开当时选择的材料">{source.url}</a> : <small>{source.text?.replace(/\s+/g, " ").trim().slice(0, 180) || "手动提供的文本"}</small>}</div>)}</div></div>
         <div className="analysis-input-group"><strong>这次你准备做什么</strong><p>{action || "未记录"}</p></div>
         <div className="analysis-input-group"><strong>你更在意哪些问题</strong><p>{concerns.length ? concerns.join("、") : "未特别指定"}</p></div>
+        <div className="analysis-input-group"><strong>模型设置</strong><p>{input.model ?? "未记录"} · 思考强度：{input.reasoningEffort ?? "未记录"}</p></div>
         {input.context.redlines.length > 0 && <div className="analysis-input-group"><strong>不能接受的情况</strong><p>{input.context.redlines.join("、")}</p></div>}
         {input.context.notes && <div className="analysis-input-group"><strong>补充说明</strong><p>{input.context.notes}</p></div>}
       </div>}

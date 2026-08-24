@@ -10,7 +10,7 @@ import {
   type PairResponse,
   userContextSchema
 } from "@agreement-lens/shared";
-import { answerFollowUp } from "@agreement-lens/agent-core";
+import { answerFollowUp, modelConfigFromEnv } from "@agreement-lens/agent-core";
 import {
   cancelJob, cleanupExpired, createAnalysisRecord, db, deleteAnalysis, getAgentSession, getAnalysis,
   getAnalysisRequest, getJob, getVersionComparisons, listRecentAnalyses, openKnowledge,
@@ -59,15 +59,19 @@ app.addHook("preHandler", async (request, reply) => {
 
 app.get("/health", async () => ({ ok: true, version: "0.1.0", time: new Date().toISOString() }));
 
-app.get("/v1/capabilities", async () => ({
-  modelConfigured: Boolean(process.env.OPENAI_API_KEY),
-  model: process.env.MODEL_NAME ?? "deterministic-demo-v1",
-  pdf: true,
-  ocr: false,
-  knowledgeSearch: true,
-  knowledgeShell: true,
-  maxSourceDocuments
-}));
+app.get("/v1/capabilities", async () => {
+  const config = modelConfigFromEnv();
+  return {
+    modelConfigured: Boolean(config),
+    model: config?.model ?? "deterministic-demo-v1",
+    reasoningEffort: config?.reasoningEffort ?? "low",
+    pdf: true,
+    ocr: false,
+    knowledgeSearch: true,
+    knowledgeShell: true,
+    maxSourceDocuments
+  };
+});
 
 app.post("/v1/pair", async (request, reply) => {
   const body = (request.body ?? {}) as { code?: string };
@@ -275,7 +279,9 @@ app.post("/v1/services/:id/recheck", async (request, reply) => {
     ...(typeof body.serviceName === "string" ? { serviceName: body.serviceName } : {}),
     ...(Array.isArray(body.sources) ? { sources: body.sources } : {}),
     ...(body.context && typeof body.context === "object" ? { context: body.context } : {}),
-    ...(typeof body.renderedHtml === "string" ? { renderedHtml: body.renderedHtml } : {})
+    ...(typeof body.renderedHtml === "string" ? { renderedHtml: body.renderedHtml } : {}),
+    ...(typeof body.model === "string" ? { model: body.model } : {}),
+    ...(typeof body.reasoningEffort === "string" ? { reasoningEffort: body.reasoningEffort } : {})
   };
   const parsedInput = createAnalysisSchema.safeParse(inputCandidate);
   if (!parsedInput.success) {

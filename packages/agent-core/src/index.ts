@@ -315,7 +315,10 @@ export async function runWorkflow(
       agentProgress[agent].message ?? "正在分析"
     );
   };
-  const modelConfig = modelConfigFromEnv();
+  const modelConfig = modelConfigFromEnv({
+    model: input.analysisInput?.model,
+    reasoningEffort: input.analysisInput?.reasoningEffort
+  });
   const modelFailures: string[] = [];
   const selectedDomains = input.domains?.length ? input.domains : Object.keys(patterns) as Domain[];
   for (const domain of selectedDomains) {
@@ -345,7 +348,7 @@ export async function runWorkflow(
         config: {
           ...modelConfig,
           signal: input.signal,
-          model: roleModel ?? modelConfig.model,
+          model: input.analysisInput?.model ?? roleModel ?? modelConfig.model,
           agentName: domain,
           traceId: input.analysisId,
           onProgress: ({ progress }) => updateAgent(domain, progress)
@@ -387,7 +390,7 @@ export async function runWorkflow(
         config: {
           ...modelConfig,
           signal: input.signal,
-          model: process.env.MODEL_VERIFIER ?? modelConfig.model,
+          model: input.analysisInput?.model ?? process.env.MODEL_VERIFIER ?? modelConfig.model,
           agentName: "verifier",
           traceId: input.analysisId,
           onProgress: ({ progress }) => updateAgent("verifier", progress)
@@ -466,7 +469,7 @@ export async function runWorkflow(
         config: {
           ...modelConfig,
           signal: input.signal,
-          model: process.env.MODEL_MAIN ?? modelConfig.model,
+          model: input.analysisInput?.model ?? process.env.MODEL_MAIN ?? modelConfig.model,
           agentName: "main",
           traceId: input.analysisId,
           onProgress: ({ progress }) => updateAgent("main", progress)
@@ -520,13 +523,14 @@ export async function runWorkflow(
       model: modelConfig
         ? JSON.stringify({
           default: modelConfig.model,
-          fees: process.env.MODEL_FEES ?? modelConfig.model,
-          privacy: process.env.MODEL_PRIVACY ?? modelConfig.model,
-          content: process.env.MODEL_CONTENT ?? modelConfig.model,
-          rights: process.env.MODEL_RIGHTS ?? modelConfig.model,
-          verifier: process.env.MODEL_VERIFIER ?? modelConfig.model,
-          main: process.env.MODEL_MAIN ?? modelConfig.model,
-          router: process.env.MODEL_ROUTER ?? modelConfig.model
+          fees: input.analysisInput?.model ?? process.env.MODEL_FEES ?? modelConfig.model,
+          privacy: input.analysisInput?.model ?? process.env.MODEL_PRIVACY ?? modelConfig.model,
+          content: input.analysisInput?.model ?? process.env.MODEL_CONTENT ?? modelConfig.model,
+          rights: input.analysisInput?.model ?? process.env.MODEL_RIGHTS ?? modelConfig.model,
+          verifier: input.analysisInput?.model ?? process.env.MODEL_VERIFIER ?? modelConfig.model,
+          main: input.analysisInput?.model ?? process.env.MODEL_MAIN ?? modelConfig.model,
+          router: input.analysisInput?.model ?? process.env.MODEL_ROUTER ?? modelConfig.model,
+          reasoningEffort: modelConfig.reasoningEffort
         })
         : "deterministic-demo-v1"
     }
@@ -669,7 +673,10 @@ export async function answerFollowUp(
   promptDir?: string,
   onProgress?: (progress: Partial<AgentProgress>) => void
 ): Promise<{ answer: string; session?: MainAgentSession }> {
-  const modelConfig = modelConfigFromEnv();
+  const modelConfig = modelConfigFromEnv({
+    model: result.analysisInput?.model,
+    reasoningEffort: result.analysisInput?.reasoningEffort
+  });
   if (modelConfig && knowledge) {
     return runModelFollowUp({
       result,

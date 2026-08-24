@@ -9,7 +9,8 @@ import {
   type AgentProgress,
   type Finding,
   type SourceDocument,
-  type UserContext
+  type UserContext,
+  reasoningEfforts
 } from "@agreement-lens/shared";
 import type { KnowledgeTool } from "./index.js";
 
@@ -203,7 +204,7 @@ export interface ModelConfig {
   model: string;
   apiFormat?: "chat" | "responses" | "gemini";
   toolMode?: "native" | "inline";
-  reasoningEffort: "low" | "medium" | "high";
+  reasoningEffort: typeof reasoningEfforts[number];
   timeoutMs: number;
   signal?: AbortSignal;
   maxToolRounds: number;
@@ -1190,7 +1191,15 @@ async function completionWithGeminiSdk(config: ModelConfig, messages: ChatMessag
   const chatConfig = {
     ...(geminiSystemInstruction(messages) ? { systemInstruction: geminiSystemInstruction(messages) } : {}),
     temperature: 0.1,
-    thinkingConfig: { thinkingLevel: config.reasoningEffort },
+    ...(config.reasoningEffort === "none"
+      ? {}
+      : {
+          thinkingConfig: {
+            thinkingLevel: config.reasoningEffort === "xhigh" || config.reasoningEffort === "max"
+              ? "high"
+              : config.reasoningEffort
+          }
+        }),
     httpOptions: { retryOptions: { attempts: 1 } },
     ...(config.maxCompletionTokens ? { maxOutputTokens: config.maxCompletionTokens } : {}),
     ...(config.toolMode !== "inline" ? {
@@ -1835,16 +1844,23 @@ export async function runModelChangeRouter(input: {
   ], { sources: input.currentSources, knowledge: input.knowledge }, changeRouterOutputSchema, undefined, normalizeChangeRouterOutput);
 }
 
-export function modelConfigFromEnv(): ModelConfig | undefined {
+export function modelConfigFromEnv(overrides?: {
+  model?: string;
+  reasoningEffort?: typeof reasoningEfforts[number];
+}): ModelConfig | undefined {
   const resolveEnvReference = (value: string | undefined) => {
     const reference = value?.match(/^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/);
     const variableName = reference?.[1];
     return variableName ? process.env[variableName] : value;
   };
   const configuredEffort = resolveEnvReference(process.env.MODEL_REASONING_EFFORT);
-  const reasoningEffort = configuredEffort === "medium" || configuredEffort === "high" ? configuredEffort : "low";
+  const reasoningEffort = reasoningEfforts.includes(configuredEffort as typeof reasoningEfforts[number])
+    ? configuredEffort as typeof reasoningEfforts[number]
+    : "low";
   const configuredApiFormat = resolveEnvReference(process.env.MODEL_API_FORMAT);
-  const apiFormat = configuredApiFormat === "responses"
+  const apiFormat = overrides?.model
+    ? (overrides.model.startsWith("gemini-") ? "gemini" : "chat")
+    : configuredApiFormat === "responses"
     ? "responses"
     : configuredApiFormat === "gemini"
       ? "gemini"
@@ -1866,10 +1882,10 @@ export function modelConfigFromEnv(): ModelConfig | undefined {
         ?? resolveEnvReference(process.env.OPENAI_BASE_URL)
         ?? "https://generativelanguage.googleapis.com"
       : resolveEnvReference(process.env.OPENAI_BASE_URL) ?? "https://api.openai.com/v1",
-    model: resolveEnvReference(process.env.MODEL_NAME) ?? "gpt-4.1-mini",
+    model: overrides?.model ?? resolveEnvReference(process.env.MODEL_NAME) ?? "gpt-4.1-mini",
     apiFormat,
     toolMode,
-    reasoningEffort,
+    reasoningEffort: overrides?.reasoningEffort ?? reasoningEffort,
     timeoutMs: Number.isFinite(configuredTimeout) && configuredTimeout >= 10_000 ? configuredTimeout : DEFAULT_MODEL_TIMEOUT_MS,
     maxToolRounds: Number.isInteger(configuredRounds) && configuredRounds >= 0 && configuredRounds <= 100 ? configuredRounds : 100,
     maxRetries: Number.isInteger(configuredRetries) && configuredRetries >= 0 && configuredRetries <= 100 ? configuredRetries : 100,

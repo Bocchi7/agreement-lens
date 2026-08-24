@@ -34,6 +34,34 @@ describe("OpenAI-compatible model adapter", () => {
     }
   });
 
+  it("allows a single analysis to override the configured model and reasoning effort", () => {
+    const previousApiFormat = process.env.MODEL_API_FORMAT;
+    const previousKey = process.env.OPENAI_API_KEY;
+    const previousGeminiKey = process.env.GEMINI_API_KEY;
+    try {
+      process.env.OPENAI_API_KEY = "configured-secret";
+      delete process.env.GEMINI_API_KEY;
+      process.env.MODEL_API_FORMAT = "gemini";
+      expect(modelConfigFromEnv({ model: "gpt-5.6-terra", reasoningEffort: "max" })).toMatchObject({
+        model: "gpt-5.6-terra",
+        apiFormat: "chat",
+        reasoningEffort: "max"
+      });
+      expect(modelConfigFromEnv({ model: "gemini-3.7-flash", reasoningEffort: "none" })).toMatchObject({
+        model: "gemini-3.7-flash",
+        apiFormat: "gemini",
+        reasoningEffort: "none"
+      });
+    } finally {
+      if (previousApiFormat === undefined) delete process.env.MODEL_API_FORMAT;
+      else process.env.MODEL_API_FORMAT = previousApiFormat;
+      if (previousKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousKey;
+      if (previousGeminiKey === undefined) delete process.env.GEMINI_API_KEY;
+      else process.env.GEMINI_API_KEY = previousGeminiKey;
+    }
+  });
+
   it("executes native tool calls and validates the final specialist schema", async () => {
     let calls = 0;
     const progress: Array<{ rounds?: number; retries?: number; message?: string }> = [];

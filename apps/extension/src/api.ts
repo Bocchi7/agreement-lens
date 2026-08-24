@@ -27,6 +27,8 @@ export interface RecheckInput {
   sources?: CreateAnalysisInput["sources"];
   context?: CreateAnalysisInput["context"];
   renderedHtml?: string;
+  model?: CreateAnalysisInput["model"];
+  reasoningEffort?: CreateAnalysisInput["reasoningEffort"];
   checkOnly?: boolean;
 }
 
@@ -73,7 +75,7 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs = LOCAL_RE
 
 export const api = {
   health: () => request<{ ok: boolean }>("/health"),
-  capabilities: () => request<{ modelConfigured: boolean; model: string }>("/v1/capabilities"),
+  capabilities: () => request<{ modelConfigured: boolean; model: string; reasoningEffort: string }>("/v1/capabilities"),
   async pair(code: string) {
     const result = await request<PairResponse>("/v1/pair", { method: "POST", body: JSON.stringify({ code }) });
     if (typeof chrome !== "undefined" && chrome.storage?.local) await chrome.storage.local.set({ pairToken: result.token });

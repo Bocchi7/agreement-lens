@@ -66,8 +66,8 @@ button { color: inherit; }
 .pair-screen h1 { font-size: 25px; }
 .field { width: 100%; display: flex; flex-direction: column; text-align: left; gap: 7px; margin: 18px 0 12px; }
 .field span { font-size: 12px; font-weight: 700; color: #4e5853; }
-.field input, .field textarea, .manual-box textarea { border: 1px solid #cbd4cf; background: #fff; border-radius: 6px; padding: 11px 12px; outline: 0; resize: vertical; }
-.field input:focus, .field textarea:focus, .manual-box textarea:focus { border-color: #34725e; box-shadow: 0 0 0 3px #dcece5; }
+.field input, .field select, .field textarea, .manual-box textarea { border: 1px solid #cbd4cf; background: #fff; border-radius: 6px; padding: 11px 12px; outline: 0; resize: vertical; }
+.field input:focus, .field select:focus, .field textarea:focus, .manual-box textarea:focus { border-color: #34725e; box-shadow: 0 0 0 3px #dcece5; }
 .pair-screen .field input { font: 700 24px/1.2 ui-monospace, monospace; text-align: center; letter-spacing: 7px; }
 .primary, .small-primary { border: 0; border-radius: 6px; background: #174d3f; color: white; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; gap: 8px; cursor: pointer; }
 .primary { min-height: 43px; padding: 0 18px; }
@@ -125,6 +125,9 @@ button { color: inherit; }
 .redline-list input:checked + .checkbox-ui { color: white; background: #174d3f; border-color: #174d3f; }
 .field.compact { margin-bottom: 0; }
 .field.compact textarea { min-height: 65px; font-size: 12px; }
+.model-settings { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(110px, .6fr); gap: 10px; }
+.model-settings .field { margin: 0; }
+.model-settings select { width: 100%; font-size: 11px; }
 .sticky-action { position: fixed; z-index: 15; bottom: 0; left: 0; right: 0; min-height: 68px; padding: 11px 18px; background: rgba(255,255,255,.96); backdrop-filter: blur(8px); border-top: 1px solid #d9e0dc; display: flex; align-items: center; justify-content: space-between; }
 .sticky-action > div { display: flex; flex-direction: column; }
 .sticky-action strong { color: #174d3f; font-size: 17px; }

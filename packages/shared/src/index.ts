@@ -55,6 +55,8 @@ export const actionTypes = ["register", "pay", "upload", "authorize", "other"] a
 export const riskCategories = ["money", "data", "content", "account", "remedies"] as const;
 export const severities = ["low", "medium", "high", "critical"] as const;
 export const recommendations = ["continue", "adjust", "pause"] as const;
+export const modelChoices = ["gpt-5.6-luna", "gpt-5.6-terra", "deepseek-v4-flash", "gemini-3.7-flash"] as const;
+export const reasoningEfforts = ["none", "low", "medium", "high", "xhigh", "max"] as const;
 export const maxSourceDocuments = 32;
 
 export const userContextSchema = z.object({
@@ -110,7 +112,9 @@ export const analysisInputSourceSchema = discoveredSourceSchema.omit({
 export const analysisInputSchema = z.object({
   pageUrl: z.string().url(),
   sources: z.array(analysisInputSourceSchema),
-  context: userContextSchema
+  context: userContextSchema,
+  model: z.string().optional(),
+  reasoningEffort: z.enum(reasoningEfforts).optional()
 });
 export type AnalysisInputSnapshot = z.infer<typeof analysisInputSchema>;
 
@@ -214,7 +218,9 @@ export const createAnalysisSchema = z.object({
   pageUrl: z.string().url(),
   sources: z.array(discoveredSourceSchema).min(1).max(maxSourceDocuments),
   context: userContextSchema,
-  renderedHtml: z.string().max(2_000_000).optional()
+  renderedHtml: z.string().max(2_000_000).optional(),
+  model: z.enum(modelChoices).optional(),
+  reasoningEffort: z.enum(reasoningEfforts).optional()
 });
 export type CreateAnalysisInput = z.infer<typeof createAnalysisSchema>;
 

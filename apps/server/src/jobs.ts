@@ -34,7 +34,9 @@ function analysisInputSnapshot(input: CreateAnalysisInput): AnalysisInputSnapsho
     sources: input.sources
       .filter((source) => source.selected)
       .map(({ dataBase64: _dataBase64, renderedHtml: _renderedHtml, ...source }) => source),
-    context: input.context
+    context: input.context,
+    ...(input.model ? { model: input.model } : {}),
+    ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {})
   };
 }
 
