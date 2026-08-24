@@ -57,7 +57,7 @@ button { color: inherit; }
 .history-preview-main em { margin-top: 5px; color: #28634f; font-size: 9px; line-height: 1.4; font-style: normal; }
 .history-preview-main em span { display: block; }
 .history-check-cancel { margin: -6px 18px 14px; color: #983623; }
-.running-elapsed { margin: -14px auto 18px; color: #65766e; font-size: 10px; }
+.running-elapsed { margin: 8px auto 18px; color: #65766e; font-size: 10px; }
 .pair-symbol { width: 56px; height: 56px; display: grid; place-items: center; color: #174d3f; background: #e3eee8; border: 1px solid #ccddd4; border-radius: 8px; }
 .pair-symbol.offline-symbol { color: #9c3725; background: #f8e2dc; border-color: #efc7bd; }
 .command-box { margin: 4px 0 18px; padding: 10px 12px; border: 1px solid #cad4ce; border-radius: 5px; background: white; color: #174d3f; font: 600 11px/1.4 ui-monospace, monospace; }

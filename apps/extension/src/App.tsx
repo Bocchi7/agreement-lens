@@ -1470,7 +1470,7 @@ function RunningScreen({ job, sources, onCancel }: { job: JobStatus; sources: Di
     ["main", "结论整合"],
     ["router", "版本路由"]
   ] as const;
-  return <main className="running"><div className="radar"><span /><Search size={28} /></div><p className="eyebrow">正在分析 {sources.length} 份材料</p><h1>{job.message}</h1><p className="running-elapsed">已等待 {formatElapsed(clock - new Date(job.createdAt).getTime())}</p><div className="progress-track"><i style={{ width: `${job.progress}%` }} /></div><span className="progress-number">{job.progress}%</span><div className="agent-grid">{agentDefinitions.map(([key, name]) => {
+  return <main className="running"><div className="radar"><span /><Search size={28} /></div><p className="eyebrow">正在分析 {sources.length} 份材料</p><p className="running-elapsed">已等待 {formatElapsed(clock - new Date(job.createdAt).getTime())}</p><div className="progress-track"><i style={{ width: `${job.progress}%` }} /></div><span className="progress-number">{job.progress}%</span><div className="agent-grid">{agentDefinitions.map(([key, name]) => {
     const progress = job.agents?.[key];
     const status = progress?.status ?? "idle";
     const Icon = status === "completed" ? Check : status === "failed" ? AlertTriangle : status === "running" ? LoaderCircle : Circle;
