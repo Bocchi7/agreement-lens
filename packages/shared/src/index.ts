@@ -168,6 +168,7 @@ export const analysisResultSchema = z.object({
   actionChecklist: z.array(z.string()),
   createdAt: z.string(),
   updatedAt: z.string(),
+  analysisDurationMs: z.number().int().nonnegative().optional(),
   saved: z.boolean(),
   versions: z.object({
     knowledge: z.string(),

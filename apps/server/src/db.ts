@@ -219,7 +219,10 @@ export function listRecentAnalyses(limit = 50) {
         recommendation: result.recommendation,
         saved: Boolean(row.saved),
         sourceCount: result.sources.length,
-        findingCount: result.findings.length
+        findingCount: result.findings.length,
+        model: result.analysisInput?.model,
+        reasoningEffort: result.analysisInput?.reasoningEffort,
+        analysisDurationMs: result.analysisDurationMs
       }];
     } catch {
       return [];

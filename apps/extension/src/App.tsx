@@ -1397,7 +1397,14 @@ function HistoryScreen({
       return <div className="history-row" key={entry.analysisId}>
         <button className="history-row-open" onClick={() => void onOpen(entry)} disabled={Boolean(loadingId || deletingId)}>
           <span className={`history-recommendation ${meta.tone}`}><Shield size={15} /></span>
-          <span className="history-main"><strong>{entry.serviceName || domain}</strong><small title={entry.pageUrl}>{domain || entry.pageUrl}</small><span>{formatHistoryDate(entry.updatedAt || entry.createdAt)} · {entry.sourceCount} 份材料 · {entry.findingCount} 项告警</span></span>
+          <span className="history-main">
+            <strong>{entry.serviceName || domain}</strong>
+            <small title={entry.pageUrl}>{domain || entry.pageUrl}</small>
+            <span>{formatHistoryDate(entry.updatedAt || entry.createdAt)} · {entry.sourceCount} 份材料 · {entry.findingCount} 项告警</span>
+            <span title={`${entry.model ?? "模型未记录"} · 思考强度：${entry.reasoningEffort ?? "未记录"} · 分析耗时：${formatAnalysisDuration(entry.analysisDurationMs)}`}>
+              {entry.model ?? "模型未记录"} · 思考：{entry.reasoningEffort ?? "未记录"} · 耗时 {formatAnalysisDuration(entry.analysisDurationMs)}
+            </span>
+          </span>
           <span className="history-row-end">{isLoading ? <LoaderCircle size={16} className="spin" /> : <ChevronRight size={17} />}</span>
         </button>
         <button className="icon-button compact-icon history-delete" title="删除历史分析" onClick={() => onDelete(entry)} disabled={Boolean(loadingId || deletingId)}>{isDeleting ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}</button>
@@ -1429,6 +1436,15 @@ function formatHistoryDate(value: string): string {
   return Number.isNaN(timestamp) ? "时间未知" : new Date(timestamp).toLocaleString("zh-CN", {
     month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit"
   });
+}
+
+function formatAnalysisDuration(durationMs?: number): string {
+  if (!Number.isFinite(durationMs)) return "耗时未记录";
+  const totalSeconds = Math.max(0, Math.round((durationMs ?? 0) / 1_000));
+  if (totalSeconds < 60) return `${totalSeconds} 秒`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds ? `${minutes} 分 ${seconds} 秒` : `${minutes} 分`;
 }
 
 function OfflineScreen({ detail }: { detail?: string }) {
@@ -1544,7 +1560,7 @@ function ResultHeader({ result, saving, historyMode, onHistory, onSave }: { resu
 
 function Overview({ result, topFindings, openEvidence, setView }: { result: AnalysisResult; topFindings: Finding[]; openEvidence: (finding: Finding) => void; setView: (view: View) => void }) {
   return <><section className="decision"><p>{result.recommendationReason}</p>{result.actionChecklist.length > 0 && <div className="checklist"><strong>确认前建议</strong>{result.actionChecklist.slice(0, 3).map((item) => <span key={item}><CheckCircle2 size={16} />{item}</span>)}</div>}</section>
-    <AnalysisInputView input={result.analysisInput} />
+    <AnalysisInputView input={result.analysisInput} analysisDurationMs={result.analysisDurationMs} />
     <section className="result-section"><div className="result-title"><div><AlertTriangle size={18} /><h2>重点告警</h2></div><button onClick={() => setView("risks")}>查看全部 {result.findings.length}</button></div>
       <div className="finding-list">{topFindings.map((finding, index) => <FindingRow key={finding.id} finding={finding} index={index + 1} onClick={() => openEvidence(finding)} />)}</div>
       {!topFindings.length && <div className="empty-inline"><CheckCircle2 size={22} /><span>已读材料中暂未发现可核验的重点告警</span></div>}
@@ -1553,7 +1569,13 @@ function Overview({ result, topFindings, openEvidence, setView }: { result: Anal
   </>;
 }
 
-function AnalysisInputView({ input }: { input: AnalysisResult["analysisInput"] }) {
+function AnalysisInputView({
+  input,
+  analysisDurationMs
+}: {
+  input: AnalysisResult["analysisInput"];
+  analysisDurationMs?: number;
+}) {
   const action = actionOptions.find((item) => item.value === input?.context.action)?.label ?? input?.context.action;
   const concerns = input?.context.concerns.map((concern) => concernOptions.find((item) => item.value === concern)?.label ?? concern) ?? [];
   return <details className="analysis-input">
@@ -1565,6 +1587,7 @@ function AnalysisInputView({ input }: { input: AnalysisResult["analysisInput"] }
         <div className="analysis-input-group"><strong>这次你准备做什么</strong><p>{action || "未记录"}</p></div>
         <div className="analysis-input-group"><strong>你更在意哪些问题</strong><p>{concerns.length ? concerns.join("、") : "未特别指定"}</p></div>
         <div className="analysis-input-group"><strong>模型设置</strong><p>{input.model ?? "未记录"} · 思考强度：{input.reasoningEffort ?? "未记录"}</p></div>
+        <div className="analysis-input-group"><strong>分析耗时</strong><p>{formatAnalysisDuration(analysisDurationMs)}</p></div>
         {input.context.redlines.length > 0 && <div className="analysis-input-group"><strong>不能接受的情况</strong><p>{input.context.redlines.join("、")}</p></div>}
         {input.context.notes && <div className="analysis-input-group"><strong>补充说明</strong><p>{input.context.notes}</p></div>}
       </div>}

@@ -19,6 +19,9 @@ export interface HistoryEntry {
   saved: boolean;
   sourceCount: number;
   findingCount: number;
+  model?: string;
+  reasoningEffort?: string;
+  analysisDurationMs?: number;
 }
 
 export interface RecheckInput {

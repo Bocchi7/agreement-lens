@@ -89,7 +89,8 @@ export function enqueueAnalysis(jobId: string, analysisId: string, serviceId: st
       assertUsableSources(sources);
       setJob(jobId, { state: "analyzing", progress: 30, message: "来源已就绪，开始多视角分析" });
       let mainAgentSession: MainAgentSession | undefined;
-      const result = await runWorkflow({
+      const analysisStartedAt = Date.now();
+      const workflowResult = await runWorkflow({
         analysisId, serviceId, serviceName: input.serviceName,
         sources, context: input.context, signal, promptDir: path.join(repoRoot, "prompts"),
         analysisInput: analysisInputSnapshot(input),
@@ -98,6 +99,10 @@ export function enqueueAnalysis(jobId: string, analysisId: string, serviceId: st
         state: progress.stage, progress: progress.progress, message: progress.message, agents: progress.agents
       }));
       if (isCancelled(jobId)) return;
+      const result = {
+        ...workflowResult,
+        analysisDurationMs: Date.now() - analysisStartedAt
+      };
       saveResult(analysisResultSchema.parse(result));
       if (mainAgentSession) saveAgentSession(analysisId, mainAgentSession);
       setJob(jobId, { state: "complete", progress: 100, message: "分析完成" });
@@ -140,7 +145,8 @@ export function enqueueRecheck(
       });
       const knowledge = openKnowledge();
       let mainAgentSession: MainAgentSession | undefined;
-      const result = await runWorkflow({
+      const analysisStartedAt = Date.now();
+      const workflowResult = await runWorkflow({
         analysisId,
         serviceId,
         serviceName: input.serviceName,
@@ -161,6 +167,10 @@ export function enqueueRecheck(
         }
       }));
       if (isCancelled(jobId)) return;
+      const result = {
+        ...workflowResult,
+        analysisDurationMs: Date.now() - analysisStartedAt
+      };
       saveResult(analysisResultSchema.parse(result));
       if (mainAgentSession) saveAgentSession(analysisId, mainAgentSession);
       const comparison: VersionComparison = {
