@@ -25,7 +25,8 @@ type HistoryReturnState = {
   view: View;
 };
 type HistoryCheckState = "idle" | "loading" | "checking" | "unchanged" | "changed" | "failed" | "cancelled";
-type CurrentHistory = HistoryEntry & { versionCount: number; versionConsistent: boolean; versionInfoAvailable: boolean };
+type HistoryScope = "all" | "current";
+type CurrentHistory = HistoryEntry & { historyCount: number; versionCount: number; versionConsistent: boolean; versionInfoAvailable: boolean };
 
 const actionOptions: Array<{ value: UserContext["action"]; label: string }> = [
   { value: "register", label: "注册 / 重新同意" },
@@ -264,6 +265,7 @@ export function App() {
   const [historyLoadingId, setHistoryLoadingId] = useState<string | null>(null);
   const [historyDeletingId, setHistoryDeletingId] = useState<string | null>(null);
   const [historyReturn, setHistoryReturn] = useState<HistoryReturnState | null>(null);
+  const [historyScope, setHistoryScope] = useState<HistoryScope>("all");
   const [historyMode, setHistoryMode] = useState(false);
   const [historyPageUrl, setHistoryPageUrl] = useState<string | null>(null);
   const [currentHistory, setCurrentHistory] = useState<CurrentHistory | null>(null);
@@ -881,14 +883,16 @@ export function App() {
     historyLookupUrlRef.current = pageUrl;
     setHistoryLookupLoading(true);
     try {
-      const entries = (await api.history(100)).analyses;
+      const entries = sortHistoryEntries((await api.history(100)).analyses);
       if (historyLookupUrlRef.current !== pageUrl) return;
-      const entry = entries.find((candidate) => candidate.serviceId === serviceId) ?? null;
+      const matchingEntries = entries.filter((candidate) => candidate.serviceId === serviceId);
+      const entry = matchingEntries[0] ?? null;
       if (entry) {
         const versionData = await api.versions(entry.serviceId).catch(() => null);
         const signatures = new Set((versionData?.analyses ?? []).map((version) => [...version.fingerprints].sort().join(":")));
         setCurrentHistory({
           ...entry,
+          historyCount: matchingEntries.length,
           versionCount: versionData ? Math.max(1, signatures.size) : 0,
           versionConsistent: versionData ? signatures.size <= 1 : false,
           versionInfoAvailable: Boolean(versionData)
@@ -964,11 +968,12 @@ export function App() {
     }
   }, [phase, currentHistory?.analysisId, historyCheckState, sources.map((source) => `${source.id}:${source.url ?? ""}:${source.title}:${source.selected}`).join("|")]);
 
-  async function refreshHistory() {
+  async function refreshHistory(serviceId?: string) {
     setHistoryLoading(true);
     setHistoryError("");
     try {
-      setHistoryEntries((await api.history()).analyses);
+      const entries = sortHistoryEntries((await api.history(100)).analyses);
+      setHistoryEntries(serviceId ? entries.filter((entry) => entry.serviceId === serviceId) : entries);
     } catch (cause) {
       setHistoryError(cause instanceof Error ? cause.message : "无法读取历史分析");
     } finally {
@@ -992,7 +997,7 @@ export function App() {
         setHistoryPageUrl(null);
         setPhase("history");
       }
-      await refreshHistory();
+      await refreshHistory(historyScope === "current" ? entry.serviceId : undefined);
       if (snapshot?.pageUrl) void refreshCurrentHistory(snapshot.pageUrl);
       if (chromeAvailable()) {
         const remaining = (await api.history(100)).analyses;
@@ -1018,8 +1023,20 @@ export function App() {
     }
     setHistoryMode(false);
     setHistoryPageUrl(null);
+    setHistoryScope("all");
     setPhase("history");
     await refreshHistory();
+  }
+
+  async function openCurrentHistoryList() {
+    if (!currentHistory) return;
+    if (job?.kind === "version-check" && historyCheckState === "checking") await cancelRunningJob();
+    setHistoryReturn({ phase: "prepare", result: null, view: "overview" });
+    setHistoryMode(false);
+    setHistoryPageUrl(null);
+    setHistoryScope("current");
+    setPhase("history");
+    await refreshHistory(currentHistory.serviceId);
   }
 
   function returnFromHistory() {
@@ -1053,13 +1070,6 @@ export function App() {
     } finally {
       setHistoryLoadingId(null);
     }
-  }
-
-  async function openCurrentHistory() {
-    if (!currentHistory) return;
-    if (job?.kind === "version-check" && historyCheckState === "checking") await cancelRunningJob();
-    setHistoryReturn({ phase: "prepare", result: null, view: "overview" });
-    await openHistoryEntry(currentHistory);
   }
 
   async function cancelRunningJob() {
@@ -1127,6 +1137,7 @@ export function App() {
         saved: result.saved,
         sourceCount: result.sources.length,
         findingCount: result.findings.length,
+        historyCount: currentHistory?.historyCount ?? 1,
         versionCount: 1,
         versionConsistent: true,
         versionInfoAvailable: true
@@ -1282,7 +1293,7 @@ export function App() {
   if (phase === "running" && job && !(preserveResultWhileRunning && result)) return <Shell onOpenHistory={historyLauncher}><RunningScreen job={job} sources={sources} onCancel={() => void cancelRunningJob()} /></Shell>;
   if (phase === "offline") return <Shell offline><OfflineScreen detail={error} /></Shell>;
   if (phase === "error") return <Shell onOpenHistory={historyLauncher}><Centered><AlertTriangle size={30} /><h2>操作失败</h2><p>{error}</p><button className="primary" onClick={() => { setError(""); setPhase(snapshot ? "prepare" : "permission"); }}><RefreshCw size={16} />返回并重试</button></Centered></Shell>;
-  if (phase === "history") return <Shell onOpenHistory={historyLauncher}><HistoryScreen entries={historyEntries} loading={historyLoading} error={historyError} loadingId={historyLoadingId} deletingId={historyDeletingId} onRetry={() => void refreshHistory()} onOpen={openHistoryEntry} onDelete={deleteHistoryEntry} onBack={returnFromHistory} hasReturn={Boolean(historyReturn)} /></Shell>;
+  if (phase === "history") return <Shell onOpenHistory={historyLauncher}><HistoryScreen scope={historyScope} entries={historyEntries} loading={historyLoading} error={historyError} loadingId={historyLoadingId} deletingId={historyDeletingId} onRetry={() => void refreshHistory(historyScope === "current" ? currentHistory?.serviceId : undefined)} onOpen={openHistoryEntry} onDelete={deleteHistoryEntry} onBack={returnFromHistory} hasReturn={Boolean(historyReturn)} /></Shell>;
   if ((phase === "result" || (phase === "running" && preserveResultWhileRunning)) && result) {
     return <Shell onOpenHistory={historyLauncher}>
       <ResultHeader result={result} saving={saving} historyMode={historyMode} onHistory={() => historyMode ? returnFromHistory() : void openHistory()} onSave={() => void saveAnalysis()} />
@@ -1325,7 +1336,7 @@ export function App() {
       onCancelManualEdit={cancelManualEdit}
       addManualText={addManualText} addPdfFiles={addPdfFiles}
       currentHistory={currentHistory} historyCheckState={historyCheckState}
-      historyLoading={historyLookupLoading} onOpenHistoryEntry={() => void openCurrentHistory()} onCancel={historyCheckState === "checking" ? () => void cancelRunningJob() : undefined}
+      historyLoading={historyLookupLoading} onOpenHistoryList={() => void openCurrentHistoryList()} onCancel={historyCheckState === "checking" ? () => void cancelRunningJob() : undefined}
     />
   </Shell>;
 }
@@ -1352,8 +1363,9 @@ function PermissionScreen({ onGrant }: { onGrant: () => void }) {
 }
 
 function HistoryScreen({
-  entries, loading, error, loadingId, deletingId, onRetry, onOpen, onDelete, onBack, hasReturn
+  scope, entries, loading, error, loadingId, deletingId, onRetry, onOpen, onDelete, onBack, hasReturn
 }: {
+  scope: HistoryScope;
   entries: HistoryEntry[];
   loading: boolean;
   error: string;
@@ -1369,8 +1381,8 @@ function HistoryScreen({
     <section className="history-heading">
       <div>
         <p className="eyebrow">分析记录</p>
-        <h1>最近分析</h1>
-        <p>这里保留不同网页的已完成分析，收起侧边栏后也可以从这里继续查看。</p>
+        <h1>{scope === "current" ? "当前网页的历史分析" : "最近分析"}</h1>
+        <p>{scope === "current" ? "按时间倒序选择要查看的历史版本。" : "这里保留不同网页的已完成分析，收起侧边栏后也可以从这里继续查看。"}</p>
       </div>
       {hasReturn && <button className="icon-button" title="返回当前页面" onClick={onBack}><ArrowLeft size={18} /></button>}
     </section>
@@ -1402,6 +1414,16 @@ function historyDomain(pageUrl: string): string {
   }
 }
 
+function sortHistoryEntries(entries: HistoryEntry[]): HistoryEntry[] {
+  const timestamp = (value: string) => {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  };
+  return [...entries].sort((left, right) =>
+    timestamp(right.updatedAt || right.createdAt) - timestamp(left.updatedAt || left.createdAt)
+  );
+}
+
 function formatHistoryDate(value: string): string {
   const timestamp = Date.parse(value);
   return Number.isNaN(timestamp) ? "时间未知" : new Date(timestamp).toLocaleString("zh-CN", {
@@ -1424,7 +1446,7 @@ function PrepareScreen(props: {
   editingSourceId: string | null; onEditManual: (source: DiscoveredSource) => void; onRemoveManual: (sourceId: string) => void;
   onBeginManualAdd: () => void; onCancelManualEdit: () => void; manualFormValid: boolean;
   currentHistory: CurrentHistory | null; historyCheckState: HistoryCheckState; historyLoading: boolean;
-  onOpenHistoryEntry: () => void; onCancel?: () => void;
+  onOpenHistoryList: () => void; onCancel?: () => void;
 }) {
   const { snapshot, sources, setSources, context, setContext } = props;
   const currentVersionSummary = props.historyCheckState === "checking"
@@ -1441,9 +1463,9 @@ function PrepareScreen(props: {
   return <main className="prepare">
     <section className="page-intro"><p className="eyebrow">当前页面</p><h1>{snapshot?.pageTitle ?? "未识别页面"}</h1><p className="page-url">{snapshot?.pageUrl}</p><div className="scan-summary"><CheckCircle2 size={17} /><span>发现 {sources.length} 份可能相关的规则</span></div></section>
     {props.historyLoading && <div className="history-preview loading"><LoaderCircle size={16} className="spin" /><span>正在查找当前网页的历史分析</span></div>}
-    {!props.historyLoading && props.currentHistory && <button className="history-preview" type="button" onClick={props.onOpenHistoryEntry}>
+    {!props.historyLoading && props.currentHistory && <button className="history-preview" type="button" onClick={props.onOpenHistoryList}>
       <span className="history-preview-icon"><History size={17} /></span>
-      <span className="history-preview-main"><strong>已有历史分析</strong><small>{formatHistoryDate(props.currentHistory.updatedAt || props.currentHistory.createdAt)} · {props.currentHistory.sourceCount} 份材料 · {props.currentHistory.findingCount} 项告警</small><em><span>{currentVersionSummary}</span></em></span>
+      <span className="history-preview-main"><strong>已有历史分析（{props.currentHistory.historyCount} 条）</strong><small>最新：{formatHistoryDate(props.currentHistory.updatedAt || props.currentHistory.createdAt)} · {props.currentHistory.sourceCount} 份材料 · {props.currentHistory.findingCount} 项告警</small><em><span>{currentVersionSummary}</span></em></span>
       <ChevronRight size={17} />
     </button>}
     {props.historyCheckState === "checking" && props.onCancel && <button className="text-button history-check-cancel" onClick={props.onCancel}><X size={14} />中断版本检查</button>}
