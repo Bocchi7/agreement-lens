@@ -62,6 +62,42 @@ describe("OpenAI-compatible model adapter", () => {
     }
   });
 
+  it("adds the OpenAI-compatible /v1 prefix when the configured base URL is a server root", async () => {
+    const requestPaths: string[] = [];
+    const server = http.createServer(async (request, response) => {
+      requestPaths.push(request.url ?? "");
+      for await (const _chunk of request) {
+        // Drain the request before responding.
+      }
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({
+        choices: [{ message: { role: "assistant", content: JSON.stringify({ findings: [] }) } }]
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    await runModelSpecialist({
+      role: "fees",
+      sources: [],
+      context: { action: "register", concerns: ["money"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      config: {
+        apiKey: "test",
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        model: "test-model",
+        reasoningEffort: "low",
+        timeoutMs: 45_000,
+        maxToolRounds: 0,
+        agentName: "fees"
+      }
+    });
+
+    expect(requestPaths).toEqual(["/v1/chat/completions"]);
+  });
+
   it("executes native tool calls and validates the final specialist schema", async () => {
     let calls = 0;
     const progress: Array<{ rounds?: number; retries?: number; message?: string }> = [];

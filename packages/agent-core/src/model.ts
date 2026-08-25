@@ -568,10 +568,31 @@ const followUpConversationInstruction = [
   "除非用户明确要求 JSON，否则只返回面向用户的自然语言 Markdown 答案。"
 ].join("\n");
 
+class ModelProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ModelProtocolError";
+  }
+}
+
+async function readJsonResponse<T>(response: Response, format: "chat" | "responses"): Promise<T> {
+  const bodyText = await response.text();
+  try {
+    return JSON.parse(bodyText) as T;
+  } catch {
+    const contentType = response.headers.get("content-type") ?? "unknown";
+    const preview = bodyText.replace(/\s+/g, " ").trim().slice(0, 300);
+    throw new ModelProtocolError(
+      `模型 ${format} 接口返回了非 JSON 响应（HTTP ${response.status}, Content-Type: ${contentType}）。` +
+      (preview ? `响应开头：${preview}` : "")
+    );
+  }
+}
+
 async function readCompletionResponse(response: Response): Promise<CompletionReadResult> {
   const contentType = response.headers.get("content-type") ?? "";
   if (!contentType.includes("text/event-stream") || !response.body) {
-    const body = await response.json() as ChatResponse;
+    const body = await readJsonResponse<ChatResponse>(response, "chat");
     if (!response.ok) throw new Error(body.error?.message ?? `Model request failed (${response.status})`);
     const message = body.choices?.[0]?.message;
     if (!message) throw new Error("Model response did not contain a message");
@@ -757,7 +778,7 @@ function responseMessageFromOutput(body: ResponsesResponse): ChatMessage {
 async function readResponsesResponse(response: Response): Promise<CompletionReadResult> {
   const contentType = response.headers.get("content-type") ?? "";
   if (!contentType.includes("text/event-stream") || !response.body) {
-    const body = await response.json() as ResponsesResponse;
+    const body = await readJsonResponse<ResponsesResponse>(response, "responses");
     if (!response.ok) throw new Error(body.error?.message ?? `Model request failed (${response.status})`);
     return {
       message: responseMessageFromOutput(body),
@@ -903,6 +924,17 @@ function messageDiagnostics(messages: ChatMessage[]): Array<Record<string, unkno
 
 function geminiBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/(?:v1|v1beta|v1alpha)\/?$/, "").replace(/\/+$/, "");
+}
+
+function openAiBaseUrl(baseUrl: string): string {
+  const normalized = baseUrl.replace(/\/+$/, "");
+  let pathname = "";
+  try {
+    pathname = new URL(normalized).pathname;
+  } catch {
+    throw new ModelProtocolError(`模型 API 地址无效：${baseUrl}`);
+  }
+  return /\/v\d+(?:\/|$)/.test(pathname) ? normalized : `${normalized}/v1`;
 }
 
 function geminiToolDefinitions() {
@@ -1375,7 +1407,16 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        const endpoint = `${config.baseUrl.replace(/\/$/, "")}/${config.apiFormat === "responses" ? "responses" : "chat/completions"}`;
+        const endpoint = `${openAiBaseUrl(config.baseUrl)}/${config.apiFormat === "responses" ? "responses" : "chat/completions"}`;
+        console.info("[agent-core] model HTTP endpoint", JSON.stringify({
+          agent: config.agentName ?? "unknown",
+          traceId: config.traceId,
+          apiFormat: config.apiFormat ?? "chat",
+          endpoint,
+          model: config.model,
+          round,
+          attempt
+        }));
         const response = await fetch(endpoint, {
           method: "POST",
           signal: config.signal ? AbortSignal.any([config.signal, AbortSignal.timeout(config.timeoutMs)]) : AbortSignal.timeout(config.timeoutMs),
@@ -1391,6 +1432,17 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
           },
           body: requestBody
         });
+        console.info("[agent-core] model HTTP response", JSON.stringify({
+          agent: config.agentName ?? "unknown",
+          traceId: config.traceId,
+          apiFormat: config.apiFormat ?? "chat",
+          endpoint,
+          model: config.model,
+          round,
+          attempt,
+          status: response.status,
+          contentType: response.headers.get("content-type") ?? "unknown"
+        }));
         const completionResult = config.apiFormat === "responses"
           ? await readResponsesResponse(response)
           : await readCompletionResponse(response);
@@ -1410,6 +1462,7 @@ async function completion(config: ModelConfig, messages: ChatMessage[], context:
       } catch (error) {
         lastError = error;
         if (config.signal?.aborted) throw error;
+        if (error instanceof ModelProtocolError) throw error;
         if (attempt >= maxRetries) throw error;
         reportModelProgress(config, {
           status: "running",
