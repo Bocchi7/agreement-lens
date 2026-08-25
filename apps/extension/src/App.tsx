@@ -1072,6 +1072,25 @@ export function App() {
     }
   }
 
+  function returnToAnalysisPrepare() {
+    const analysisInput = result?.analysisInput;
+    if (analysisInput) {
+      setContext(analysisInput.context);
+      if (isModelChoice(analysisInput.model)) setSelectedModel(analysisInput.model);
+      if (analysisInput.reasoningEffort) setSelectedReasoning(analysisInput.reasoningEffort);
+    }
+    setMessages([]);
+    setSelectedFinding(null);
+    setError("");
+    setHistoryMode(false);
+    setHistoryPageUrl(null);
+    setHistoryReturn(null);
+    setHistoryCheckState("idle");
+    versionCheckKeyRef.current = "";
+    versionCheckSourceSignatureRef.current = "";
+    setPhase(snapshot ? "prepare" : "permission");
+  }
+
   async function cancelRunningJob() {
     if (!job) return;
     try {
@@ -1296,7 +1315,7 @@ export function App() {
   if (phase === "history") return <Shell onOpenHistory={historyLauncher}><HistoryScreen scope={historyScope} entries={historyEntries} loading={historyLoading} error={historyError} loadingId={historyLoadingId} deletingId={historyDeletingId} onRetry={() => void refreshHistory(historyScope === "current" ? currentHistory?.serviceId : undefined)} onOpen={openHistoryEntry} onDelete={deleteHistoryEntry} onBack={returnFromHistory} hasReturn={Boolean(historyReturn)} /></Shell>;
   if ((phase === "result" || (phase === "running" && preserveResultWhileRunning)) && result) {
     return <Shell onOpenHistory={historyLauncher}>
-      <ResultHeader result={result} saving={saving} historyMode={historyMode} onHistory={() => historyMode ? returnFromHistory() : void openHistory()} onSave={() => void saveAnalysis()} />
+      <ResultHeader result={result} saving={saving} historyMode={historyMode} onPrepare={returnToAnalysisPrepare} onSave={() => void saveAnalysis()} />
       {(supplementing || (phase === "running" && job)) && <section className="supplement-progress"><LoaderCircle className="spin" size={16} /><div><strong>{supplementing ? "正在读取补充材料" : job?.message ?? "正在深入分析"}</strong><p>{supplementing ? "原分析结果会保留，读取完成后再启动分析。" : `当前进度 ${job?.progress ?? 0}%`}</p></div>{job && <button className="icon-button compact-icon" title="中断当前任务" onClick={() => void cancelRunningJob()}><X size={15} /></button>}</section>}
       {error && <p className="inline-error result-error">{error}</p>}
       <nav className="tabs">
@@ -1553,9 +1572,9 @@ function RunningScreen({ job, sources, onCancel }: { job: JobStatus; sources: Di
   })}</div><button className="cancel-analysis" onClick={onCancel}><X size={15} />中断并返回</button><p className="muted small">关闭侧边栏不会中断任务</p></main>;
 }
 
-function ResultHeader({ result, saving, historyMode, onHistory, onSave }: { result: AnalysisResult; saving: boolean; historyMode: boolean; onHistory: () => void; onSave: () => void }) {
+function ResultHeader({ result, saving, historyMode, onPrepare, onSave }: { result: AnalysisResult; saving: boolean; historyMode: boolean; onPrepare: () => void; onSave: () => void }) {
   const meta = recommendationMeta[result.recommendation];
-  return <header className="result-header"><div><p>{historyMode ? "历史分析 · " : ""}{result.serviceName}</p><h1 className={meta.tone}>{meta.label}</h1></div><div className="header-actions">{historyMode && <button className="icon-button light" title="返回最近分析" onClick={onHistory}><ArrowLeft size={17} /></button>}<button className="icon-button light" disabled={saving || result.saved} title={result.saved ? "已保存" : saving ? "正在保存" : "保存本次分析"} onClick={onSave}>{saving ? <LoaderCircle size={17} className="spin" /> : result.saved ? <Check size={17} /> : <Save size={17} />}</button></div></header>;
+  return <header className="result-header"><div><p>{historyMode ? "历史分析 · " : ""}{result.serviceName}</p><h1 className={meta.tone}>{meta.label}</h1></div><div className="header-actions"><button className="icon-button light" title="返回分析准备" onClick={onPrepare}><ArrowLeft size={17} /></button><button className="icon-button light" disabled={saving || result.saved} title={result.saved ? "已保存" : saving ? "正在保存" : "保存本次分析"} onClick={onSave}>{saving ? <LoaderCircle size={17} className="spin" /> : result.saved ? <Check size={17} /> : <Save size={17} />}</button></div></header>;
 }
 
 function Overview({ result, topFindings, openEvidence, setView }: { result: AnalysisResult; topFindings: Finding[]; openEvidence: (finding: Finding) => void; setView: (view: View) => void }) {
