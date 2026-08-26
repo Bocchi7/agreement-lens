@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import {
+  analysisResultSchema,
   createAnalysisSchema,
   followUpSchema,
   maxSourceDocuments,
@@ -13,13 +14,14 @@ import {
 import { answerFollowUp, modelConfigFromEnv } from "@agreement-lens/agent-core";
 import {
   cancelJob, cleanupExpired, createAnalysisRecord, db, deleteAnalysis, getAgentSession, getAnalysis,
-  getAnalysisRequest, getJob, getVersionComparisons, listRecentAnalyses, openKnowledge,
-  saveAgentSession, setSaved
+  getAgentTrace, getAnalysisRequest, getJob, getVersionComparisons, listRecentAnalyses, openKnowledge,
+  saveAgentSession, saveAgentTraceEvent, saveResult, setSaved
 } from "./db.js";
 import { abortJob, enqueueAnalysis, enqueueRecheck, enqueueVersionCheck, newJob } from "./jobs.js";
 import { allowedExtensionId, serverPort } from "./config.js";
 import { repoRoot } from "./config.js";
 import { mergeSupplementalSources } from "./supplemental-sources.js";
+import { createSourceReader } from "./related-source.js";
 import { compactVersionHistory } from "./version-history.js";
 import path from "node:path";
 
@@ -122,6 +124,14 @@ app.get("/v1/analyses/:id", async (request, reply) => {
   return result ?? reply.code(404).send({ error: "分析尚未完成或不存在" });
 });
 
+app.get("/v1/analyses/:id/trace", async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  if (!getAnalysis(id) && !getAnalysisRequest(id) && !getJob(id)) {
+    return reply.code(404).send({ error: "分析不存在" });
+  }
+  return { analysisId: id, events: getAgentTrace(id) };
+});
+
 app.get("/v1/analyses/:id/follow-up/progress", async (request, reply) => {
   const id = (request.params as { id: string }).id;
   if (!getAnalysis(id)) return reply.code(404).send({ error: "分析不存在" });
@@ -163,6 +173,7 @@ app.post("/v1/analyses/:id/follow-up", async (request, reply) => {
   }
   try {
     const startedAt = new Date().toISOString();
+    const sourceCountBeforeFollowUp = result.sources.length;
     followUpProgress.set(id, {
       startedAt,
       progress: { status: "running", rounds: 0, retries: 0, message: "正在连接主Agent" }
@@ -184,9 +195,14 @@ app.post("/v1/analyses/:id/follow-up", async (request, reply) => {
             message: progress.message ?? current?.progress.message
           }
         });
-      }
+      },
+      (event) => saveAgentTraceEvent(id, event),
+      createSourceReader(result.sources)
     );
     if (response.session) saveAgentSession(id, response.session);
+    if (result.sources.length !== sourceCountBeforeFollowUp) {
+      saveResult(analysisResultSchema.parse(result));
+    }
     const current = followUpProgress.get(id);
     followUpProgress.set(id, {
       startedAt: current?.startedAt ?? startedAt,

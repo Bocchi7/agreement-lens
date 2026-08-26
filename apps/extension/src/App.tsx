@@ -15,7 +15,7 @@ import { api, ApiError } from "./api";
 import type { HistoryEntry } from "./api";
 import type { PageSnapshot } from "./types";
 import { evidenceSourceUrl, resultSourceLabel, uniqueSourceDocuments } from "./evidence-source";
-import { permissionPatternsForSite } from "./frame-discovery";
+import { canonicalDiscoveredSourceUrl, permissionPatternsForFrames } from "./frame-discovery";
 
 type View = "overview" | "risks" | "sources" | "chat" | "versions";
 type Phase = "loading" | "pair" | "permission" | "scanning" | "prepare" | "preparing" | "checking" | "running" | "result" | "history" | "offline" | "error";
@@ -257,7 +257,6 @@ export function App() {
   const [followUpProgress, setFollowUpProgress] = useState<AgentProgress | null>(null);
   const [askingSince, setAskingSince] = useState<number | null>(null);
   const [clock, setClock] = useState(Date.now());
-  const [supplementing, setSupplementing] = useState(false);
   const [preserveResultWhileRunning, setPreserveResultWhileRunning] = useState(false);
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -565,9 +564,17 @@ export function App() {
     try {
       if (!permissionTarget) throw new Error("当前标签页不支持扫描，请切换到需要分析的网站后重试");
       const tab = permissionTarget;
-      const granted = await chrome.permissions.request({ origins: permissionPatternsForSite(tab.url) });
+      const initialFrames = ((await chrome.webNavigation.getAllFrames({ tabId: tab.id }).catch(() => null))
+        ?? [{ frameId: 0, url: tab.url }]) as Array<{ frameId: number; url: string }>;
+      const granted = await chrome.permissions.request({
+        origins: permissionPatternsForFrames(
+          (initialFrames ?? []).map((frame) => frame.url).filter(Boolean),
+          tab.url
+        )
+      });
       if (!granted) throw new Error("未获得当前站点的读取权限");
-      const frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id }).catch(() => [{ frameId: 0 }]);
+      const frames = ((await chrome.webNavigation.getAllFrames({ tabId: tab.id }).catch(() => null))
+        ?? [{ frameId: 0, url: tab.url }]) as Array<{ frameId: number; url: string }>;
       const scanFrame = async (frameId: number) => {
         await chrome.scripting.executeScript({ target: { tabId: tab.id, frameIds: [frameId] }, files: ["content.js"] });
         return chrome.tabs.sendMessage(tab.id, { type: "SCAN_PAGE" }, { frameId }) as Promise<{
@@ -578,7 +585,15 @@ export function App() {
       const topFrameResponse = await scanFrame(0);
       await Promise.all((frames ?? [])
         .filter((frame) => frame.frameId !== 0)
-        .map((frame) => scanFrame(frame.frameId).catch(() => undefined)));
+        .map((frame) => scanFrame(frame.frameId).catch((cause) => {
+          console.info("[agreement-lens] frame scan skipped", {
+            tabId: tab.id,
+            frameId: frame.frameId,
+            url: frame.url,
+            error: cause instanceof Error ? cause.message : String(cause)
+          });
+          return undefined;
+        })));
 
       let page: PageSnapshot | null = null;
       for (let attempt = 0; attempt < 30; attempt++) {
@@ -759,7 +774,7 @@ export function App() {
                 relation: source.relation
               }))
             }),
-            75_000,
+            180_000,
             "浏览器读取协议来源超时，改由服务端读取原始 URL"
           ) as { sources?: unknown[] };
         } catch (cause) {
@@ -771,35 +786,57 @@ export function App() {
           url?: string;
           kind?: "url" | "pdf";
           relation?: "primary" | "direct" | "manual";
+          parentSourceId?: string;
           renderedHtml?: string;
           dataBase64?: string;
           error?: string;
           deferToServer?: boolean;
+          linkedSources?: Array<{ title: string; url: string }>;
         };
         const acquiredSources = (browserSources?.sources ?? []) as BrowserPreparedSource[];
         const fetched = new Map<string, BrowserPreparedSource>(
           acquiredSources.map((source) => [source.id, source])
         );
-        const existingIds = new Set(sources.map((source) => source.id));
         const enrichedRoots = sources.map((source) => {
           const acquired = fetched.get(source.id);
           return acquired?.renderedHtml || acquired?.dataBase64
-            ? { ...source, renderedHtml: acquired.renderedHtml, dataBase64: acquired.dataBase64 }
+            ? {
+                ...source,
+                renderedHtml: acquired.renderedHtml,
+                dataBase64: acquired.dataBase64,
+                ...(acquired.linkedSources?.length ? { linkedSources: acquired.linkedSources } : {})
+              }
             : source;
         });
+        const existingIds = new Set(sources.map((source) => source.id));
+        const existingUrls = new Set(
+          sources
+            .map((source) => source.url)
+            .filter((url): url is string => Boolean(url))
+            .map(canonicalDiscoveredSourceUrl)
+        );
         const browserDiscovered = acquiredSources
-          .filter((source) => !existingIds.has(source.id) && source.url && source.title && (source.renderedHtml || source.dataBase64))
+          .filter((source) => !existingIds.has(source.id)
+            && source.url
+            && source.title
+            && (source.renderedHtml || source.dataBase64)
+            && !existingUrls.has(canonicalDiscoveredSourceUrl(source.url)))
           .map((source) => ({
             id: source.id,
             kind: source.kind ?? "url",
             title: source.title!,
             url: source.url!,
-            renderedHtml: source.renderedHtml,
-            dataBase64: source.dataBase64,
+            ...(source.renderedHtml ? { renderedHtml: source.renderedHtml } : {}),
+            ...(source.dataBase64 ? { dataBase64: source.dataBase64 } : {}),
             selected: true,
-            relation: source.relation ?? "direct"
+            relation: source.relation ?? "direct",
+            ...(source.parentSourceId ? { parentSourceId: source.parentSourceId } : {})
           } satisfies DiscoveredSource));
-        preparedSources = [...enrichedRoots, ...browserDiscovered].slice(0, 8);
+        // Reuse the same browser-rendered reader used for the initial roots.
+        // First-level cited pages stay out of rootSourceMaterials, but are
+        // registered with their rendered HTML so an Agent can read them via
+        // read_source without falling back to an empty server-side shell.
+        preparedSources = [...enrichedRoots, ...browserDiscovered].slice(0, maxSourceDocuments);
       }
       const created = await api.createAnalysis({
         serviceName: snapshot.pageTitle, pageUrl: snapshot.pageUrl,
@@ -1123,7 +1160,9 @@ export function App() {
           url: source.url,
           text: source.mediaType === "text" ? source.normalizedText : undefined,
           selected: true,
-          relation: "primary"
+          relation: source.sourceRole === "related" ? "direct" : "primary",
+          parentSourceId: source.parentSourceId,
+          parentSectionId: source.parentSectionId
         })),
         model: isModelChoice(result.analysisInput?.model) ? result.analysisInput.model : selectedModel,
         reasoningEffort: result.analysisInput?.reasoningEffort ?? selectedReasoning
@@ -1170,114 +1209,6 @@ export function App() {
     }
   }
 
-  async function addRelatedSources(related: Array<{ title: string; url: string }>) {
-    if (!result || !related.length || supplementing || preserveResultWhileRunning) return;
-    setError("");
-    setSupplementing(true);
-    try {
-      const remaining = Math.max(0, maxSourceDocuments - result.sources.length);
-      const requestedSources: DiscoveredSource[] = related.slice(0, Math.min(8, remaining)).map((item) => ({
-        id: crypto.randomUUID(),
-        kind: /\.pdf(?:$|\?)/i.test(item.url) ? "pdf" : "url",
-        title: item.title,
-        url: item.url,
-        selected: true,
-        relation: "direct"
-      } satisfies DiscoveredSource));
-      if (!requestedSources.length) throw new Error(`当前分析已达到 ${maxSourceDocuments} 份材料上限`);
-
-      let preparedSources = requestedSources;
-      if (chromeAvailable()) {
-        let browserReaderAvailable = false;
-        try {
-          browserReaderAvailable = await withTimeout(
-            chrome.permissions.request({ origins: ["http://*/*", "https://*/*"] }),
-            10_000,
-            "浏览器来源读取权限请求超时"
-          );
-        } catch (cause) {
-          console.warn("[agreement-lens] supplemental browser permission unavailable; using server URL loader", cause);
-        }
-        let browserSources: { sources?: unknown[] } | undefined;
-        if (browserReaderAvailable) {
-          try {
-            browserSources = await withTimeout(
-              chrome.runtime.sendMessage({
-                type: "FETCH_AGREEMENT_SOURCES",
-                tabId: snapshot?.tabId,
-                sources: requestedSources.map((source) => ({
-                  id: source.id,
-                  title: source.title,
-                  url: source.url!,
-                  kind: source.kind as "url" | "pdf",
-                  relation: source.relation
-                }))
-              }),
-              75_000,
-              "浏览器读取补充协议超时，改由服务端读取原始 URL"
-            ) as { sources?: unknown[] };
-          } catch (cause) {
-            console.warn("[agreement-lens] supplemental browser acquisition unavailable; using server URL loader", cause);
-          }
-        }
-        type BrowserPreparedSource = {
-          id: string;
-          title?: string;
-          url?: string;
-          kind?: "url" | "pdf";
-          relation?: "primary" | "direct" | "manual";
-          renderedHtml?: string;
-          dataBase64?: string;
-          error?: string;
-          deferToServer?: boolean;
-        };
-        const acquired = (browserSources?.sources ?? []) as BrowserPreparedSource[];
-        const acquiredById = new Map(acquired.map((source) => [source.id, source]));
-        const includedUrls = new Set(result.sources.map((source) => source.url).filter((url): url is string => Boolean(url)));
-        preparedSources = requestedSources
-          .filter((source) => source.url && !includedUrls.has(source.url))
-          .map((source) => {
-            const fetched = acquiredById.get(source.id);
-            return fetched?.renderedHtml || fetched?.dataBase64
-              ? {
-                ...source,
-                renderedHtml: fetched.renderedHtml,
-                dataBase64: fetched.dataBase64
-              }
-              : source;
-          })
-          .slice(0, remaining);
-      }
-      if (!preparedSources.length) throw new Error("所选补充材料已包含在当前分析中");
-
-      const created = await api.addSources(result.id, preparedSources);
-      const pendingJob = {
-        id: created.jobId, analysisId: created.analysisId, kind: "analysis", state: "queued",
-        progress: 0, message: "补充材料已进入队列",
-        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
-      } satisfies JobStatus;
-      if (snapshot?.tabId !== undefined) {
-        await writeAnalysisState(snapshot.tabId, {
-          job: pendingJob,
-          jobId: pendingJob.id,
-          analysisId: pendingJob.analysisId,
-          previousAnalysisId: result.id,
-          pageUrl: snapshot.pageUrl,
-          sourceCount: result.sources.length + preparedSources.length
-        });
-      }
-      setJob(pendingJob);
-      runningReturnRef.current = { phase: "result", result };
-      setPreserveResultWhileRunning(true);
-      setPhase("running");
-    } catch (cause) {
-      setError(`补充材料失败：${cause instanceof Error ? cause.message : "未知错误"}`);
-      setPhase("result");
-    } finally {
-      setSupplementing(false);
-    }
-  }
-
   async function saveAnalysis() {
     if (!result) return;
     setSaving(true);
@@ -1316,7 +1247,7 @@ export function App() {
   if ((phase === "result" || (phase === "running" && preserveResultWhileRunning)) && result) {
     return <Shell onOpenHistory={historyLauncher}>
       <ResultHeader result={result} saving={saving} historyMode={historyMode} onPrepare={returnToAnalysisPrepare} onSave={() => void saveAnalysis()} />
-      {(supplementing || (phase === "running" && job)) && <section className="supplement-progress"><LoaderCircle className="spin" size={16} /><div><strong>{supplementing ? "正在读取补充材料" : job?.message ?? "正在深入分析"}</strong><p>{supplementing ? "原分析结果会保留，读取完成后再启动分析。" : `当前进度 ${job?.progress ?? 0}%`}</p></div>{job && <button className="icon-button compact-icon" title="中断当前任务" onClick={() => void cancelRunningJob()}><X size={15} /></button>}</section>}
+      {phase === "running" && job && <section className="supplement-progress"><LoaderCircle className="spin" size={16} /><div><strong>{job.message ?? "正在深入分析"}</strong><p>当前进度 {job.progress ?? 0}%</p></div><button className="icon-button compact-icon" title="中断当前任务" onClick={() => void cancelRunningJob()}><X size={15} /></button></section>}
       {error && <p className="inline-error result-error">{error}</p>}
       <nav className="tabs">
         {([
@@ -1331,7 +1262,7 @@ export function App() {
       <main className="result-body">
         {view === "overview" && <Overview result={result} topFindings={topFindings} openEvidence={openEvidence} setView={setView} />}
         {view === "risks" && <RiskList findings={result.findings} openEvidence={openEvidence} />}
-        {view === "sources" && <SourcesView result={result} supplementing={supplementing || (phase === "running" && preserveResultWhileRunning)} readOnly={historyMode} onAddRelated={addRelatedSources} />}
+        {view === "sources" && <SourcesView result={result} />}
         {view === "chat" && <ChatView messages={messages} suggestions={result.followUpSuggestions ?? []} input={chatInput} setInput={setChatInput} ask={ask} asking={asking} progress={followUpProgress} elapsedMs={askingSince ? clock - askingSince : 0} />}
         {view === "versions" && <VersionsView versions={versions} onRecheck={recheck} busy={phase === "running" || historyMode} />}
       </main>
@@ -1622,15 +1553,9 @@ function RiskList({ findings, openEvidence }: { findings: Finding[]; openEvidenc
   return <section className="result-section no-top"><div className="view-heading"><h2>全部风险</h2><span>{findings.length} 项</span></div><div className="finding-list">{findings.map((finding, index) => <FindingRow key={finding.id} finding={finding} index={index + 1} onClick={() => openEvidence(finding)} />)}</div></section>;
 }
 
-function SourcesView({ result, supplementing, readOnly, onAddRelated }: { result: AnalysisResult; supplementing: boolean; readOnly: boolean; onAddRelated: (sources: Array<{ title: string; url: string }>) => void }) {
+function SourcesView({ result }: { result: AnalysisResult }) {
   const sources = uniqueSourceDocuments(result.sources);
-  const included = new Set(sources.map((source) => source.url).filter(Boolean));
-  const remaining = Math.max(0, maxSourceDocuments - sources.length);
-  const related = sources.flatMap((source) => source.linkedSources ?? [])
-    .filter((item) => !included.has(item.url))
-    .filter((item, index, all) => all.findIndex((other) => other.url === item.url) === index)
-    .slice(0, Math.min(8, remaining));
-  return <section className="result-section no-top"><div className="view-heading"><h2>分析来源</h2><span>{sources.length} 份</span></div>{sources.map((source) => <div className="source-detail" key={source.id}><div className={`source-status ${source.status}`}><FileText size={17} /></div><div><strong>{source.title}</strong>{source.url && <small className="source-detail-url" title={source.url}>{source.url}</small>}<p>{source.normalizedText.length > 0 ? `${source.sections.length} 个章节 · ${source.normalizedText.length.toLocaleString()} 字` : source.status === "failed" ? "读取失败" : "未取得有效正文"}</p><small>{source.status === "ready" ? "已完整读取并生成内容指纹" : source.error}</small></div>{source.url && <button title="打开来源" onClick={() => chromeAvailable() && chrome.tabs.create({ url: source.url })}><ExternalLink size={15} /></button>}</div>)}{related.length > 0 && <div className="related-box"><div><strong>发现 {related.length} 份更深层关联材料</strong><p>{related.map((item) => item.title).join("、")}</p></div>{readOnly ? <small className="read-only-note">历史分析仅供查看，返回当前页面后可补充材料。</small> : <button disabled={supplementing} onClick={() => onAddRelated(related)}>{supplementing ? <><LoaderCircle className="spin" size={13} />正在处理</> : "确认并继续读取"}</button>}</div>}</section>;
+  return <section className="result-section no-top"><div className="view-heading"><h2>分析来源</h2><span>{sources.length} 份</span></div>{sources.map((source) => <div className="source-detail" key={source.id}><div className={`source-status ${source.status}`}><FileText size={17} /></div><div><strong>{source.title}</strong>{source.url && <small className="source-detail-url" title={source.url}>{source.url}</small>}<p>{source.normalizedText.length > 0 ? `${source.sections.length} 个章节 · ${source.normalizedText.length.toLocaleString()} 字` : source.status === "failed" ? "读取失败" : "未取得有效正文"}</p><small>{source.sourceRole === "related" ? "Agent 按需读取的引用材料" : source.status === "ready" ? "已完整读取并生成内容指纹" : source.error}</small></div>{source.url && <button title="打开来源" onClick={() => chromeAvailable() && chrome.tabs.create({ url: source.url })}><ExternalLink size={15} /></button>}</div>)}</section>;
 }
 
 function ChatView({ messages, suggestions, input, setInput, ask, asking, progress, elapsedMs }: { messages: Array<{ role: "user" | "assistant"; text: string }>; suggestions: string[]; input: string; setInput: (v: string) => void; ask: () => void; asking: boolean; progress: AgentProgress | null; elapsedMs: number }) {

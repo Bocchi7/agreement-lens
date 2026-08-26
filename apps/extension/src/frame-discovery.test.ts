@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canonicalDiscoveredSourceUrl, mergeDiscoveredSources, permissionPatternsForSite } from "./frame-discovery";
+import { canonicalDiscoveredSourceUrl, mergeDiscoveredSources, permissionPatternsForFrames, permissionPatternsForSite } from "./frame-discovery";
 
 describe("frame discovery helpers", () => {
   it("merges top-page and iframe sources while deduplicating canonical URLs", () => {
@@ -43,5 +43,16 @@ describe("frame discovery helpers", () => {
     ]);
     expect(permissionPatternsForSite("https://passport.baidu.com/v2/")).toContain("https://*.baidu.com/*");
     expect(permissionPatternsForSite("https://account.example.com.cn/")).toContain("https://*.example.com.cn/*");
+  });
+
+  it("includes cross-site iframe hosts so login dialogs can be scanned", () => {
+    expect(permissionPatternsForFrames([
+      "https://passport.yuewen.com/?popup=1",
+      "https://turing.captcha.gtimg.com/1/template/drag_ele.html"
+    ], "https://www.qidian.com/")).toEqual([
+      "https://www.qidian.com/*",
+      "https://*.qidian.com/*",
+      "https://passport.yuewen.com/*"
+    ]);
   });
 });

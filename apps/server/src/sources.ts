@@ -86,34 +86,6 @@ function deduplicateDiscoveredSources(sources: DiscoveredSource[]): DiscoveredSo
   return [...byIdentity.values()];
 }
 
-function sourceIdentity(source: SourceDocument): string {
-  return source.url ? `url:${sourceUrlIdentity(source.url)}` : `id:${source.id}`;
-}
-
-function sourcePreference(source: SourceDocument): number {
-  return (source.url?.startsWith("https://") ? 4 : 0)
-    + (source.status === "ready" ? 2 : 0)
-    + Math.min(source.normalizedText.length / 1_000_000, 1);
-}
-
-function deduplicateSourceDocuments(sources: SourceDocument[]): SourceDocument[] {
-  const byIdentity = new Map<string, SourceDocument>();
-  for (const source of sources) {
-    const identity = sourceIdentity(source);
-    const existing = byIdentity.get(identity);
-    if (!existing) {
-      byIdentity.set(identity, source);
-      continue;
-    }
-    const preferred = sourcePreference(source) > sourcePreference(existing) ? source : existing;
-    const other = preferred === source ? existing : source;
-    const linkedSources = [...(preferred.linkedSources ?? []), ...(other.linkedSources ?? [])]
-      .filter((item, index, all) => all.findIndex((candidate) => candidate.url === item.url) === index);
-    byIdentity.set(identity, linkedSources.length ? { ...preferred, linkedSources } : preferred);
-  }
-  return [...byIdentity.values()];
-}
-
 function sourceErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : "来源读取失败";
   if (/fetch failed|ETIMEDOUT|ECONNRESET|ENETUNREACH/i.test(message)) {
@@ -566,47 +538,20 @@ export async function loadSourceGraph(
     }
     return loadSource(source, useRenderedHtml);
   }));
-  if (rootDocuments.length >= maxDocuments) return rootDocuments;
-  const seen = new Set([
-    ...roots.map((source) => source.url).filter((url): url is string => Boolean(url)).map(sourceUrlIdentity),
-    ...rootDocuments.map((source) => source.url).filter((url): url is string => Boolean(url)).map(sourceUrlIdentity)
-  ]);
-  const normalizeTitle = (title: string) => normalize(title)
-    .replace(/[《》"'“”‘’（）()[\]]/g, "")
-    .toLocaleLowerCase();
-  const seenTitles = new Set([
-    ...roots.map((source) => normalizeTitle(source.title)),
-    ...rootDocuments.map((source) => normalizeTitle(source.title))
-  ]);
-  const direct: DiscoveredSource[] = [];
-  for (const [index, document] of rootDocuments.entries()) {
-    // The extension has already rendered and recursively acquired links from
-    // rendered roots. Fetching those links again here would downgrade SPA or
-    // iframe agreements back to their empty static app shells.
-    if (roots[index]?.renderedHtml) continue;
-    for (const link of document.linkedSources ?? []) {
-      const normalizedTitle = normalizeTitle(link.title);
-      const linkIdentity = sourceUrlIdentity(link.url);
-      if (seen.has(linkIdentity) || seenTitles.has(normalizedTitle) || direct.length + rootDocuments.length >= maxDocuments) continue;
-      seen.add(linkIdentity);
-      seenTitles.add(normalizedTitle);
-      direct.push({
-        id: randomUUID(),
-        kind: link.url.toLowerCase().includes(".pdf") ? "pdf" : "url",
-        title: link.title,
-        url: link.url,
-        selected: true,
-        relation: "direct"
-      });
-    }
-  }
-  const directDocuments = await Promise.all(direct.map((source) => loadSource(source)));
-  return deduplicateSourceDocuments([...rootDocuments, ...directDocuments]);
+  // linkedSources is deliberately retained as an index of references. The
+  // referenced pages are not fetched here: an Agent may decide that a link is
+  // relevant and let an analysis Agent read it later through read_source.
+  return rootDocuments.map((document, index) => ({
+    ...document,
+    sourceRole: roots[index]?.relation === "direct" ? "related" as const : "root" as const,
+    ...(roots[index]?.parentSourceId ? { parentSourceId: roots[index].parentSourceId } : {}),
+    ...(roots[index]?.parentSectionId ? { parentSectionId: roots[index].parentSectionId } : {})
+  }));
 }
 const agreementLinkKeywords = [
   "协议", "条款", "隐私", "privacy", "cookie", "cookies", "terms", "conditions",
   "user agreement", "service agreement", "subscription", "auto-renew", "自动续费",
-  "社区规范", "community guidelines", "法律声明", "个人信息保护", "个人信息处理",
+  "规范", "community guidelines", "法律声明", "个人信息保护", "个人信息处理",
   "数据保护", "数据须知", "收集使用信息", "账号注销"
 ];
 

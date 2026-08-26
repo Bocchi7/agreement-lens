@@ -52,3 +52,19 @@ export function permissionPatternsForSite(pageUrl: string): string[] {
     : suffix;
   return [...new Set([exact, `${url.protocol}//*.${domain}/*`])];
 }
+
+export function permissionPatternsForFrames(frameUrls: string[], pageUrl?: string): string[] {
+  const patterns = pageUrl ? permissionPatternsForSite(pageUrl) : [];
+  for (const frameUrl of frameUrls) {
+    try {
+      const url = new URL(frameUrl);
+      if (!/^https?:$/.test(url.protocol)) continue;
+      const frameIdentity = `${url.hostname}${url.pathname}`.toLocaleLowerCase();
+      if (!/(?:^|[./-])(login|passport|auth|signin|sign-in|account|register|reg|agreement|protocol|policy|terms)(?:[./-]|$)/.test(frameIdentity)) continue;
+      patterns.push(`${url.protocol}//${url.host}/*`);
+    } catch {
+      // Ignore opaque, extension, data and malformed frame URLs.
+    }
+  }
+  return [...new Set(patterns)];
+}

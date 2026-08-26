@@ -76,7 +76,9 @@ export const discoveredSourceSchema = z.object({
   dataBase64: z.string().max(12_000_000).optional(),
   renderedHtml: z.string().max(2_000_000).optional(),
   selected: z.boolean().default(true),
-  relation: z.enum(["primary", "direct", "manual"]).default("primary")
+  relation: z.enum(["primary", "direct", "manual"]).default("primary"),
+  parentSourceId: z.string().optional(),
+  parentSectionId: z.string().optional()
 });
 export type DiscoveredSource = z.infer<typeof discoveredSourceSchema>;
 
@@ -93,6 +95,9 @@ export const sourceDocumentSchema = z.object({
   id: z.string(),
   title: z.string(),
   url: z.string().optional(),
+  sourceRole: z.enum(["root", "related"]).optional(),
+  parentSourceId: z.string().optional(),
+  parentSectionId: z.string().optional(),
   mediaType: z.enum(["html", "pdf", "text"]),
   normalizedText: z.string(),
   fingerprint: z.string(),

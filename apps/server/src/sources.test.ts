@@ -116,6 +116,46 @@ describe("source loading", () => {
     expect(sources).toHaveLength(1);
   });
 
+  it("keeps linked agreement pages as references without fetching them automatically", async () => {
+    const originalFetch = globalThis.fetch;
+    let fetchCount = 0;
+    globalThis.fetch = (async () => {
+      fetchCount += 1;
+      return new Response(`<main><h1>服务中心</h1><p>${"根协议正文。".repeat(80)}</p><a href="https://example.com/privacy">隐私政策</a></main>`, {
+        status: 200,
+        headers: { "content-type": "text/html; charset=utf-8" }
+      });
+    }) as typeof fetch;
+    try {
+      const sources = await loadSourceGraph([{
+        id: `root-only-${Date.now()}`,
+        kind: "url",
+        title: "服务中心",
+        url: "https://example.com/account",
+        selected: true,
+        relation: "primary"
+      }]);
+      expect(fetchCount).toBe(1);
+      expect(sources).toHaveLength(1);
+      expect(sources[0]?.sourceRole).toBe("root");
+      expect(sources[0]?.linkedSources).toEqual([{ title: "隐私政策", url: "https://example.com/privacy" }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("preserves a previously fetched related source as related during a recheck", async () => {
+    const [source] = await loadSourceGraph([{
+      id: `related-root-recheck-${Date.now()}`,
+      kind: "url",
+      title: "引用隐私政策",
+      url: "https://example.com/privacy",
+      selected: true,
+      relation: "direct"
+    }], `<main><h1>隐私政策</h1><p>${"隐私政策正文。".repeat(80)}</p></main>`, 8, "https://example.com/privacy");
+    expect(source?.sourceRole).toBe("related");
+  });
+
   it("extracts links when agreement labels are split or use partial English wording", async () => {
     const [source] = await loadSourceGraph([{
       id: `partial-labels-${Date.now()}`,

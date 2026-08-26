@@ -16,10 +16,17 @@ import {
   runModelSpecialist,
   runModelVerifier
 } from "./model.js";
-import type { MainAgentSession } from "./model.js";
+import type { MainAgentSession, SourceReader } from "./model.js";
 
 export { modelConfigFromEnv } from "./model.js";
-export type { MainAgentSession } from "./model.js";
+export type {
+  AgentTraceEvent,
+  MainAgentSession,
+  ReadSourceRequest,
+  ReadSourceResult,
+  SourceReader
+} from "./model.js";
+import type { AgentTraceEvent } from "./model.js";
 
 export interface KnowledgeHit {
   id: string;
@@ -46,7 +53,9 @@ export interface WorkflowInput {
   domains?: Domain[];
   previousResult?: AnalysisResult;
   signal?: AbortSignal;
+  readSource?: SourceReader;
   onMainAgentSession?: (session: MainAgentSession) => void;
+  onTrace?: (event: AgentTraceEvent) => void;
 }
 
 export interface WorkflowProgress {
@@ -344,6 +353,7 @@ export async function runWorkflow(
         sources: input.sources,
         context: input.context,
         knowledge,
+        readSource: input.readSource,
         promptDir: input.promptDir,
         config: {
           ...modelConfig,
@@ -351,6 +361,7 @@ export async function runWorkflow(
           model: input.analysisInput?.model ?? roleModel ?? modelConfig.model,
           agentName: domain,
           traceId: input.analysisId,
+          onTrace: input.onTrace,
           onProgress: ({ progress }) => updateAgent(domain, progress)
         }
       });
@@ -386,6 +397,7 @@ export async function runWorkflow(
         findings,
         sources: input.sources,
         knowledge,
+        readSource: input.readSource,
         promptDir: input.promptDir,
         config: {
           ...modelConfig,
@@ -393,6 +405,7 @@ export async function runWorkflow(
           model: input.analysisInput?.model ?? process.env.MODEL_VERIFIER ?? modelConfig.model,
           agentName: "verifier",
           traceId: input.analysisId,
+          onTrace: input.onTrace,
           onProgress: ({ progress }) => updateAgent("verifier", progress)
         }
       });
@@ -465,6 +478,7 @@ export async function runWorkflow(
         context: input.context,
         sources: input.sources,
         knowledge,
+        readSource: input.readSource,
         promptDir: input.promptDir,
         config: {
           ...modelConfig,
@@ -472,6 +486,7 @@ export async function runWorkflow(
           model: input.analysisInput?.model ?? process.env.MODEL_MAIN ?? modelConfig.model,
           agentName: "main",
           traceId: input.analysisId,
+          onTrace: input.onTrace,
           onProgress: ({ progress }) => updateAgent("main", progress)
         }
       });
@@ -627,7 +642,9 @@ export async function refineChangeRoute(
   current: SourceDocument[],
   knowledge: KnowledgeTool,
   promptDir?: string,
-  onProgress?: (progress: Partial<AgentProgress>) => void
+  onProgress?: (progress: Partial<AgentProgress>) => void,
+  onTrace?: (event: AgentTraceEvent) => void,
+  readSource?: SourceReader
 ): Promise<ChangeRoute> {
   const modelConfig = modelConfigFromEnv();
   if (!route.changed || !modelConfig) return route;
@@ -638,11 +655,13 @@ export async function refineChangeRoute(
       previousSources: previous,
       currentSources: current,
       knowledge,
+      readSource,
       promptDir,
       config: {
         ...modelConfig,
         model: process.env.MODEL_ROUTER ?? modelConfig.model,
         agentName: "router",
+        onTrace,
         onProgress: ({ progress }) => onProgress?.(progress)
       }
     });
@@ -671,7 +690,9 @@ export async function answerFollowUp(
   session: MainAgentSession | undefined,
   knowledge?: KnowledgeTool,
   promptDir?: string,
-  onProgress?: (progress: Partial<AgentProgress>) => void
+  onProgress?: (progress: Partial<AgentProgress>) => void,
+  onTrace?: (event: AgentTraceEvent) => void,
+  readSource?: SourceReader
 ): Promise<{ answer: string; session?: MainAgentSession }> {
   const modelConfig = modelConfigFromEnv({
     model: result.analysisInput?.model,
@@ -684,11 +705,13 @@ export async function answerFollowUp(
       session,
       sources: result.sources,
       knowledge,
+      readSource,
       promptDir,
       config: {
         ...modelConfig,
         model: process.env.MODEL_MAIN ?? modelConfig.model,
-        agentName: "main"
+        agentName: "main",
+        onTrace
       },
       onProgress
     });

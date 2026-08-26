@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { canonicalSourceUrl } from "@agreement-lens/shared";
 import type { AnalysisInputSnapshot, AnalysisResult, CreateAnalysisInput, JobStatus, UserContext, VersionComparison } from "@agreement-lens/shared";
-import type { MainAgentSession } from "@agreement-lens/agent-core";
+import type { AgentTraceEvent, MainAgentSession } from "@agreement-lens/agent-core";
 import { appDbPath, dataDir, knowledgeDbPath, snapshotDir } from "./config.js";
 import { runKnowledgeShell } from "./knowledge-shell.js";
 
@@ -48,6 +49,19 @@ db.exec(`
     session_json TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS agent_trace_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id TEXT NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+    agent TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    round INTEGER,
+    attempt INTEGER,
+    tool_name TEXT,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_agent_trace_events_analysis
+    ON agent_trace_events (analysis_id, sequence);
   CREATE TABLE IF NOT EXISTS services (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -149,8 +163,40 @@ export function cancelJob(id: string): JobStatus | undefined {
 }
 
 export function saveResult(result: AnalysisResult) {
-  db.prepare("UPDATE analyses SET result_json=?, updated_at=? WHERE id=?")
-    .run(JSON.stringify(result), result.updatedAt, result.id);
+  const row = db.prepare("SELECT request_json FROM analyses WHERE id=?").get(result.id) as { request_json?: string } | undefined;
+  let requestJson: string | undefined;
+  if (row?.request_json) {
+    try {
+      const request = JSON.parse(row.request_json) as CreateAnalysisInput;
+      const existing = new Set(request.sources.flatMap((source) => source.url ? [canonicalSourceUrl(source.url)] : []));
+      const related = result.sources
+        .filter((source) => source.sourceRole === "related" && source.url)
+        .filter((source) => !existing.has(canonicalSourceUrl(source.url!)))
+        .map((source) => ({
+          id: source.id,
+          kind: source.mediaType === "pdf" ? "pdf" : "url",
+          title: source.title,
+          url: source.url,
+          selected: true,
+          relation: "direct" as const,
+          ...(source.parentSourceId ? { parentSourceId: source.parentSourceId } : {}),
+          ...(source.parentSectionId ? { parentSectionId: source.parentSectionId } : {})
+        }));
+      if (related.length) {
+        requestJson = JSON.stringify({ ...request, sources: [...request.sources, ...related] });
+      }
+    } catch {
+      // Keep the existing request snapshot intact if an old database row is
+      // not compatible with the current input shape.
+    }
+  }
+  if (requestJson) {
+    db.prepare("UPDATE analyses SET result_json=?, request_json=?, updated_at=? WHERE id=?")
+      .run(JSON.stringify(result), requestJson, result.updatedAt, result.id);
+  } else {
+    db.prepare("UPDATE analyses SET result_json=?, updated_at=? WHERE id=?")
+      .run(JSON.stringify(result), result.updatedAt, result.id);
+  }
   db.prepare(`INSERT INTO services (id, name, page_url, latest_analysis_id, source_fingerprint, created_at, updated_at)
     SELECT service_id, service_name, page_url, id, ?, created_at, updated_at FROM analyses WHERE id=?
     ON CONFLICT(id) DO UPDATE SET name=excluded.name, page_url=excluded.page_url,
@@ -167,6 +213,54 @@ export function saveAgentSession(analysisId: string, session: MainAgentSession) 
 export function getAgentSession(analysisId: string): MainAgentSession | undefined {
   const row = db.prepare("SELECT session_json FROM agent_sessions WHERE analysis_id=?").get(analysisId) as { session_json: string } | undefined;
   return row ? JSON.parse(row.session_json) as MainAgentSession : undefined;
+}
+
+function tracePayload(event: AgentTraceEvent): string {
+  const serialized = JSON.stringify(event.data);
+  const maxBytes = Number(process.env.TRACE_MAX_PAYLOAD_BYTES ?? 1_000_000);
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0 || Buffer.byteLength(serialized, "utf8") <= maxBytes) {
+    return serialized;
+  }
+  return JSON.stringify({
+    truncated: true,
+    originalBytes: Buffer.byteLength(serialized, "utf8"),
+    value: serialized.slice(0, Math.max(0, Math.floor(maxBytes / 2)))
+  });
+}
+
+export function saveAgentTraceEvent(analysisId: string, event: AgentTraceEvent) {
+  db.prepare(`INSERT INTO agent_trace_events
+    (analysis_id, agent, phase, round, attempt, tool_name, payload_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      analysisId,
+      event.agent,
+      event.phase,
+      event.round ?? null,
+      event.attempt ?? null,
+      event.toolName ?? null,
+      tracePayload(event),
+      new Date().toISOString()
+    );
+}
+
+export function getAgentTrace(analysisId: string) {
+  const rows = db.prepare(`SELECT sequence, analysis_id, agent, phase, round, attempt,
+      tool_name, payload_json, created_at
+    FROM agent_trace_events
+    WHERE analysis_id=?
+    ORDER BY sequence ASC`).all(analysisId) as Array<Record<string, unknown>>;
+  return rows.map((row) => ({
+    sequence: row.sequence as number,
+    analysisId: row.analysis_id as string,
+    agent: row.agent as string,
+    phase: row.phase as string,
+    round: row.round as number | null,
+    attempt: row.attempt as number | null,
+    toolName: row.tool_name as string | null,
+    data: JSON.parse(row.payload_json as string) as Record<string, unknown>,
+    createdAt: row.created_at as string
+  }));
 }
 
 export function getAnalysis(id: string): AnalysisResult | undefined {

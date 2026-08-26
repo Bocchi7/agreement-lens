@@ -1,5 +1,6 @@
 import http from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
+import type { SourceDocument } from "@agreement-lens/shared";
 import { modelConfigFromEnv, runModelFollowUp, runModelSpecialist, runModelVerifier } from "./model.js";
 
 const servers: http.Server[] = [];
@@ -101,6 +102,7 @@ describe("OpenAI-compatible model adapter", () => {
   it("executes native tool calls and validates the final specialist schema", async () => {
     let calls = 0;
     const progress: Array<{ rounds?: number; retries?: number; message?: string }> = [];
+    const trace: Array<{ phase: string; toolName?: string; data: Record<string, unknown> }> = [];
     const requestBodies: Array<Record<string, unknown>> = [];
     const server = http.createServer(async (request, response) => {
       const chunks: Buffer[] = [];
@@ -179,6 +181,7 @@ describe("OpenAI-compatible model adapter", () => {
         timeoutMs: 45_000,
         maxToolRounds: 2,
         agentName: "fees",
+        onTrace: (event) => trace.push(event),
         onProgress: ({ progress: update }) => progress.push(update)
       }
     });
@@ -199,6 +202,254 @@ describe("OpenAI-compatible model adapter", () => {
     expect(findings[0]?.evidence[0]?.quote).toContain("自动续费");
     expect(progress.some((update) => update.rounds === 1)).toBe(true);
     expect(progress.some((update) => update.rounds === 2)).toBe(true);
+    expect(trace.map((event) => event.phase)).toEqual([
+      "request", "response", "tool_call", "tool_result",
+      "request", "final", "validation"
+    ]);
+    expect(trace.find((event) => event.phase === "tool_call")?.toolName).toBe("search_sources");
+    expect(trace.find((event) => event.phase === "tool_result")?.data.result).toBeDefined();
+    expect(trace.find((event) => event.phase === "request")?.data.messageCount).toBe(2);
+  });
+
+  it("injects root materials and lets an Agent read a cited source on demand", async () => {
+    const requestBodies: Array<Record<string, unknown>> = [];
+    let fetchCalls = 0;
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      requestBodies.push(body);
+      response.setHeader("content-type", "application/json");
+      if (requestBodies.length === 1) {
+        response.end(JSON.stringify({
+          choices: [{ message: {
+            role: "assistant",
+            tool_calls: [{
+              id: "related-1",
+              type: "function",
+              function: {
+                name: "read_source",
+                arguments: JSON.stringify({
+                  url: "https://example.com/privacy",
+                  title: "隐私政策"
+                })
+              }
+            }]
+          } }]
+        }));
+        return;
+      }
+      response.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: JSON.stringify({ findings: [] }) } }] }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    const rootText = "根协议正文，包含隐私政策链接。";
+    const findings = await runModelSpecialist({
+      role: "privacy",
+      sources: [{
+        id: "root-1",
+        title: "服务协议",
+        url: "https://example.com/terms",
+        sourceRole: "root",
+        mediaType: "html",
+        normalizedText: rootText,
+        fingerprint: "root-fingerprint",
+        sections: [{ id: "root-section", heading: "隐私", content: rootText }],
+        linkedSources: [{ title: "隐私政策", url: "https://example.com/privacy" }],
+        fetchedAt: new Date().toISOString(),
+        status: "ready"
+      }],
+      context: { action: "register", concerns: ["data"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      readSource: async (sourceRequest) => {
+        fetchCalls += 1;
+        expect(sourceRequest.url).toBe("https://example.com/privacy");
+        expect(sourceRequest.parentSourceId).toBe("root-1");
+          return {
+          reused: false,
+          loadedNewSource: true,
+          source: {
+            id: "related-1",
+            title: "隐私政策",
+            url: sourceRequest.url,
+            sourceRole: "related",
+            parentSourceId: "root-1",
+            parentSectionId: "root-section",
+            mediaType: "html",
+            normalizedText: "隐私政策正文。",
+            fingerprint: "related-fingerprint",
+            sections: [{ id: "privacy-section", heading: "收集", content: "隐私政策正文。" }],
+            fetchedAt: new Date().toISOString(),
+            status: "ready"
+          }
+        };
+      },
+      config: {
+        apiKey: "test",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        model: "test-model",
+        reasoningEffort: "low",
+        timeoutMs: 45_000,
+        maxToolRounds: 2,
+        agentName: "privacy"
+      }
+    });
+
+    expect(fetchCalls).toBe(1);
+    expect(findings).toEqual([]);
+    const firstMessages = requestBodies[0]?.messages as Array<{ role: string; content?: string }>;
+    const firstUser = JSON.parse(firstMessages.find((message) => message.role === "user")?.content ?? "{}");
+    expect(firstUser.sourceMaterials[0].sourceId).toBe("root-1");
+    expect(firstUser.sourceMaterials[0].sections[0].content).toBe(rootText);
+    expect(firstUser.sourceMaterials).toHaveLength(1);
+    expect(JSON.stringify(requestBodies[1])).toContain("related-1");
+    expect(JSON.stringify(requestBodies[1])).toContain("隐私政策正文");
+  });
+
+  it("routes registered related section reads through the source reader", async () => {
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      response.setHeader("content-type", "application/json");
+      if (requestBodies.length === 1) {
+        response.end(JSON.stringify({ choices: [{ message: {
+          role: "assistant",
+          tool_calls: [{
+            id: "related-section-1",
+            type: "function",
+            function: {
+              name: "read_source",
+              arguments: JSON.stringify({ sourceId: "related-1", sectionId: "related-section" })
+            }
+          }]
+        } }] }));
+        return;
+      }
+      response.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: JSON.stringify({ findings: [] }) } }] }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    let readerCalls = 0;
+    const relatedSource: SourceDocument = {
+      id: "related-1",
+      title: "直播服务协议",
+      url: "https://example.com/live-terms",
+      sourceRole: "related",
+      mediaType: "html",
+      normalizedText: "直播服务协议正文。",
+      fingerprint: "related-fingerprint",
+      sections: [{ id: "related-section", heading: "直播规则", content: "直播服务协议正文。" }],
+      fetchedAt: new Date().toISOString(),
+      status: "ready"
+    };
+    await runModelSpecialist({
+      role: "content",
+      sources: [{
+        id: "root-1",
+        title: "用户协议",
+        url: "https://example.com/terms",
+        sourceRole: "root",
+        mediaType: "html",
+        normalizedText: "用户协议正文。",
+        fingerprint: "root-fingerprint",
+        sections: [{ id: "root-section", heading: "正文", content: "用户协议正文。" }],
+        fetchedAt: new Date().toISOString(),
+        status: "ready"
+      }, relatedSource],
+      context: { action: "register", concerns: ["content"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      readSource: async (sourceRequest) => {
+        readerCalls += 1;
+        expect(sourceRequest).toEqual({ sourceId: "related-1" });
+        return { source: relatedSource, reused: true, loadedNewSource: false };
+      },
+      config: {
+        apiKey: "test",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        model: "test-model",
+        reasoningEffort: "low",
+        timeoutMs: 45_000,
+        maxToolRounds: 2
+      }
+    });
+
+    expect(readerCalls).toBe(1);
+    expect(JSON.stringify(requestBodies[1])).toContain("直播服务协议正文");
+  });
+
+  it("rejects a URL that is not declared by linkedSources", async () => {
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requestBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+      response.setHeader("content-type", "application/json");
+      if (requestBodies.length === 1) {
+        response.end(JSON.stringify({ choices: [{ message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "not-allowed",
+            type: "function",
+            function: {
+              name: "read_source",
+              arguments: JSON.stringify({ url: "https://example.com/not-cited" })
+            }
+          }]
+        } }] }));
+        return;
+      }
+      response.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: JSON.stringify({ findings: [] }) } }] }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not expose a port");
+
+    let readerCalls = 0;
+    await runModelSpecialist({
+      role: "privacy",
+      sources: [{
+        id: "root-1",
+        title: "服务协议",
+        url: "https://example.com/terms",
+        sourceRole: "root",
+        mediaType: "html",
+        normalizedText: "服务协议正文。",
+        fingerprint: "root-fingerprint",
+        sections: [{ id: "root-section", heading: "正文", content: "服务协议正文。" }],
+        linkedSources: [{ title: "隐私政策", url: "https://example.com/privacy" }],
+        fetchedAt: new Date().toISOString(),
+        status: "ready"
+      }],
+      context: { action: "register", concerns: ["data"], redlines: [], notes: "" },
+      knowledge: { search: () => [] },
+      readSource: async () => {
+        readerCalls += 1;
+        throw new Error("reader should not be called for an unlisted URL");
+      },
+      config: {
+        apiKey: "test",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        model: "test-model",
+        reasoningEffort: "low",
+        timeoutMs: 45_000,
+        maxToolRounds: 2
+      }
+    });
+
+    expect(readerCalls).toBe(0);
+    expect((requestBodies[1]?.messages as Array<{ role: string; content?: string }>).some((message) =>
+      message.role === "tool" && message.content?.includes("not present in linkedSources")
+    )).toBe(true);
   });
 
   it("uses the native Responses format when configured", async () => {
@@ -466,7 +717,7 @@ describe("OpenAI-compatible model adapter", () => {
                 id: "tool-full-section",
                 type: "function",
                 function: {
-                  name: "read_source_section",
+                  name: "read_source",
                   arguments: JSON.stringify({ sourceId: "source-1", sectionId: "section-1" })
                 }
               }]
@@ -640,7 +891,7 @@ describe("OpenAI-compatible model adapter", () => {
       response.setHeader("content-type", "text/event-stream");
       if (requestBodies.length === 1) {
         response.write(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{
-          index: 0, id: "call-1", type: "function", function: { name: "read_source_section", arguments: "" }
+          index: 0, id: "call-1", type: "function", function: { name: "read_source", arguments: "" }
         }] } }] })}\n\n`);
         response.write(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{
           index: 0, function: { arguments: "{}" }
@@ -688,7 +939,7 @@ describe("OpenAI-compatible model adapter", () => {
     }>;
     const assistant = secondMessages.find((message) => message.role === "assistant");
     expect(assistant?.tool_calls).toHaveLength(1);
-    expect(assistant?.tool_calls?.[0]?.function.name).toBe("read_source_section");
+    expect(assistant?.tool_calls?.[0]?.function.name).toBe("read_source");
     expect(assistant?.tool_calls?.[0]?.function.arguments).toBe(JSON.stringify({
       sourceId: "source-1", sectionId: "section-1"
     }));
@@ -763,7 +1014,7 @@ describe("OpenAI-compatible model adapter", () => {
             content: {
               parts: [{
                 functionCall: {
-                  name: "read_source_section",
+                  name: "read_source",
                   args: { sourceId: "source-1", sectionId: "section-1" },
                   id: "gemini-call-1"
                 },
@@ -871,12 +1122,12 @@ describe("OpenAI-compatible model adapter", () => {
     expect(secondContents.some((content) => content.role === "user"
       && content.parts.some((part) => part.text?.includes("\"sourceCatalog\"")))).toBe(true);
     expect(secondContents.some((content) => content.role === "model"
-      && content.parts.some((part) => part.functionCall?.name === "read_source_section"))).toBe(true);
+      && content.parts.some((part) => part.functionCall?.name === "read_source"))).toBe(true);
     expect(secondContents.some((content) => content.role === "user"
       && content.parts.some((part) => part.text?.includes("以下是本轮已实际执行的工具返回结果")
         && part.text.includes(sentinel)))).toBe(true);
     expect(secondContents.some((content) => content.role === "user"
-      && content.parts.some((part) => part.functionResponse?.name === "read_source_section"
+      && content.parts.some((part) => part.functionResponse?.name === "read_source"
         && part.functionResponse.id === "gemini-call-1"
         && JSON.stringify(part.functionResponse.response?.output).includes(sentinel)))).toBe(true);
   });

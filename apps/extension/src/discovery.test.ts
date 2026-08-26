@@ -35,12 +35,14 @@ describe("agreement discovery", () => {
       <a href="/legal/terms-and-conditions"><span>Terms</span><span>and Conditions</span></a>
       <a href="/privacy-cookies">Privacy &amp; Cookies</a>
       <a href="/privacy-notice">Your privacy notice</a>
+      <a href="/live/community-rule">社区直播规范</a>
     `);
     const sources = discoverAgreementSources(dom.window.document, "https://example.com/");
     expect(sources.map((source) => source.url)).toEqual([
       "https://example.com/legal/terms-and-conditions",
       "https://example.com/privacy-cookies",
-      "https://example.com/privacy-notice"
+      "https://example.com/privacy-notice",
+      "https://example.com/live/community-rule"
     ]);
   });
 
@@ -87,6 +89,20 @@ describe("agreement discovery", () => {
     `, { url: "https://ptlogin.4399.com/ptlogin/phoneLoginFrame.do" });
     const sources = discoverAgreementSources(dom.window.document, dom.window.location.href);
     expect(sources.map((source) => source.title)).toEqual(["《用户协议》", "《隐私政策》"]);
+  });
+
+  it("recognizes Qidian login iframe agreement links", () => {
+    const dom = new JSDOM(`
+      <div class="login-agreement">
+        <a href="https://acts.qidian.com/pact/user_pact.html">《用户服务协议》</a>
+        <a href="https://acts.qidian.com/pact/qd_pact.html">《隐私政策》</a>
+      </div>
+    `, { url: "https://passport.yuewen.com/?popup=1&target=iframe" });
+    const sources = discoverAgreementSources(dom.window.document, dom.window.location.href);
+    expect(sources.map((source) => source.url)).toEqual([
+      "https://acts.qidian.com/pact/user_pact.html",
+      "https://acts.qidian.com/pact/qd_pact.html"
+    ]);
   });
 
   it("finds agreement links inside open shadow roots and data-href components", () => {

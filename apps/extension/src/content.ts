@@ -1,5 +1,6 @@
 import { discoverAgreementSources, sanitizedRenderedHtml } from "./discovery";
 import { highlightEvidence } from "./evidence-highlight";
+import "./rendered-capture";
 import {
   CONTENT_SCRIPT_VERSION,
   hasLiveExtensionContext,
@@ -72,6 +73,7 @@ async function publishDiscovery(
 }
 
 const runtimeWindow = window as Window & {
+  __agreementLensCaptureOnly?: boolean;
   __agreementLensLoaded?: boolean;
   __agreementLensContentVersion?: string;
   __agreementLensContentMigrationPending?: boolean;
@@ -80,7 +82,7 @@ const runtimeWindow = window as Window & {
   };
 };
 
-if (requiresContentScriptMigration({
+if (!runtimeWindow.__agreementLensCaptureOnly && requiresContentScriptMigration({
   hasController: Boolean(runtimeWindow.__agreementLensContentController),
   hasLoadedMarker: Boolean(runtimeWindow.__agreementLensLoaded),
   contentVersion: runtimeWindow.__agreementLensContentVersion
@@ -92,7 +94,7 @@ if (requiresContentScriptMigration({
     runtimeWindow.__agreementLensContentMigrationPending = true;
     window.location.reload();
   }
-} else {
+} else if (!runtimeWindow.__agreementLensCaptureOnly) {
 runtimeWindow.__agreementLensContentController?.dispose();
 
 {

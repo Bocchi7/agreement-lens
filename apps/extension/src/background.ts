@@ -2,7 +2,7 @@ import type { PageSnapshot } from "./types";
 import { decodeHtmlBytes } from "@agreement-lens/shared";
 import { resolveAgreementLinksFromLoadedScripts, resolveDynamicAgreementLinks } from "./dynamic-discovery";
 import { setTabBadge as updateTabBadge } from "./tab-badge";
-import { mergeDiscoveredSources } from "./frame-discovery";
+import { canonicalDiscoveredSourceUrl, mergeDiscoveredSources } from "./frame-discovery";
 import { needsRenderedFallback, visibleTextLength } from "./html-readiness";
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
@@ -11,7 +11,7 @@ const MAX_HTML_BYTES = 2_000_000;
 const MAX_PDF_BYTES = 8_000_000;
 const MAX_BROWSER_SOURCES = 8;
 const DIRECT_HTML_TIMEOUT_MS = 8_000;
-const BROWSER_SOURCE_TIMEOUT_MS = 15_000;
+const BROWSER_SOURCE_TIMEOUT_MS = 45_000;
 
 interface BrowserSourceRequest {
   id: string;
@@ -19,6 +19,7 @@ interface BrowserSourceRequest {
   url: string;
   kind: "url" | "pdf";
   relation?: "primary" | "direct" | "manual";
+  parentSourceId?: string;
 }
 
 interface CapturedAgreementLink {
@@ -46,6 +47,7 @@ interface BrowserFetchedSource extends BrowserSourceRequest {
 type FrameDiscoveryRecord = Omit<PageSnapshot, "tabId" | "pendingRecheck">;
 
 const discoveryUpdates = new Map<number, Promise<PageSnapshot | null>>();
+const dynamicFrameRescans = new Map<number, number>();
 let existingPageMigration: Promise<void> | undefined;
 
 function base64FromBytes(bytes: Uint8Array): string {
@@ -81,94 +83,61 @@ async function waitForTab(tabId: number, timeoutMs = 8_000): Promise<boolean> {
 
 async function captureRenderedTab(tabId: number): Promise<CapturedRenderedPage> {
   type CaptureTarget = { tabId: number; allFrames?: boolean; frameIds?: number[] };
-  type RenderedFrameResult = {
-    html: string;
-    textLength: number;
-    title: string;
-    url: string;
-    links: CapturedAgreementLink[];
-  };
-  const capture = async (target: CaptureTarget): Promise<Array<{ result?: unknown }>> => chrome.scripting.executeScript({
-    target,
-    func: async () => {
-      const visibleTextLength = () => {
-        const renderedText = document.body?.innerText?.replace(/\s+/g, " ").trim();
-        if (renderedText) return renderedText.length;
-        const clone = document.documentElement.cloneNode(true) as HTMLElement;
-        clone.querySelectorAll("script,style,noscript,template").forEach((node) => node.remove());
-        return (clone.textContent ?? "").replace(/\s+/g, " ").trim().length;
-      };
-      const agreementBodyIsStillLoading = () => {
-        const emptyDetail = [...document.querySelectorAll(
-          ".detail.ProseMirror, .detail-container .detail, [class*='agreement-detail'], [class*='policy-detail']"
-        )].some((element) => (element.textContent ?? "").replace(/\s+/g, " ").trim().length < 80);
-        const emptyDetailTitle = [...document.querySelectorAll(
-          ".detail-container .title h1, [class*='agreement-detail'] h1, [class*='policy-detail'] h1"
-        )].some((element) => !(element.textContent ?? "").trim());
-        return emptyDetail || emptyDetailTitle;
-      };
-      const startedAt = Date.now();
-      for (let attempt = 0; attempt < 16; attempt += 1) {
-        const textLength = visibleTextLength();
-        const elapsed = Date.now() - startedAt;
-        // A readable agreement is more valuable than a perfectly idle page.
-        // Sites with timers or analytics can keep mutating their DOM forever.
-        if (textLength >= 300 && elapsed >= 500 && !agreementBodyIsStillLoading()) break;
-        if (textLength >= 80 && elapsed >= 1_500 && !agreementBodyIsStillLoading()) break;
-        await new Promise((resolve) => setTimeout(resolve, 500));
+  type RenderedFrameResult = CapturedRenderedPage;
+  const capture = async (target: CaptureTarget): Promise<Array<{ result?: unknown }>> => {
+    const allFrames = target.allFrames
+      ? ((await chrome.webNavigation.getAllFrames({ tabId }).catch(() => null)) ?? [])
+      : [];
+    const frameIds = target.allFrames
+      ? [...new Set((allFrames ?? [{ frameId: 0 }]).map((frame) => frame.frameId))]
+      : (target.frameIds ?? [0]);
+    if (!frameIds.length) frameIds.push(0);
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds },
+      func: () => {
+        (globalThis as typeof globalThis & { __agreementLensCaptureOnly?: boolean }).__agreementLensCaptureOnly = true;
       }
-      if (agreementBodyIsStillLoading() && visibleTextLength() < 300) {
-        throw new Error("协议正文动态加载未完成");
-      }
-      const clone = document.documentElement.cloneNode(true) as HTMLElement;
-      clone.querySelectorAll("script,style,noscript,iframe,input,textarea,select,button,template").forEach((node) => node.remove());
-      clone.querySelectorAll("*").forEach((node) => {
-        for (const attribute of [...node.attributes]) {
-          if (/^on/i.test(attribute.name) || ["value", "srcdoc"].includes(attribute.name)) node.removeAttribute(attribute.name);
+    });
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds },
+      files: ["content.js"]
+    });
+    try {
+      return await Promise.all(frameIds.map(async (frameId) => {
+        const response = await chrome.tabs.sendMessage(tabId, {
+          type: "CAPTURE_RENDERED_SOURCE"
+        }, { frameId }) as {
+          ok?: boolean;
+          page?: CapturedRenderedPage;
+          error?: string;
+        };
+        if (!response?.ok || !response.page) {
+          console.warn("[agreement-lens] rendered source capture returned no page", {
+            tabId,
+            frameId,
+            response
+          });
+          throw new Error(response?.error || "浏览器捕获来源页面失败");
         }
-      });
-      const keywords = [
-        "协议", "条款", "隐私", "privacy", "cookie", "cookies", "terms", "conditions",
-        "user agreement", "service agreement", "subscription", "auto-renew", "自动续费",
-        "社区规范", "community guidelines", "法律声明", "个人信息保护", "个人信息处理",
-        "数据保护", "数据须知", "收集使用信息", "账号注销"
-      ];
-      const normalize = (value: string) => value
-        .replace(/\u00a0/g, " ")
-        .replace(/[\u2010-\u2015]/g, "-")
-        .replace(/\s+/g, " ")
-        .trim()
-        .toLocaleLowerCase();
-      const links = [...document.querySelectorAll<HTMLAnchorElement>("a[href],area[href]")]
-        .map((link) => {
-          const title = normalize(link.innerText || link.textContent || link.title || link.getAttribute("aria-label") || "");
-          try {
-            const target = new URL(link.href, location.href);
-            const matchValue = `${title} ${target.pathname} ${target.hash}`;
-            const historical = /历史版本|历史条款|旧版|上一版|previous|histor(?:y|ical)|archive|archived/i.test(matchValue)
-              || /(?:^|[/_-])old(?:[/_-]|$)/i.test(`${target.pathname}${target.search}`);
-            const interactive = /\/(?:oauth2?|authorize|signin|sign-in|login)(?:\/|$)/i.test(`${target.hostname}${target.pathname}`)
-              || ["client_id", "redirect_uri", "response_type"].some((name) => target.searchParams.has(name));
-            return ["http:", "https:"].includes(target.protocol)
-              && keywords.some((keyword) => matchValue.includes(keyword))
-              && !historical
-              && !interactive
-              ? { title: link.innerText?.replace(/\s+/g, " ").trim() || link.textContent?.replace(/\s+/g, " ").trim() || "关联规则", url: target.href }
-              : undefined;
-          } catch {
-            return undefined;
-          }
-        })
-        .filter((item): item is { title: string; url: string } => Boolean(item));
-      return {
-        html: clone.outerHTML.slice(0, 2_000_000),
-        textLength: visibleTextLength(),
-        title: document.title || location.hostname,
-        url: location.href,
-        links
-      };
+        console.info("[agreement-lens] rendered source capture response", {
+          tabId,
+          frameId,
+          url: response.page.url,
+          textLength: response.page.textLength,
+          htmlLength: response.page.html.length,
+          linkedSourceCount: response.page.links.length
+        });
+        return { result: response.page };
+      }));
+    } finally {
+      await chrome.scripting.executeScript({
+        target: { tabId, frameIds },
+        func: () => {
+          delete (globalThis as typeof globalThis & { __agreementLensCaptureOnly?: boolean }).__agreementLensCaptureOnly;
+        }
+      }).catch(() => undefined);
     }
-  });
+  };
   let rendered: Array<{ result?: unknown }> = [];
   try {
     // Read the top-level document first. An unrelated slow iframe must not
@@ -176,12 +145,7 @@ async function captureRenderedTab(tabId: number): Promise<CapturedRenderedPage> 
     rendered = await capture({ tabId });
   } catch {
     try {
-      const frames = await chrome.webNavigation.getAllFrames({ tabId });
-      const frameResults = await Promise.allSettled(
-        (frames ?? []).map((frame) => capture({ tabId, frameIds: [frame.frameId] }))
-      );
-      rendered = frameResults
-        .flatMap((item) => item.status === "fulfilled" ? item.value : []);
+      rendered = await capture({ tabId, allFrames: true });
     } catch {
       rendered = await capture({ tabId });
     }
@@ -515,6 +479,57 @@ async function fetchSourceGraphInBrowser(
   return results.filter((source): source is BrowserFetchedSource => Boolean(source));
 }
 
+async function fetchBrowserSourceClosure(
+  roots: BrowserSourceRequest[],
+  preferredTabId?: number
+): Promise<BrowserFetchedSource[]> {
+  const rootResults = await fetchSourceGraphInBrowser(roots, preferredTabId);
+  const knownUrls = new Set(
+    roots
+      .map((source) => source.url)
+      .concat(rootResults.map((source) => source.url))
+      .map((url) => canonicalDiscoveredSourceUrl(url))
+  );
+  const relatedRequests: BrowserSourceRequest[] = [];
+  for (const parent of rootResults) {
+    for (const link of parent.linkedSources) {
+      const url = canonicalDiscoveredSourceUrl(link.url);
+      if (knownUrls.has(url)) continue;
+      knownUrls.add(url);
+      relatedRequests.push({
+        id: crypto.randomUUID(),
+        title: link.title || "关联规则",
+        url,
+        kind: /\.pdf(?:$|[?#])/i.test(url) ? "pdf" : "url",
+        relation: "direct",
+        parentSourceId: parent.id
+      });
+      // The browser source limit is deliberately shared by roots and the
+      // first-level references. This keeps one analysis from opening an
+      // unbounded number of background tabs while still making cited dynamic
+      // agreements available to the Agent.
+      if (roots.length + relatedRequests.length >= 32) break;
+    }
+    if (roots.length + relatedRequests.length >= 32) break;
+  }
+  console.info("[agreement-lens] browser source closure discovered", {
+    rootCount: roots.length,
+    rootResults: rootResults.length,
+    relatedCount: relatedRequests.length,
+    relatedUrls: relatedRequests.map((source) => source.url)
+  });
+  const relatedResults = relatedRequests.length
+    ? await fetchSourceGraphInBrowser(relatedRequests, preferredTabId)
+    : [];
+  return [
+    ...rootResults,
+    ...relatedResults.map((source, index) => ({
+      ...source,
+      parentSourceId: relatedRequests[index]?.parentSourceId
+    }))
+  ];
+}
+
 async function maybeRecheck(payload: PageSnapshot) {
   const host = new URL(payload.pageUrl).hostname.replace(/^www\./, "");
   const local = await chrome.storage.local.get(["pairToken", "savedServices"]);
@@ -544,14 +559,17 @@ async function scanTab(tabId: number) {
     await chrome.tabs.sendMessage(tabId, { type: "SCAN_PAGE" }, { frameId });
   };
   try {
-    const frames = await chrome.webNavigation.getAllFrames({ tabId }).catch(() => [{ frameId: 0 }]);
+    const frames = ((await chrome.webNavigation.getAllFrames({ tabId }).catch(() => null))
+      ?? [{ frameId: 0, url: "" }]) as Array<{ frameId: number; url: string }>;
     const frameIds = [...new Set((frames ?? []).map((frame) => frame.frameId))];
     await scanFrame(0);
     await Promise.all(frameIds.filter((frameId) => frameId !== 0).map((frameId) =>
       scanFrame(frameId).catch((error) => {
+        const frame = frames?.find((item) => item.frameId === frameId);
         console.info("[agreement-lens] skipped inaccessible frame", {
           tabId,
           frameId,
+          url: frame?.url,
           error: error instanceof Error ? error.message : String(error)
         });
       })
@@ -640,23 +658,22 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
 chrome.webNavigation.onDOMContentLoaded.addListener((details) => {
   if (details.frameId === 0 || !details.url.startsWith("http")) return;
-  const origin = new URL(details.url).origin + "/*";
-  chrome.permissions.contains({ origins: [origin] }, (allowed) => {
-    if (!allowed) return;
-    void chrome.scripting.executeScript({
-      target: { tabId: details.tabId, frameIds: [details.frameId] },
-      files: ["content.js"]
-    }).then(() => chrome.tabs.sendMessage(
-      details.tabId,
-      { type: "SCAN_PAGE" },
-      { frameId: details.frameId }
-    )).catch((error) => {
-      console.info("[agreement-lens] dynamic frame scan skipped", {
-        tabId: details.tabId,
-        frameId: details.frameId,
-        url: details.url,
-        error: error instanceof Error ? error.message : String(error)
-      });
+  // Try even when optional permission is not listed. The activeTab grant can
+  // cover a newly-created cross-origin login iframe, while executeScript will
+  // still reject safely when neither activeTab nor a host grant applies.
+  void chrome.scripting.executeScript({
+    target: { tabId: details.tabId, frameIds: [details.frameId] },
+    files: ["content.js"]
+  }).then(() => chrome.tabs.sendMessage(
+    details.tabId,
+    { type: "SCAN_PAGE" },
+    { frameId: details.frameId }
+  )).catch((error) => {
+    console.info("[agreement-lens] dynamic frame scan skipped", {
+      tabId: details.tabId,
+      frameId: details.frameId,
+      url: details.url,
+      error: error instanceof Error ? error.message : String(error)
     });
   });
 });
@@ -732,6 +749,31 @@ function queuePageDiscovery(incoming: PageSnapshot, frameId: number): Promise<Pa
   return current;
 }
 
+async function rescanDynamicFrames(tabId: number): Promise<void> {
+  const now = Date.now();
+  if (now - (dynamicFrameRescans.get(tabId) ?? 0) < 2_000) return;
+  dynamicFrameRescans.set(tabId, now);
+  const frames = await chrome.webNavigation.getAllFrames({ tabId }).catch(() => []);
+  await Promise.all((frames ?? [])
+    .filter((frame) => frame.frameId !== 0 && /^https?:/i.test(frame.url))
+    .map(async (frame) => {
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId, frameIds: [frame.frameId] },
+          files: ["content.js"]
+        });
+        await chrome.tabs.sendMessage(tabId, { type: "SCAN_PAGE" }, { frameId: frame.frameId });
+      } catch (error) {
+        console.info("[agreement-lens] dynamic frame rescan skipped", {
+          tabId,
+          frameId: frame.frameId,
+          url: frame.url,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }));
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "RESOLVE_DYNAMIC_AGREEMENT_LINKS") {
     if (!sender.tab?.id) {
@@ -789,6 +831,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === "PAGE_DISCOVERED") {
     const incoming = { ...message.payload, tabId: sender.tab?.id ?? message.payload.tabId } as PageSnapshot;
+    if (sender.frameId === 0 && incoming.tabId >= 0) void rescanDynamicFrames(incoming.tabId);
     void queuePageDiscovery(incoming, sender.frameId ?? 0).then(async (payload) => {
       if (!payload) {
         sendResponse({ ok: false, stale: true });
@@ -815,7 +858,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === "FETCH_AGREEMENT_SOURCES") {
     const tabId = message.tabId;
-    void fetchSourceGraphInBrowser(message.sources.slice(0, MAX_BROWSER_SOURCES) as BrowserSourceRequest[], tabId)
+    void fetchBrowserSourceClosure(message.sources.slice(0, MAX_BROWSER_SOURCES) as BrowserSourceRequest[], tabId)
       .then((sources) => sendResponse({ ok: true, sources }))
       .catch((error) => sendResponse({ ok: false, error: error instanceof Error ? error.message : "来源读取失败" }));
     return true;

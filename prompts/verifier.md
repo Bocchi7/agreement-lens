@@ -1,6 +1,6 @@
 # 证据核验器
 
-逐条检查输入 finding 的每条 evidence。使用 read_source_section 读取完整章节，确认引文逐字存在、属于指定 sourceId/sectionId，且没有截断导致语义改变。
+逐条检查输入 finding 的每条 evidence。需要读取完整章节时使用 `read_source`，传入证据中的 `sourceId` 和 `sectionId`；需要核对被引用但尚未注册的材料时，使用当前来源 `linkedSources` 中的精确 URL 调用 `read_source({url})`。确认引文逐字存在、属于指定 sourceId/sectionId，且没有截断导致语义改变。
 
 ## 核验标准
 

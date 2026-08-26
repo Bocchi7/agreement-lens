@@ -3,8 +3,9 @@ import { analysisResultSchema, maxSourceDocuments, type AnalysisInputSnapshot, t
 import type { AnalysisResult, VersionComparison } from "@agreement-lens/shared";
 import { routeChangedContent, runWorkflow } from "@agreement-lens/agent-core";
 import type { MainAgentSession } from "@agreement-lens/agent-core";
-import { discardAnalysisRecordForJob, getAgentSession, getJob, openKnowledge, saveAgentSession, saveResult, saveVersionComparison, updateJob } from "./db.js";
+import { discardAnalysisRecordForJob, getAgentSession, getJob, openKnowledge, saveAgentSession, saveAgentTraceEvent, saveResult, saveVersionComparison, updateJob } from "./db.js";
 import { loadSourceGraph } from "./sources.js";
+import { createSourceReader } from "./related-source.js";
 import { repoRoot } from "./config.js";
 import path from "node:path";
 
@@ -79,6 +80,28 @@ function assertUsableSources(sources: Awaited<ReturnType<typeof loadSourceGraph>
     : "没有获取到可分析的协议正文，请打开协议页面或手动粘贴文本后重试");
 }
 
+function createTrackedSourceReader(sources: Awaited<ReturnType<typeof loadSourceGraph>>) {
+  const sourceReader = createSourceReader(sources);
+  const readRelatedSourceIds = new Set<string>();
+  const readSource = async (request: Parameters<typeof sourceReader>[0]) => {
+    const result = await sourceReader(request);
+    if (result.source.sourceRole === "related") {
+      readRelatedSourceIds.add(result.source.id);
+    }
+    return result;
+  };
+  return { readSource, readRelatedSourceIds };
+}
+
+function visibleAnalysisSources(
+  sources: Awaited<ReturnType<typeof loadSourceGraph>>,
+  readRelatedSourceIds: Set<string>
+) {
+  return sources.filter((source) =>
+    source.sourceRole !== "related" || readRelatedSourceIds.has(source.id)
+  );
+}
+
 export function enqueueAnalysis(jobId: string, analysisId: string, serviceId: string, input: CreateAnalysisInput) {
   queue.push(() => runWithJobSignal(jobId, async (signal) => {
     try {
@@ -87,20 +110,26 @@ export function enqueueAnalysis(jobId: string, analysisId: string, serviceId: st
       const sources = await loadSourceGraph(selected, input.renderedHtml, maxSourceDocuments, input.pageUrl);
       if (isCancelled(jobId)) return;
       assertUsableSources(sources);
+      const { readSource, readRelatedSourceIds } = createTrackedSourceReader(sources);
       setJob(jobId, { state: "analyzing", progress: 30, message: "来源已就绪，开始多视角分析" });
       let mainAgentSession: MainAgentSession | undefined;
       const analysisStartedAt = Date.now();
       const workflowResult = await runWorkflow({
         analysisId, serviceId, serviceName: input.serviceName,
         sources, context: input.context, signal, promptDir: path.join(repoRoot, "prompts"),
+        readSource,
         analysisInput: analysisInputSnapshot(input),
-        onMainAgentSession: (session) => { mainAgentSession = session; }
+        onMainAgentSession: (session) => { mainAgentSession = session; },
+        onTrace: (event) => saveAgentTraceEvent(analysisId, event)
       }, openKnowledge(), (progress) => setJob(jobId, {
         state: progress.stage, progress: progress.progress, message: progress.message, agents: progress.agents
       }));
       if (isCancelled(jobId)) return;
       const result = {
         ...workflowResult,
+        // Keep pre-registered citations in the model catalog, but only expose
+        // related sources that an Agent actually read during this run.
+        sources: visibleAnalysisSources(workflowResult.sources, readRelatedSourceIds),
         analysisDurationMs: Date.now() - analysisStartedAt
       };
       saveResult(analysisResultSchema.parse(result));
@@ -128,6 +157,7 @@ export function enqueueRecheck(
       const sources = await loadSourceGraph(selected, input.renderedHtml, maxSourceDocuments, input.pageUrl);
       if (isCancelled(jobId)) return;
       assertUsableSources(sources);
+      const { readSource, readRelatedSourceIds } = createTrackedSourceReader(sources);
       let route = routeChangedContent(previousResult.sources, sources);
       const now = new Date().toISOString();
       if (!route.changed) {
@@ -153,10 +183,12 @@ export function enqueueRecheck(
         sources,
         context: input.context,
         signal,
+        readSource,
         promptDir: path.join(repoRoot, "prompts"),
         analysisInput: analysisInputSnapshot(input),
         saved: true,
-        onMainAgentSession: (session) => { mainAgentSession = session; }
+        onMainAgentSession: (session) => { mainAgentSession = session; },
+        onTrace: (event) => saveAgentTraceEvent(analysisId, event)
       }, knowledge, (progress) => setJob(jobId, {
         state: progress.stage,
         progress: progress.progress,
@@ -169,6 +201,7 @@ export function enqueueRecheck(
       if (isCancelled(jobId)) return;
       const result = {
         ...workflowResult,
+        sources: visibleAnalysisSources(workflowResult.sources, readRelatedSourceIds),
         analysisDurationMs: Date.now() - analysisStartedAt
       };
       saveResult(analysisResultSchema.parse(result));
